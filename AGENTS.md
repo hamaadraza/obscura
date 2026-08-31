@@ -59,6 +59,11 @@ It serves local fixtures, so it is deterministic and offline. WPT conformance
 and the real-world render corpus also live in that repo; report WPT as subtest
 pass %, not whole-file pass.
 
+CI fails a PR on any stage regression, and also on any stage failing on both
+base and candidate unless it is listed in
+`scripts/ci/expected_obstacle_failures.txt` (read from the merge base, so an
+acknowledgment lands one PR before it takes effect). Keep that file empty.
+
 ## Before you finish
 
 For any code change:

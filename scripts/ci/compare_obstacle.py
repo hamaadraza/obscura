@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""Compare obstacle-course correctness and report latency changes."""
+"""Compare obstacle-course correctness and report latency changes.
+
+Two correctness rules gate the run:
+  - A stage that passes on base and fails on the candidate is a regression
+    and fails the job.
+  - A stage that fails on BOTH base and candidate must be listed in the
+    expected-failures file or the job fails. Without this rule a stage broken
+    before the PR stays invisible forever: observer-intersection was silently
+    failing on every run for a month because only regressions were checked.
+
+The expected-failures file (scripts/ci/expected_obstacle_failures.txt) is
+read from the trusted base revision by ci.yml, like this script itself, so a
+PR cannot acknowledge its own breakage; an entry takes effect only after the
+change adding it is merged.
+"""
 
 from __future__ import annotations
 
@@ -54,10 +68,23 @@ def add_summary(markdown: str) -> None:
         print(markdown)
 
 
+def load_expected_failures(path: Path | None) -> set[str]:
+    """Stage names acknowledged as failing, one per line, # comments."""
+    if path is None or not path.exists():
+        return set()
+    entries: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        name = line.split("#", 1)[0].strip()
+        if name:
+            entries.add(name)
+    return entries
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", type=Path, required=True)
     parser.add_argument("--candidate", type=Path, required=True)
+    parser.add_argument("--expected-failures", type=Path, default=None)
     args = parser.parse_args()
 
     base = result_map(load_result(args.base))
@@ -77,6 +104,24 @@ def main() -> None:
 
     regressions = sorted(name for name in base if base[name]["pass"] and not candidate[name]["pass"])
     improvements = sorted(name for name in base if not base[name]["pass"] and candidate[name]["pass"])
+
+    expected = load_expected_failures(args.expected_failures)
+    persistent = sorted(
+        name for name in base
+        if not base[name]["pass"] and not candidate[name]["pass"]
+    )
+    unacknowledged = sorted(name for name in persistent if name not in expected)
+    unknown_entries = sorted(name for name in expected if name not in base)
+    recovered_entries = sorted(
+        name for name in expected if name in candidate and candidate[name]["pass"]
+    )
+    for name in persistent:
+        state = "acknowledged" if name in expected else "UNACKNOWLEDGED"
+        print(f"::warning::obstacle stage {name} fails on base and candidate ({state})")
+    for name in unknown_entries:
+        print(f"::warning::expected-failures entry {name} matches no obstacle stage")
+    for name in recovered_entries:
+        print(f"::warning::expected-failures entry {name} passes now; remove it")
     ratios = []
     slow = []
     for name in sorted(base):
@@ -102,6 +147,21 @@ def main() -> None:
         lines.append(f"\nImproved stages: {', '.join(improvements)}\n")
     if regressions:
         lines.append(f"\nRegressed stages: {', '.join(regressions)}\n")
+    if persistent:
+        lines.append(
+            "\nStages failing on both base and candidate: "
+            + ", ".join(
+                f"`{name}`" + ("" if name in expected else " **(unacknowledged)**")
+                for name in persistent
+            )
+            + "\n"
+        )
+    if recovered_entries:
+        lines.append(
+            "\nStale expected-failures entries (now passing): "
+            + ", ".join(recovered_entries)
+            + "\n"
+        )
     if slow:
         lines.append("\nStages above the reporting threshold:\n\n")
         for name, base_ms, candidate_ms, ratio in slow:
@@ -111,6 +171,11 @@ def main() -> None:
 
     if regressions:
         raise SystemExit("candidate introduces new obstacle-course failures")
+    if unacknowledged:
+        raise SystemExit(
+            "obstacle stages fail on base and candidate without an "
+            "expected-failures entry: " + ", ".join(unacknowledged)
+        )
 
 
 if __name__ == "__main__":

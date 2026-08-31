@@ -1,0 +1,8 @@
+# Obstacle-course stages acknowledged as failing, one stage name per line.
+# Keep this file empty: AGENTS.md requires the course to stay 33/33. An entry
+# here only stops CI from hard-failing on a stage that already failed on the
+# base revision; regressions against base always fail regardless.
+#
+# ci.yml reads this file from the trusted base revision, like the comparison
+# script itself, so a PR cannot acknowledge its own breakage: an entry takes
+# effect only after the change adding it is merged.
