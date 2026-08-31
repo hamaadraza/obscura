@@ -12697,12 +12697,44 @@ mod tests {
         assert_eq!(
             rt.evaluate(
                 "[broken.complete, broken.naturalWidth, broken.naturalHeight, \
-                  __brokenEvents, __brokenDecode]"
+                  broken.width, broken.height, __brokenEvents, __brokenDecode]"
             )
             .unwrap(),
-            serde_json::json!([true, 0, 0, ["error"], "EncodingError"])
+            serde_json::json!([true, 0, 0, 16, 16, ["error"], "EncodingError"])
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const empty = document.createElement("img");
+                    const sized = document.createElement("img");
+                    sized.setAttribute("width", "40");
+                    sized.setAttribute("height", "30");
+                    sized.src = "missing-sized.png";
+                    return [empty.width, empty.height, empty.complete, sized.width, sized.height];
+                })()"#
+            )
+            .unwrap(),
+            serde_json::json!([0, 0, true, 40, 30])
+        );
+        rt.execute_script(
+            "sannysoft-broken-image",
+            r#"
+                globalThis.__sanny = null;
+                const image = document.createElement("img");
+                image.onerror = () => {
+                    __sanny = [image.width, image.height, image.naturalWidth, image.naturalHeight];
+                };
+                document.body.appendChild(image);
+                image.src = "https://intoli.com/nonexistent-image.png";
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__sanny").unwrap(),
+            serde_json::json!([16, 16, 0, 0])
+        );
     }
 
     #[cfg(feature = "render")]
@@ -13629,6 +13661,33 @@ mod tests {
         assert!(plugins.as_f64().unwrap() > 0.0, "Should have plugins");
         let chrome = rt.evaluate("typeof window.chrome").unwrap();
         assert_eq!(chrome, serde_json::json!("object"));
+        let plugin_globals = rt
+            .evaluate(
+                r#"[
+                    typeof PluginArray,
+                    navigator.plugins instanceof PluginArray,
+                    typeof Plugin,
+                    typeof MimeTypeArray,
+                    navigator.mimeTypes instanceof MimeTypeArray,
+                    typeof Navigator,
+                    navigator instanceof Navigator,
+                    Object.getOwnPropertyDescriptor(window, 'PluginArray').enumerable
+                ]"#,
+            )
+            .unwrap();
+        assert_eq!(
+            plugin_globals,
+            serde_json::json!([
+                "function",
+                true,
+                "function",
+                "function",
+                true,
+                "function",
+                true,
+                false
+            ])
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

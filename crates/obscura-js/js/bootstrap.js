@@ -30,6 +30,7 @@
     '__processDynScriptQueue', '_decodeDataScriptUrl', '_markNative', '_fpRand', '_fpNoise',
     '_fpCache', '_getFp', '_fp', '_splitAsciiWhitespace',
     '_createWebGLContext',
+    '_imageEncodingError', '_displayedImageDimension',
     '_getElementsByClassName', '_docEncoding', '_docIsUtf8',
     '_isSpecialScheme', '_applyDocQueryEncoding', '_anchorBase',
     '_elemHrefURL', '_setElemHrefPart', '_pad', '_daysInMonth',
@@ -5873,6 +5874,16 @@ function _imageEncodingError() {
   return new DOMException("The source image cannot be decoded.", "EncodingError");
 }
 
+function _displayedImageDimension(img, attr, natural) {
+  img._refreshImageFromCache();
+  img._queueImageRequest();
+  const value = Number.parseInt(img.getAttribute(attr) || "", 10);
+  if (Number.isFinite(value) && value >= 0) return value;
+  if (natural > 0) return natural;
+  if (img._imageComplete && img.src && !img._imageDecoded) return 16;
+  return 0;
+}
+
 // HTMLImageElement is backed by the same retained resource cache used by
 // layout/paint. The render-only native op owns responsive candidate selection,
 // fetching, and metadata sniffing; bootstrap owns only the observable request
@@ -5947,15 +5958,9 @@ class HTMLImageElement extends Element {
     }
   }
 
-  get width() {
-    const value = Number.parseInt(this.getAttribute("width") || "", 10);
-    return Number.isFinite(value) && value >= 0 ? value : this._imageNaturalWidth;
-  }
+  get width() { return _displayedImageDimension(this, "width", this._imageNaturalWidth); }
   set width(value) { this.setAttribute("width", Math.max(0, Number(value) || 0)); }
-  get height() {
-    const value = Number.parseInt(this.getAttribute("height") || "", 10);
-    return Number.isFinite(value) && value >= 0 ? value : this._imageNaturalHeight;
-  }
+  get height() { return _displayedImageDimension(this, "height", this._imageNaturalHeight); }
   set height(value) { this.setAttribute("height", Math.max(0, Number(value) || 0)); }
 
   get srcset() { return this.getAttribute("srcset") || ""; }
@@ -6515,6 +6520,11 @@ for (let i = 0; i < 50; i++) {
 // navigatorPrototype checks don't throw a ReferenceError.
 function Navigator() {}
 _markNative(Navigator);
+try {
+  Object.defineProperty(globalThis, 'Navigator', {
+    value: Navigator, writable: true, enumerable: false, configurable: true,
+  });
+} catch (_e) { globalThis.Navigator = Navigator; }
 
 // PluginArray must exist before navigator is built so the plugins getter can use it.
 function PluginArray(items) {
@@ -6537,12 +6547,16 @@ _markNative(PluginArray);
 _markNative(PluginArray.prototype.item);
 _markNative(PluginArray.prototype.namedItem);
 _markNative(PluginArray.prototype.refresh);
+try {
+  Object.defineProperty(globalThis, 'PluginArray', {
+    value: PluginArray, writable: true, enumerable: false, configurable: true,
+  });
+} catch (_e) { globalThis.PluginArray = PluginArray; }
 
 // Plugin / MimeType / MimeTypeArray global interfaces. Chrome exposes these as
-// global constructors; their absence threw "ReferenceError: Plugin is not
-// defined" in site bundles that reference them (issue #305). Plain function
-// declarations (no globalThis assignment) so they survive the V8 snapshot, the
-// same pattern PluginArray uses.
+// window constructors (issue #305). Bootstrap runs inside an IIFE, so a bare
+// function declaration is not a global; assign them onto globalThis the same
+// way NetworkInformation is installed.
 function Plugin(name, filename, description, mimeTypes) {
   this.name = name;
   this.filename = filename;
@@ -6561,6 +6575,11 @@ Object.defineProperty(Plugin.prototype, Symbol.toStringTag, {value: 'Plugin', co
 _markNative(Plugin);
 _markNative(Plugin.prototype.item);
 _markNative(Plugin.prototype.namedItem);
+try {
+  Object.defineProperty(globalThis, 'Plugin', {
+    value: Plugin, writable: true, enumerable: false, configurable: true,
+  });
+} catch (_e) { globalThis.Plugin = Plugin; }
 
 function MimeType(type, description, suffixes, plugin) {
   this.type = type;
@@ -6570,6 +6589,11 @@ function MimeType(type, description, suffixes, plugin) {
 }
 Object.defineProperty(MimeType.prototype, Symbol.toStringTag, {value: 'MimeType', configurable: true});
 _markNative(MimeType);
+try {
+  Object.defineProperty(globalThis, 'MimeType', {
+    value: MimeType, writable: true, enumerable: false, configurable: true,
+  });
+} catch (_e) { globalThis.MimeType = MimeType; }
 
 function MimeTypeArray(items) {
   for (var _i = 0; _i < items.length; _i++) this[_i] = items[_i];
@@ -6585,6 +6609,11 @@ Object.defineProperty(MimeTypeArray.prototype, Symbol.toStringTag, {value: 'Mime
 _markNative(MimeTypeArray);
 _markNative(MimeTypeArray.prototype.item);
 _markNative(MimeTypeArray.prototype.namedItem);
+try {
+  Object.defineProperty(globalThis, 'MimeTypeArray', {
+    value: MimeTypeArray, writable: true, enumerable: false, configurable: true,
+  });
+} catch (_e) { globalThis.MimeTypeArray = MimeTypeArray; }
 
 class NetworkInformation {
   constructor() { this._listeners = Object.create(null); }
