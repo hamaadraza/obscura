@@ -6610,6 +6610,17 @@ for (const _ev of [
   "rejectionhandled","reset","resize","scroll","seeked","seeking","select",
   "stalled","storage","submit","suspend","timeupdate","toggle","unhandledrejection",
   "unload","volumechange","waiting","wheel",
+  // Animation, transition and their -webkit- aliases: the dispatcher already
+  // routes an event to `on<type>`, so reflecting these makes a handler assigned
+  // as a property run for the CSS animations the engine already fires.
+  "animationend","animationiteration","animationstart",
+  "transitioncancel","transitionend","transitionrun","transitionstart",
+  "webkitanimationend","webkitanimationiteration","webkitanimationstart",
+  "webkittransitionend",
+  // Present in a browser of this vintage, and read by feature probes even
+  // where the engine never has cause to fire them.
+  "beforematch","beforexrselect","contextlost","contextrestored",
+  "pointerrawupdate","securitypolicyviolation","slotchange",
 ]) {
   const _on = "on" + _ev;
   if (!(_on in globalThis)) globalThis[_on] = null;
@@ -6619,6 +6630,85 @@ for (const _ev of [
     }
   }
 }
+
+// Members of this browser vintage that are read far more often than they are
+// driven. Each is defined with the shape a probe expects -- accessors on the
+// interface prototype, methods reporting as native code -- rather than as data
+// properties on instances.
+(function _installVintageMembers() {
+  function defineAccessor(proto, name, get, set) {
+    if (name in proto) return;
+    const getter = { ['get ' + name]() { return get.call(this); } }['get ' + name];
+    const setter = set && { ['set ' + name](v) { return set.call(this, v); } }['set ' + name];
+    _markNativeAs(getter, 'function get ' + name + '() { [native code] }');
+    if (setter) _markNativeAs(setter, 'function set ' + name + '() { [native code] }');
+    Object.defineProperty(proto, name, {
+      get: getter, set: setter || undefined, enumerable: true, configurable: true,
+    });
+  }
+  function defineMethod(proto, name, fn) {
+    if (name in proto) return;
+    Object.defineProperty(proto, name, {
+      value: _asNativeMethod(name, fn), writable: true, enumerable: true, configurable: true,
+    });
+  }
+
+  // Reflects the `elementtiming` content attribute, like any other reflection.
+  defineAccessor(Element.prototype, 'elementTiming',
+    function () { return this.getAttribute('elementtiming') || ''; },
+    function (value) { this.setAttribute('elementtiming', String(value)); });
+
+  // The document's text-fragment directive. Nothing is parsed out of the URL
+  // here, so it reports no items, which is what a document navigated without
+  // one reports too.
+  defineAccessor(Document.prototype, 'fragmentDirective', function () {
+    if (!this._fragmentDirective) {
+      const proto = globalThis.FragmentDirective ? FragmentDirective.prototype : Object.prototype;
+      const directive = Object.create(proto);
+      Object.defineProperty(directive, 'items', {
+        value: Object.freeze([]), enumerable: true, configurable: true,
+      });
+      this._fragmentDirective = directive;
+    }
+    return this._fragmentDirective;
+  });
+
+  // Superseded by getHTML, but still probed. The shadow-including form is not
+  // supported here, so it serialises the light DOM exactly as innerHTML does.
+  defineMethod(Element.prototype, 'getInnerHTML', function () { return this.innerHTML; });
+
+  // Runs the update callback and settles, which is the outcome a browser
+  // reaches when it cannot capture a transition. Pages await these promises
+  // before continuing, so they must always settle.
+  defineMethod(Document.prototype, 'startViewTransition', function (callback) {
+    const update = typeof callback === 'function'
+      ? callback
+      : (callback && typeof callback.update === 'function' ? callback.update : null);
+    const proto = globalThis.ViewTransition ? ViewTransition.prototype : Object.prototype;
+    const transition = Object.create(proto);
+    const updateCallbackDone = new Promise((resolve, reject) => {
+      Promise.resolve().then(() => {
+        if (!update) { resolve(undefined); return; }
+        try { Promise.resolve(update()).then(resolve, reject); }
+        catch (error) { reject(error); }
+      });
+    });
+    // The transition itself is never captured, so `ready` and `finished` follow
+    // the callback and do not carry its failure onward: a rejection belongs to
+    // whoever awaited updateCallbackDone.
+    const settled = updateCallbackDone.then(() => undefined, () => undefined);
+    Object.defineProperties(transition, {
+      updateCallbackDone: { value: updateCallbackDone, enumerable: true, configurable: true },
+      ready: { value: settled, enumerable: true, configurable: true },
+      finished: { value: settled, enumerable: true, configurable: true },
+      skipTransition: {
+        value: _asNativeMethod('skipTransition', function () {}),
+        writable: true, enumerable: true, configurable: true,
+      },
+    });
+    return transition;
+  });
+})();
 
 globalThis.Window = globalThis.Window || function Window() {};
 Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
