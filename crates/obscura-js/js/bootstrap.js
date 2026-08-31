@@ -17,7 +17,8 @@
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
     '__obscura_stealth', '__obscura_markTrusted', '__obscura_core_handoff',
     '__obscura_frameId', '__obscura_parentFrameId', '__obscura_frameWindows',
-    '__obscura_frameObjects', '__obscura_frameElements', '__obscura_deliverMessage',
+    '__obscura_frameObjects', '__obscura_spareFrameObjects',
+    '__obscura_frameElements', '__obscura_deliverMessage',
     '__obscura_liveFrameIds', '__obscura_forgetFrame',
     '__obscura_registerLinkedStylesheet', '__obscura_activateLabel',
     '__obscura_isDisabled', '__obscura_labeledControl', '__obscura_interactiveHost',
@@ -4283,6 +4284,10 @@ class Element extends Node {
     }
     if (!frameId) return;
     this._frameId = frameId;
+    // A claimed spare becomes one of the page's frames, so its objects move
+    // back onto the frame registry the rest of the code reads. The registry of
+    // record is the page's, reached through `top` from a nested realm.
+    _adoptSpareFrameObjects(frameId);
     // The spare was built with the page as its parent. When a frame claims one,
     // re-point the child's `parent` at the claiming realm, or a document nested
     // two deep would believe the page is its immediate parent. `top` is the
@@ -10667,7 +10672,7 @@ function _structuredClone(value, seen) {
     seen.set(value, copy);
     return copy;
   }
-  if (value instanceof SharedArrayBuffer) {
+  if (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer) {
     return value; // transferable, not copyable
   }
   if (value instanceof Date) return new Date(value.getTime());
@@ -12501,6 +12506,24 @@ function _frameObjectEntry(frameId) {
     }
   } catch (_e) {}
   return null;
+}
+
+// Move a claimed spare's window and document from the parked registry onto the
+// live one, in whichever realm holds them.
+function _adoptSpareFrameObjects(frameId) {
+  const scopes = [globalThis];
+  try { if (globalThis.top && globalThis.top !== globalThis) scopes.push(globalThis.top); } catch (_e) {}
+  for (let i = 0; i < scopes.length; i++) {
+    try {
+      const scope = scopes[i];
+      const parked = scope.__obscura_spareFrameObjects;
+      if (!parked || !parked[frameId]) continue;
+      const live = scope.__obscura_frameObjects ||
+        (scope.__obscura_frameObjects = Object.create(null));
+      live[frameId] = parked[frameId];
+      delete parked[frameId];
+    } catch (_e) {}
+  }
 }
 
 function _frameObjectsFor(element) {
@@ -15685,9 +15708,19 @@ const _VERSION_FEATURES = {
 
 // Withhold one feature from this realm. Deleting rather than shadowing keeps
 // `in`, `hasOwnProperty` and property enumeration all agreeing.
+// Globals the runtime itself constructs or names directly. Withholding one
+// would not present an older browser, it would break this engine: the
+// reference is bare, so its absence raises a ReferenceError from our own code
+// rather than from the page's. Presenting a version that predates one of these
+// therefore keeps it, which is a small fidelity cost against a hard failure.
+const _GATE_PROTECTED = new Set([
+  'SharedArrayBuffer', 'DocumentTimeline', 'ResizeObserverSize', 'Scheduling',
+]);
+
 function _hideVersionFeature(kind, name) {
   try {
     if (kind === 'w') {
+      if (_GATE_PROTECTED.has(name)) return;
       delete globalThis[name];
       return;
     }

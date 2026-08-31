@@ -223,6 +223,13 @@ pub struct Page {
     /// purpose: a realm holds a V8 handle into that isolate, and fields drop in
     /// declaration order, so the frames must go first.
     pub frames: Vec<FrameRealm>,
+    /// Blank realms built ahead of demand that nothing has claimed yet.
+    ///
+    /// Held apart from `frames` because an unclaimed spare is not one of the
+    /// page's frames: counting it would change `frames.len()`, the frame tree
+    /// and every frame index the CDP client sees. A spare moves into `frames`
+    /// at the moment script claims it, which is when it becomes a real one.
+    spare_frames: Vec<FrameRealm>,
     pub js: Option<ObscuraJsRuntime>,
     pub lifecycle: LifecycleState,
     pub http_client: Arc<ObscuraHttpClient>,
@@ -906,6 +913,7 @@ impl Page {
             url: None,
             dom: None,
             frames: Vec::new(),
+            spare_frames: Vec::new(),
             js: None,
             lifecycle: LifecycleState::Idle,
             http_client,
@@ -1220,13 +1228,6 @@ impl Page {
             }
         }
 
-        // A spare blank realm has no element yet, so the liveness query cannot
-        // see it. Hold the unclaimed ones, or they would be torn down on the
-        // very turn they were built.
-        if let Some(js) = self.js.as_ref() {
-            live.extend(js.spare_blank_frames());
-        }
-
         let discarded: Vec<(u32, u32)> = self
             .frames
             .iter()
@@ -1253,7 +1254,28 @@ impl Page {
     /// Reports whether anything happened, so a caller can pump again. A new
     /// frame runs scripts that can post, and a message usually causes a reply,
     /// so neither queue is finished until both are quiet.
+    /// Moves spares that script has claimed into the page's frame list. The op
+    /// hands the realm out synchronously and can only drop the offer, so the
+    /// claim is observed here: an id no longer on offer belongs to a frame now.
+    fn adopt_claimed_blank_frames(&mut self) {
+        if self.spare_frames.is_empty() {
+            return;
+        }
+        let Some(js) = self.js.as_ref() else { return };
+        let offered = js.spare_blank_frames();
+        let mut index = 0;
+        while index < self.spare_frames.len() {
+            if offered.contains(&self.spare_frames[index].frame_id()) {
+                index += 1;
+            } else {
+                let claimed = self.spare_frames.remove(index);
+                self.frames.push(claimed);
+            }
+        }
+    }
+
     async fn advance_frames(&mut self) -> bool {
+        self.adopt_claimed_blank_frames();
         let attached = self.attach_pending_frames().await;
         let delivered = self.deliver_frame_messages();
         self.release_detached_frames();
@@ -1288,7 +1310,7 @@ impl Page {
             }
             // A spare is a live realm, so it counts against the same cap as any
             // frame the page asked for.
-            if self.frames.len() >= max_live_frames() {
+            if self.frames.len() + self.spare_frames.len() >= max_live_frames() {
                 return;
             }
             let Some(frame_id) = js.reserve_frame_id() else {
@@ -1300,7 +1322,17 @@ impl Page {
                 tracing::debug!("could not pre-build a blank frame realm");
                 return;
             };
-            self.frames.push(realm);
+            self.spare_frames.push(realm);
+            // Building the realm published its window and document on the page's
+            // frame registry, but an unclaimed spare is not one of the page's
+            // frames: leaving it there is a reference to a context nothing can
+            // reach, which is indistinguishable from a leaked frame. Park it
+            // until script claims it, at which point the claim moves it back.
+            if let Some(js) = self.js.as_mut() {
+                let _ = js.evaluate(&format!(
+                    "(function(){{var r=globalThis.__obscura_frameObjects;                       var s=globalThis.__obscura_spareFrameObjects||                         (globalThis.__obscura_spareFrameObjects=Object.create(null));                       if(r&&r[{frame_id}]){{s[{frame_id}]=r[{frame_id}];delete r[{frame_id}];}}                       return 1;}})()"
+                ));
+            }
             let Some(js) = self.js.as_ref() else { return };
             js.offer_spare_blank_frame(frame_id);
         }
@@ -1454,6 +1486,7 @@ impl Page {
             // Every frame realm holds a V8 handle into this isolate, so the
             // frames of the outgoing document must go before the runtime does.
             self.frames.clear();
+        self.spare_frames.clear();
             let _ = self.js.take();
         }
 
@@ -3206,6 +3239,7 @@ impl Page {
 
     pub fn navigate_blank(&mut self) {
         self.frames.clear();
+        self.spare_frames.clear();
         self.js = None;
         self.url = Some(Url::parse("about:blank").unwrap());
         self.dom = Some(parse_html(
@@ -4041,6 +4075,7 @@ impl Page {
         // and a realm cannot be suspended and resumed the way the page's DOM
         // can, so they are rebuilt when the page next loads a document.
         self.frames.clear();
+        self.spare_frames.clear();
         self.js = None;
     }
 
