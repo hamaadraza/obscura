@@ -305,12 +305,15 @@ fn effective_v8_flags(user: Option<&str>) -> String {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // Pin the process timezone before V8/ICU reads it. V8 sources the zone for
-    // both Date (getTimezoneOffset, toString) and Intl.DateTimeFormat from TZ; left
-    // unset it defaults to UTC for Date while the page layer advertised a different
-    // zone, a cross-surface mismatch fingerprinting scripts flag. Default to
-    // Europe/Berlin; set OBSCURA_TIMEZONE to match the exit IP's region. An existing
-    // TZ from the host is respected.
+    // Pin the process timezone before V8/ICU reads it. On POSIX hosts ICU
+    // consults TZ for both Date (getTimezoneOffset, toString) and
+    // Intl.DateTimeFormat; left unset it defaults to UTC for Date while the page
+    // layer advertised a different zone, a cross-surface mismatch fingerprinting
+    // scripts flag. Default to Europe/Berlin; set OBSCURA_TIMEZONE to match the
+    // exit IP's region. An existing TZ from the host is respected. Windows ICU
+    // ignores TZ entirely, so obscura-js additionally pins ICU's default zone
+    // from the same variables at isolate creation (pin_icu_default_time_zone in
+    // runtime.rs); this export keeps the two resolutions consistent.
     // SAFETY: runs before any V8 isolate or worker thread starts, so the env is
     // effectively single threaded here.
     if let Some(tz) = std::env::var("OBSCURA_TIMEZONE")

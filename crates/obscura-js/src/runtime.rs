@@ -50,6 +50,49 @@ static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 /// parallel, each isolate on its own thread with no shared lock.
 static ISOLATE_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+// The CLI pins the browser time zone by exporting TZ before V8 starts, but TZ
+// is a POSIX mechanism: ICU on Windows resolves the default zone from the OS
+// and never consults it, so Date and Intl leaked the operator's real zone
+// there. Set ICU's process default explicitly instead. rusty_v8 does not wrap
+// ucal, but the static V8 library compiles ICU with versioned C symbol
+// renaming and exports them (v8::icu::set_common_data_74 binds the same way),
+// so bind the renamed symbol directly. The `_74` suffix is ICU's major version
+// in v8 137; an ICU bump in a future v8 upgrade fails the link loudly rather
+// than silently reverting to the host zone.
+unsafe extern "C" {
+    fn ucal_setDefaultTimeZone_74(zone_id: *const u16, status: *mut i32);
+}
+
+/// The zone every JS surface must report: OBSCURA_TIMEZONE overrides, an
+/// operator-provided TZ is respected, and the default matches the CLI's
+/// Europe/Berlin pin so library embedders get the same fingerprint.
+fn pinned_time_zone() -> String {
+    for var in ["OBSCURA_TIMEZONE", "TZ"] {
+        if let Some(zone) = std::env::var(var)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            return zone;
+        }
+    }
+    "Europe/Berlin".to_string()
+}
+
+/// Pin ICU's process-wide default time zone. Must run after deno_core's V8
+/// init has loaded the ICU data bundle (ucal resolves the zone id against it),
+/// i.e. only once the first `JsRuntime` exists.
+fn pin_icu_default_time_zone() {
+    let zone = pinned_time_zone();
+    let zone_utf16: Vec<u16> =
+        zone.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut status = 0i32;
+    unsafe { ucal_setDefaultTimeZone_74(zone_utf16.as_ptr(), &mut status) };
+    if status > 0 {
+        tracing::warn!(%zone, status, "failed to pin the ICU default time zone");
+    }
+}
+
 const DEFAULT_CDP_AWAIT_TIMEOUT_MS: u64 = 30_000;
 const HEAP_LIMIT_RECOVERY_HEADROOM_BYTES: usize = 64 * 1024 * 1024;
 
@@ -332,6 +375,18 @@ impl ObscuraJsRuntime {
                 startup_snapshot: Some(SNAPSHOT),
                 ..Default::default()
             });
+
+            // ICU's zone database is only loaded once JsRuntime::new has run
+            // deno_core's V8 init, so the time-zone pin cannot join the locale
+            // pin above. Skip (not Redetect) keeps the pinned zone: Redetect
+            // would ask ICU for the host zone again, which on Windows is the
+            // OS zone the pin exists to hide.
+            pin_icu_default_time_zone();
+            runtime
+                .v8_isolate()
+                .date_time_configuration_change_notification(
+                    deno_core::v8::TimeZoneDetection::Skip,
+                );
 
             {
                 let op_state = runtime.op_state();
@@ -16991,6 +17046,38 @@ mod tests {
             result,
             serde_json::json!("en-US|en-US"),
             "Intl must not leak the host OS locale while navigator.language says en-US"
+        );
+    }
+
+    /// The TZ env pin is POSIX-only: ICU on Windows reads the OS zone and
+    /// ignores TZ, so Date and Intl leaked the operator's real time zone. The
+    /// ICU-level pin must win on every platform, and Date must agree with Intl
+    /// (a cross-surface mismatch is exactly what fingerprinting scripts flag).
+    #[test]
+    fn date_and_intl_report_the_pinned_time_zone_regardless_of_host() {
+        // nextest runs each test in its own process, so setting the zone here
+        // cannot race another test's V8 init. The pin is re-read at every
+        // isolate creation, so two runtimes with two zones prove the value
+        // comes from the pin and not from a host that happens to match one of
+        // them. Both zones have held their offset since before the epoch date
+        // asserted here, observe no DST, and have no alternate ICU spelling
+        // (Asia/Kathmandu, for example, canonicalizes to Asia/Katmandu and was
+        // +05:30 until 1986).
+        let check = "Intl.DateTimeFormat().resolvedOptions().timeZone + '|' + new Date(0).getTimezoneOffset()";
+        std::env::set_var("OBSCURA_TIMEZONE", "Asia/Tokyo");
+        let mut tokyo = setup_runtime("<html><body></body></html>");
+        assert_eq!(
+            tokyo.evaluate(check).unwrap(),
+            serde_json::json!("Asia/Tokyo|-540"),
+            "Date and Intl must both report the pinned zone, not the host zone"
+        );
+        drop(tokyo);
+        std::env::set_var("OBSCURA_TIMEZONE", "Pacific/Honolulu");
+        let mut honolulu = setup_runtime("<html><body></body></html>");
+        assert_eq!(
+            honolulu.evaluate(check).unwrap(),
+            serde_json::json!("Pacific/Honolulu|600"),
+            "a fresh isolate must pick up a changed OBSCURA_TIMEZONE"
         );
     }
 }
