@@ -148,6 +148,17 @@ pub struct ObscuraState {
     pub pending_frames: Vec<PendingFrame>,
     /// Total URL and HTML bytes held by `pending_frames`.
     pub pending_frame_bytes: usize,
+    /// Blank frame realms the Page built ahead of demand that nobody has
+    /// claimed yet.
+    ///
+    /// The queue-and-drain path above cannot serve a blank frame: script that
+    /// creates an iframe and reads `contentWindow` in the same task never
+    /// yields, so there is no drain between the two. Keeping realms ready lets
+    /// those reads be answered synchronously. A small pool rather than one,
+    /// because the shape that needs this builds a blank frame and then another
+    /// blank frame inside it without ever yielding. Page refills the pool on
+    /// its next turn; a longer burst falls back to the queue.
+    pub spare_blank_frames: Vec<u32>,
     pub frame_id_counter: u32,
     /// Which frame this state belongs to; 0 is the page's own realm.
     pub frame_id: u32,
@@ -304,6 +315,7 @@ impl ObscuraState {
             js_network_events: Vec::new(),
             pending_frames: Vec::new(),
             pending_frame_bytes: 0,
+            spare_blank_frames: Vec::new(),
             frame_id_counter: 0,
             frame_id: 0,
             pending_frame_messages: Vec::new(),
@@ -482,6 +494,14 @@ impl RealmStates {
 
     pub fn forget(&mut self, context: &v8::Global<v8::Context>) {
         self.entries.retain(|(known, _, _)| known != context);
+    }
+
+    /// Every registered realm's context, so the host can install something in
+    /// all of them (the frame-object registry is published this way: a frame
+    /// that builds its own child needs to resolve it without going through
+    /// `top`, which is a wrapper rather than the page's global).
+    pub fn contexts(&self) -> Vec<v8::Global<v8::Context>> {
+        self.entries.iter().map(|(ctx, _, _)| ctx.clone()).collect()
     }
 
     fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
@@ -3607,6 +3627,32 @@ const MAX_PENDING_FRAME_BYTES: usize = 32 * 1024 * 1024;
 // Hands a fetched frame document to the host and returns the id the frame will
 // have. The realm itself is built later, by whoever owns the runtime. A zero
 // id means the bounded native queue refused the document.
+/// Claims the blank frame realm the Page built in advance, if it is still
+/// spare. Returns 0 when there is none, and the caller falls back to queueing.
+///
+/// A blank frame has no document to fetch, so nothing makes the creating task
+/// yield before its `contentWindow` is read. That read has to be answered from
+/// a realm that already exists, which is what the spare is for.
+#[op2(fast)]
+fn op_take_blank_frame_realm(_scope: &mut v8::HandleScope, state: &OpState) -> u32 {
+    // Served to any realm, not just the page's. A blank frame nested inside
+    // another frame is exactly the shape fingerprinting scripts build (an
+    // iframe inside their reference iframe), and it has the same no-yield
+    // problem. The spare is built with the page as its parent, so the claiming
+    // realm re-points the child's `parent` at itself; `top` is the page at
+    // every depth and is already correct.
+    let gs = state.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    if gs.spare_blank_frames.is_empty() {
+        return 0;
+    }
+    // Oldest first. A realm only receives registry entries published after it
+    // was built, so the frame handed out first must be the one that already
+    // knows about the spares still queued behind it. That is what lets a
+    // claimed frame resolve a blank child it claims in the same task.
+    gs.spare_blank_frames.remove(0)
+}
+
 #[op2(fast)]
 fn op_frame_document_ready(
     scope: &mut v8::HandleScope,
@@ -4405,6 +4451,7 @@ pub fn build_extension() -> Extension {
         op_set_cookie(),
         op_navigate(),
         op_frame_document_ready(),
+        op_take_blank_frame_realm(),
         op_post_frame_message(),
         op_sleep(),
         op_async_runtime_available(),

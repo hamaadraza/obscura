@@ -1220,6 +1220,13 @@ impl Page {
             }
         }
 
+        // A spare blank realm has no element yet, so the liveness query cannot
+        // see it. Hold the unclaimed ones, or they would be torn down on the
+        // very turn they were built.
+        if let Some(js) = self.js.as_ref() {
+            live.extend(js.spare_blank_frames());
+        }
+
         let discarded: Vec<(u32, u32)> = self
             .frames
             .iter()
@@ -1250,7 +1257,53 @@ impl Page {
         let attached = self.attach_pending_frames().await;
         let delivered = self.deliver_frame_messages();
         self.release_detached_frames();
+        self.replenish_blank_frame_spare();
         attached || delivered
+    }
+
+    /// Keeps one blank frame realm built ahead of demand.
+    ///
+    /// A frame with a `src` yields while its document is fetched, which is the
+    /// gap the pending-frame queue fills. A blank frame has nothing to fetch,
+    /// so a script that appends the iframe and reads `contentWindow` in the
+    /// same task never yields, and a realm built between turns arrives too
+    /// late. Building one in advance is what lets that read be answered with a
+    /// real realm instead of a shim.
+    ///
+    /// One spare covers the common shape (a page builds a blank frame, reads
+    /// it, drops it). A burst of blank frames in one task exhausts the spare
+    /// and the rest fall back to the queue.
+    fn replenish_blank_frame_spare(&mut self) {
+        const BLANK_FRAME_HTML: &str = "<!DOCTYPE html><html><head></head><body></body></html>";
+        // Enough for a blank frame that itself builds a blank frame, which is
+        // the deepest shape seen in the wild, plus one. Each spare is a live V8
+        // context, so this is deliberately small; a longer burst falls back to
+        // the queue rather than growing the isolate.
+        const SPARE_BLANK_FRAMES: usize = 3;
+
+        loop {
+            let Some(js) = self.js.as_ref() else { return };
+            if js.spare_blank_frames().len() >= SPARE_BLANK_FRAMES {
+                return;
+            }
+            // A spare is a live realm, so it counts against the same cap as any
+            // frame the page asked for.
+            if self.frames.len() >= max_live_frames() {
+                return;
+            }
+            let Some(frame_id) = js.reserve_frame_id() else {
+                return;
+            };
+            let Some(js) = self.js.as_mut() else { return };
+            let Some(realm) = FrameRealm::new(js, frame_id, 0, "about:blank", BLANK_FRAME_HTML)
+            else {
+                tracing::debug!("could not pre-build a blank frame realm");
+                return;
+            };
+            self.frames.push(realm);
+            let Some(js) = self.js.as_ref() else { return };
+            js.offer_spare_blank_frame(frame_id);
+        }
     }
 
     /// URLs of the page's live child frames, in creation order.
@@ -1486,6 +1539,11 @@ impl Page {
         );
 
         self.js = Some(rt);
+        // Before any document script runs, so a script that creates a blank
+        // iframe and reads its contentWindow in that same first task still
+        // gets a real realm. Waiting for the first `advance_frames` would be
+        // too late for exactly the load-time code that does this.
+        self.replenish_blank_frame_spare();
     }
 
     /// Resolve the document base URL per HTML spec:

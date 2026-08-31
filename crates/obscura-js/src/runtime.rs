@@ -604,7 +604,7 @@ impl ObscuraJsRuntime {
     ) {
         use deno_core::v8;
 
-        const IDENTITY_GLOBALS: [&str; 7] = [
+        const IDENTITY_GLOBALS: [&str; 11] = [
             "__obscura_ua",
             "__obscura_platform",
             "__obscura_ua_platform",
@@ -612,6 +612,16 @@ impl ObscuraJsRuntime {
             "__obscura_stealth",
             "__obscura_geo_lat",
             "__obscura_geo_lon",
+            // The fingerprint seed, so every realm of one page derives the
+            // same GPU, screen, core count and canvas noise. Without it a
+            // frame rolled its own and disagreed with its parent about the
+            // machine they are both supposedly running on.
+            "__obscura_fpSeed",
+            // The display is a property of the screen, not of a browsing
+            // context, so an override the page carries applies in its frames.
+            "__obscura_screen_w",
+            "__obscura_screen_h",
+            "__obscura_screen_emulated",
         ];
 
         let main = self.runtime.main_context();
@@ -708,37 +718,18 @@ impl ObscuraJsRuntime {
     /// for a same-origin frame. `contentWindow.someGlobal` is then a plain
     /// property read of the frame's own object, and `contentDocument` is the
     /// document the frame's scripts actually mutated.
-    pub(crate) fn publish_realm_objects(
-        &mut self,
-        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+    /// Installs `__obscura_frameObjects[frame_id] = {window, document}` in the
+    /// context the scope is already entered on.
+    fn install_frame_object(
+        scope: &mut deno_core::v8::HandleScope,
+        context: deno_core::v8::Local<deno_core::v8::Context>,
         frame_id: u32,
+        frame_window: &deno_core::v8::Global<deno_core::v8::Object>,
+        frame_document: &Option<deno_core::v8::Global<deno_core::v8::Value>>,
     ) -> bool {
         use deno_core::v8;
 
-        let main = self.runtime.main_context();
-        let isolate = self.runtime.v8_isolate();
-        let scope = &mut v8::HandleScope::new(isolate);
-
-        // Read the frame's globals first, then install them in the page realm.
-        // Both contexts belong to this isolate, so the handles stay valid
-        // across the switch.
-        let realm_context = v8::Local::new(scope, realm);
-        let (frame_window, frame_document) = {
-            let scope = &mut v8::ContextScope::new(scope, realm_context);
-            let global = realm_context.global(scope);
-            let Some(key) = v8::String::new(scope, "document") else {
-                return false;
-            };
-            let document = global.get(scope, key.into());
-            (
-                v8::Global::new(scope, global),
-                document.map(|value| v8::Global::new(scope, value)),
-            )
-        };
-
-        let main_context = v8::Local::new(scope, main);
-        let scope = &mut v8::ContextScope::new(scope, main_context);
-        let global = main_context.global(scope);
+        let global = context.global(scope);
         let Some(registry_key) = v8::String::new(scope, "__obscura_frameObjects") else {
             return false;
         };
@@ -761,12 +752,72 @@ impl ObscuraJsRuntime {
         }
         if let (Some(key), Some(document)) = (
             v8::String::new(scope, "document"),
-            frame_document.map(|document| v8::Local::new(scope, document)),
+            frame_document
+                .as_ref()
+                .map(|document| v8::Local::new(scope, document)),
         ) {
             entry.set(scope, key.into(), document);
         }
         let index = v8::Integer::new_from_unsigned(scope, frame_id);
         registry.set(scope, index.into(), entry.into()).unwrap_or(false)
+    }
+
+    pub(crate) fn publish_realm_objects(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+        frame_id: u32,
+    ) -> bool {
+        use deno_core::v8;
+
+        // Collected before the isolate is borrowed for the scope below.
+        let others: Vec<v8::Global<v8::Context>> = self
+            .realm_states()
+            .borrow()
+            .contexts()
+            .into_iter()
+            .filter(|context| context != realm)
+            .collect();
+
+        let main = self.runtime.main_context();
+        let isolate = self.runtime.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+
+        // Read the frame's globals first, then install them in the page realm.
+        // Both contexts belong to this isolate, so the handles stay valid
+        // across the switch.
+        let realm_context = v8::Local::new(scope, realm);
+        let (frame_window, frame_document) = {
+            let scope = &mut v8::ContextScope::new(scope, realm_context);
+            let global = realm_context.global(scope);
+            let Some(key) = v8::String::new(scope, "document") else {
+                return false;
+            };
+            let document = global.get(scope, key.into());
+            (
+                v8::Global::new(scope, global),
+                document.map(|value| v8::Global::new(scope, value)),
+            )
+        };
+
+        // Published into every realm, not only the page's. A frame that builds
+        // a blank child of its own resolves it through its own registry; the
+        // only other route is `top`, which is a postMessage wrapper rather than
+        // the page's global and carries no registry.
+        for context in others {
+            let context = v8::Local::new(scope, &context);
+            let scope = &mut v8::ContextScope::new(scope, context);
+            Self::install_frame_object(scope, context, frame_id, &frame_window, &frame_document);
+        }
+
+        let main_context = v8::Local::new(scope, main);
+        let scope = &mut v8::ContextScope::new(scope, main_context);
+        Self::install_frame_object(
+            scope,
+            main_context,
+            frame_id,
+            &frame_window,
+            &frame_document,
+        )
     }
 
     /// The table ops consult to find the calling realm's document.
@@ -785,6 +836,25 @@ impl ObscuraJsRuntime {
         let mut state = self.state.borrow_mut();
         state.pending_frame_bytes = 0;
         std::mem::take(&mut state.pending_frames)
+    }
+
+    /// Reserves the next frame id for a realm the host builds on its own,
+    /// rather than in response to a document the page queued.
+    pub fn reserve_frame_id(&self) -> Option<u32> {
+        let mut state = self.state.borrow_mut();
+        let next = state.frame_id_counter.checked_add(1)?;
+        state.frame_id_counter = next;
+        Some(next)
+    }
+
+    /// Offers a pre-built blank frame realm for the next synchronous claim.
+    pub fn offer_spare_blank_frame(&self, frame_id: u32) {
+        self.state.borrow_mut().spare_blank_frames.push(frame_id);
+    }
+
+    /// The pre-built blank frame realms nobody has claimed yet.
+    pub fn spare_blank_frames(&self) -> Vec<u32> {
+        self.state.borrow().spare_blank_frames.clone()
     }
 
     /// postMessage traffic waiting to be delivered to another realm.

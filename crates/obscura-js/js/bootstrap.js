@@ -24,7 +24,7 @@
     '__markParserScripts', '__obscura_hasPendingDynamicScripts',
     '__obscura_hasPendingLoadDelayingScripts',
     '__obscura_nextPendingTimeoutDelay',
-    '__obscura_hw', '__obscura_mem',
+    '__obscura_hw', '__obscura_mem', '__obscura_fpSeed',
     '__documentReadyState__', '__currentUrl',
     // internal helpers (var-declared throughout the file)
     '__processDynScriptQueue', '_decodeDataScriptUrl', '_markNative', '_fpRand', '_fpNoise',
@@ -3192,6 +3192,10 @@ function _animationsForTarget(target) {
   });
 }
 
+// The document a frame gets when it has no src. Shared so the shim document
+// and the realm the host builds for it start from the same markup.
+const _BLANK_FRAME_HTML = '<!DOCTYPE html><html><head></head><body></body></html>';
+
 class Element extends Node {
   constructor(nid) {
     const entry = _customElementConstructionStack[_customElementConstructionStack.length - 1];
@@ -4180,10 +4184,82 @@ class Element extends Node {
       delete globalThis.__obscura_frameWindows[oldId];
     }
     this._frameId = 0;
+    this._blankRealmRequested = false;
     this._iframeLoadingUrl = null;
-    this._iframeDoc = new _IframeDocument(
-      '<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
+    this._iframeDoc = new _IframeDocument(_BLANK_FRAME_HTML, 'about:blank', this);
     this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank');
+  }
+  // A blank frame (no src, or src="about:blank") never reaches
+  // `_loadIframeSrc`, so it never asked the host for a realm and
+  // `contentWindow` fell back to the `_IframeWindow` shim: an object with no
+  // intrinsics of its own, sharing the parent's Function.prototype.toString
+  // and navigator. That is both wrong (a blank frame is a real browsing
+  // context with its own realm) and conspicuous, because fingerprinting
+  // scripts open a fresh about:blank frame precisely to read an untampered
+  // reference realm. Queue the blank document through the same path a src'd
+  // frame uses; the host builds the realm between event loop turns and
+  // publishes its window, after which `_frameObjectsFor` finds the real one.
+  //
+  // Requested on first access rather than on insertion: a realm is a live V8
+  // context, and pages mount iframes (ad slots, trackers) whose content window
+  // nothing ever touches.
+  _requestBlankFrameRealm() {
+    if (this.localName !== 'iframe') return;
+    if (this._frameId || this._blankRealmRequested) return;
+    // A src load owns the frame; it queues its own document when it resolves.
+    if (this._iframeLoadingUrl) return;
+    const src = this.getAttribute('src');
+    if (src && src !== 'about:blank') return;
+    // A frame outside the document has no browsing context yet.
+    if (!this.isConnected) return;
+    this._blankRealmRequested = true;
+    // Claim the realm the host built in advance. This is the path that matters:
+    // a script which appends the frame and reads `contentWindow` in the same
+    // task never yields, so a realm queued here would arrive after the read.
+    let frameId = 0;
+    const claim = Deno.core.ops.op_take_blank_frame_realm;
+    if (typeof claim === 'function') {
+      try { frameId = claim() >>> 0; } catch (_e) { frameId = 0; }
+    }
+    if (!frameId) {
+      // No spare (a burst of blank frames, or a nested frame asking): queue the
+      // document so the realm exists from the next turn on.
+      const op = Deno.core.ops.op_frame_document_ready;
+      if (typeof op !== 'function') return;
+      let width = 300, height = 150;
+      try {
+        const box = this.getBoundingClientRect();
+        width = Math.round(box.width) || 300;
+        height = Math.round(box.height) || 150;
+      } catch (_e) {}
+      frameId = op('about:blank', _BLANK_FRAME_HTML, width, height);
+    }
+    if (!frameId) return;
+    this._frameId = frameId;
+    // The spare was built with the page as its parent. When a frame claims one,
+    // re-point the child's `parent` at the claiming realm, or a document nested
+    // two deep would believe the page is its immediate parent. `top` is the
+    // page at every depth, so it is already right. Both were installed
+    // configurable by _installFramingRelationships for exactly this.
+    if (globalThis.__obscura_frameId) {
+      const entry = _frameObjectEntry(frameId);
+      const childWindow = entry && entry.window;
+      if (childWindow && childWindow !== globalThis) {
+        try {
+          childWindow.__obscura_parentFrameId = globalThis.__obscura_frameId >>> 0;
+          Object.defineProperty(childWindow, 'parent', {
+            value: globalThis, writable: false, enumerable: true, configurable: true,
+          });
+        } catch (_e) {}
+      }
+    }
+    if (!this._iframeDoc) {
+      this._iframeDoc = new _IframeDocument(_BLANK_FRAME_HTML, 'about:blank', this);
+      this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank');
+    }
+    this._iframeWin._frameId = frameId;
+    globalThis.__obscura_frameElements[frameId] = this;
+    globalThis.__obscura_frameWindows[frameId] = this._iframeWin;
   }
   _loadIframeSrc(url) {
     let fullUrl = url;
@@ -4237,6 +4313,7 @@ class Element extends Node {
   }
   get contentDocument() {
     if (this.localName !== 'iframe') return undefined;
+    this._requestBlankFrameRealm();
     const real = _frameObjectsFor(this);
     if (real?.document) return real.document;
     if (this._iframeDoc) {
@@ -4248,13 +4325,14 @@ class Element extends Node {
       return null; // Cross-origin: blocked
     }
     if (!this._iframeDoc) {
-      this._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
+      this._iframeDoc = new _IframeDocument(_BLANK_FRAME_HTML, 'about:blank', this);
       this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank');
     }
     return this._iframeDoc;
   }
   get contentWindow() {
     if (this.localName !== 'iframe') return undefined;
+    this._requestBlankFrameRealm();
     if (_frameObjectsFor(this)) {
       const win = _frameWindowFor(this._frameId);
       if (win) return win;
@@ -12357,11 +12435,28 @@ function _sendRealmMessage(targetFrameId, data) {
 // A free function, not a getter on Element.prototype: every own property of a
 // public interface is visible to anything that walks it, and real Chrome has no
 // such member.
+// The host publishes a realm's window and document on the *page* realm's
+// registry, so a frame looking up one of its own children finds nothing in its
+// own global. `top` is the page at every depth and is same-origin here, so it
+// is the registry of record; the local one is checked first because the page
+// realm is its own `top`.
+function _frameObjectEntry(frameId) {
+  if (!frameId) return null;
+  const local = globalThis.__obscura_frameObjects?.[frameId];
+  if (local) return local;
+  try {
+    const page = globalThis.top;
+    if (page && page !== globalThis) {
+      return page.__obscura_frameObjects?.[frameId] || null;
+    }
+  } catch (_e) {}
+  return null;
+}
+
 function _frameObjectsFor(element) {
   const frameId = element._frameId;
   if (!frameId) return null;
-  const entry = globalThis.__obscura_frameObjects[frameId];
-  return entry || null;
+  return _frameObjectEntry(frameId);
 }
 
 // The window object this realm uses to stand for frame `frameId`, built once
@@ -12373,7 +12468,7 @@ function _frameObjectsFor(element) {
 // and receiver, losing the sender's origin and source.
 function _frameWindowFor(frameId) {
   if (!frameId) return null;
-  const real = globalThis.__obscura_frameObjects?.[frameId]?.window;
+  const real = _frameObjectEntry(frameId)?.window;
   const existing = globalThis.__obscura_frameWindows[frameId];
   if (!real) return existing || null;
   if (existing && existing.__obscura_wrapsRealm) return existing;
@@ -15355,7 +15450,16 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
 globalThis.__obscura_init = function() {
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
-  _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
+  // One page is one machine, so every realm in it must derive the same
+  // fingerprint. A frame that rolled its own seed reported a different GPU,
+  // screen and core count than its parent, and comparing a document against a
+  // freshly made iframe is exactly the check fingerprinting scripts run. The
+  // host copies the page's seed onto a frame's global before calling this
+  // (IDENTITY_GLOBALS in runtime.rs), so a frame inherits and the page seeds.
+  _fpSeed = typeof globalThis.__obscura_fpSeed === 'number' && globalThis.__obscura_fpSeed
+    ? globalThis.__obscura_fpSeed
+    : (Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0));
+  globalThis.__obscura_fpSeed = _fpSeed;
   _fpCache = null;
   // A real navigation just completed (this runs after set_url), so drop any
   // URL a location setter previewed synchronously and let document_url drive

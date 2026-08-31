@@ -70,8 +70,20 @@ impl FrameRealm {
         // keeps its own security token, so V8 answers `undefined` for any
         // property the page tries to read out of it, and nothing about it is
         // published below.
-        let origin = origin_of(url);
-        let same_origin = origin != "null" && origin == parent.page_origin();
+        //
+        // `about:blank` parses to an opaque origin, but a blank frame inherits
+        // the origin of the document that created it (HTML's "create a new
+        // browsing context" steps), so it is reachable exactly like any
+        // same-origin frame. Treating it as opaque left blank frames without
+        // published objects, which is what forced `contentWindow` onto the
+        // realm-less shim.
+        let parent_origin = parent.page_origin();
+        let origin = if url.is_empty() || url == "about:blank" {
+            parent_origin.clone()
+        } else {
+            origin_of(url)
+        };
+        let same_origin = origin != "null" && origin == parent_origin;
         if same_origin {
             parent.share_security_token_with_realm(&context);
         }
@@ -993,9 +1005,13 @@ mod tests {
     }
 
     #[test]
-    fn opaque_origin_frames_are_never_same_origin() {
+    fn blank_frames_inherit_the_creator_origin_and_opaque_ones_do_not() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
-        let frame = FrameRealm::new(
+        // `about:blank` parses to an opaque origin, but a blank frame inherits
+        // the origin of the document that created it, which is why a page can
+        // read `contentDocument` out of an iframe it just appended. Treating it
+        // as opaque left blank frames unreachable from their own creator.
+        let blank = FrameRealm::new(
             &mut parent,
             1,
             0,
@@ -1003,8 +1019,22 @@ mod tests {
             "<html><body></body></html>",
         )
         .expect("frame realm");
-        assert_eq!(frame.origin(), "null");
-        assert!(!frame.is_same_origin_as("null"));
-        assert!(!frame.is_same_origin_as("https://parent.example"));
+        assert_eq!(blank.origin(), "https://parent.example");
+        assert!(blank.is_same_origin_as("https://parent.example"));
+        assert!(!blank.is_same_origin_as("null"));
+
+        // A document that carries its own opaque origin inherits nothing and
+        // stays unreachable.
+        let opaque = FrameRealm::new(
+            &mut parent,
+            2,
+            0,
+            "data:text/html,<p>opaque",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+        assert_eq!(opaque.origin(), "null");
+        assert!(!opaque.is_same_origin_as("null"));
+        assert!(!opaque.is_same_origin_as("https://parent.example"));
     }
 }
