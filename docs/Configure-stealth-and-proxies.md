@@ -69,7 +69,7 @@ Default UA matches a recent Chrome on the build platform.
 
 ## Browser profile, timezone, and geolocation
 
-The engine presents one of a built-in pool of realistic browser profiles (a mix of Windows and macOS, recent Chrome versions). Each profile keeps `navigator.platform`, `navigator.userAgentData` (platform and platform version), and the UA string internally consistent, so the surfaces a site fingerprints agree with each other. There is no GPU renderer among them: `canvas.getContext('webgl')` returns `null`, so a page cannot read a renderer string at all.
+The engine presents one of a built-in pool of realistic browser profiles (a mix of Windows and macOS, recent Chrome versions). Each profile keeps `navigator.platform`, `navigator.userAgentData` (platform and platform version), and the UA string internally consistent, so the surfaces a site fingerprints agree with each other. WebGL `getContext` returns a context whose `VENDOR` / `RENDERER` and `WEBGL_debug_renderer_info` values come from that same profile.
 
 A single stable profile is used by default. One IP cycling through different identities is itself a signal, so rotation is opt-in:
 

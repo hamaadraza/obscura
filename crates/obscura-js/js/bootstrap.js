@@ -29,6 +29,7 @@
     // internal helpers (var-declared throughout the file)
     '__processDynScriptQueue', '_decodeDataScriptUrl', '_markNative', '_fpRand', '_fpNoise',
     '_fpCache', '_getFp', '_fp', '_splitAsciiWhitespace',
+    '_createWebGLContext',
     '_getElementsByClassName', '_docEncoding', '_docIsUtf8',
     '_isSpecialScheme', '_applyDocQueryEncoding', '_anchorBase',
     '_elemHrefURL', '_setElemHrefPart', '_pad', '_daysInMonth',
@@ -58,7 +59,8 @@
     'MessageChannel', 'MessagePort', 'BroadcastChannel', 'CustomElementRegistry',
     'Scheduler',
     'XMLHttpRequestEventTarget', 'HTMLMediaElement', 'HTMLVideoElement',
-    'HTMLAudioElement', 'WebGL2RenderingContext',
+    'HTMLAudioElement', 'WebGLRenderingContext', 'WebGL2RenderingContext',
+    'HTMLCanvasElement', 'CanvasRenderingContext2D',
     'SVGElement', 'SVGGraphicsElement', 'SVGGeometryElement', 'SVGPathElement',
     'SVGSVGElement',
   ];
@@ -156,11 +158,23 @@ const _origToString = Function.prototype.toString;
 // does not add an own `prototype` property.
 const _functionToString = {
   toString() {
-    if (_nativeStr.has(this)) { return _nativeStr.get(this); }
-    if (_nativeFns.has(this)) {
-      return `function ${this.name || ''}() { [native code] }`;
+    // WeakSet.has throws on primitives. V8's stack formatter can call
+    // Function.prototype.toString with a non-function this; a throw there
+    // makes Error.stack a CallSite array instead of a string (Castle's
+    // `error.stack.split` then dies with `n[Hk] is not a function`).
+    try {
+      if (this != null && (typeof this === 'function' || typeof this === 'object')) {
+        if (_nativeStr.has(this)) { return _nativeStr.get(this); }
+        if (_nativeFns.has(this)) {
+          return `function ${this.name || ''}() { [native code] }`;
+        }
+      }
+      return _origToString.call(this);
+    } catch (_e) {
+      try { return _origToString.call(this); } catch (_e2) {
+        return 'function () { [native code] }';
+      }
     }
-    return _origToString.call(this);
   },
 }.toString;
 Function.prototype.toString = _functionToString;
@@ -228,15 +242,101 @@ _nativeFns.add(_functionToString);
 
 const _stackCache = new WeakMap();
 const _origStackDesc = Object.getOwnPropertyDescriptor(Error.prototype, 'stack');
+function _stackToString(value, error) {
+  if (typeof value === 'string') return value;
+  if (value == null) {
+    const name = error && error.name ? String(error.name) : 'Error';
+    const msg = error && error.message ? String(error.message) : '';
+    return msg ? (name + ': ' + msg) : name;
+  }
+  if (Array.isArray(value)) {
+    const lines = [];
+    for (let i = 0; i < value.length; i++) {
+      try { lines.push(String(value[i])); } catch (_e) {}
+    }
+    const head = _stackToString(null, error);
+    return lines.length ? (head + '\n' + lines.join('\n')) : head;
+  }
+  try { return String(value); } catch (_e) { return _stackToString(null, error); }
+}
+// Chrome's Error.prototype.stack is a configurable get/set that always yields
+// a string. A getter-only non-configurable wrapper made V8 hand back the
+// structured CallSite array; Castle then does `error.stack.split("\n")` and
+// throws `n[Hk] is not a function` (cstlxp.js createRequestToken).
+//
+// V8 often installs an *own* stack getter on each Error, so a prototype
+// wrapper is skipped. Native TypeError from Object.setPrototypeOf still has
+// to expose a string: if Error.prepareStackTrace (or a failed stack format)
+// left CallSites on the instance, coerce before the throw escapes.
+function _coerceErrStack(err) {
+  if (!err || (typeof err !== 'object' && typeof err !== 'function')) return;
+  try {
+    let raw;
+    try { raw = err.stack; } catch (_e) { raw = null; }
+    if (typeof raw === 'string') return;
+    const text = _stackToString(raw, err);
+    try { delete err.stack; } catch (_e) {}
+    Object.defineProperty(err, 'stack', {
+      configurable: true, enumerable: false, writable: true, value: text,
+    });
+  } catch (_e) {}
+}
 if (_origStackDesc && _origStackDesc.get) {
   Object.defineProperty(Error.prototype, 'stack', {
-    configurable: false, enumerable: false,
+    configurable: true, enumerable: false,
     get: function() {
-      if (!_stackCache.has(this)) _stackCache.set(this, _origStackDesc.get.call(this));
-      return _stackCache.get(this);
-    }
+      if (_stackCache.has(this)) return _stackCache.get(this);
+      _stackCache.set(this, '');
+      let raw;
+      try { raw = _origStackDesc.get.call(this); } catch (_e) { raw = null; }
+      const text = _stackToString(raw, this);
+      _stackCache.set(this, text);
+      return text;
+    },
+    set: function(v) {
+      _stackCache.set(this, _stackToString(v, this));
+    },
   });
 }
+(function _wrapSetPrototypeOfStack() {
+  const origObject = Object.setPrototypeOf;
+  const origReflect = (typeof Reflect === 'object' && Reflect)
+    ? Reflect.setPrototypeOf : null;
+  function setPrototypeOf(target, proto) {
+    try {
+      return origObject.apply(this, arguments);
+    } catch (err) {
+      _coerceErrStack(err);
+      throw err;
+    }
+  }
+  try {
+    Object.defineProperty(Object, 'setPrototypeOf', {
+      value: _markNative(setPrototypeOf),
+      writable: true, enumerable: false, configurable: true,
+    });
+  } catch (_e) {
+    Object.setPrototypeOf = _markNative(setPrototypeOf);
+  }
+  if (typeof origReflect === 'function') {
+    const reflectSetPrototypeOf = {
+      setPrototypeOf(target, proto) {
+        try {
+          return origReflect.apply(this, arguments);
+        } catch (err) {
+          _coerceErrStack(err);
+          throw err;
+        }
+      },
+    }.setPrototypeOf;
+    try {
+      Object.defineProperty(Reflect, 'setPrototypeOf', {
+        value: _markNative(reflectSetPrototypeOf),
+        writable: true, enumerable: false, configurable: true,
+      });
+    } catch (_e) {}
+  }
+})();
 
 let _fpSeed = 0;
 // Dynamic module/in-order script queue. Module evaluation remains serialized
@@ -6109,7 +6209,23 @@ class HTMLMediaElement extends Element {
   static HAVE_CURRENT_DATA = 2;
   static HAVE_FUTURE_DATA = 3;
   static HAVE_ENOUGH_DATA = 4;
-  canPlayType(_type) { return ''; }
+  canPlayType(type) {
+    const t = String(type || '').trim().toLowerCase();
+    if (!t) return '';
+    const mime = t.split(';')[0].trim();
+    const codecs = t;
+    const probably = {
+      'video/mp4': true, 'video/webm': true, 'video/ogg': true,
+      'audio/mpeg': true, 'audio/mp4': true, 'audio/webm': true,
+      'audio/ogg': true, 'audio/wav': true, 'audio/x-wav': true,
+      'audio/aac': true, 'audio/flac': true, 'audio/x-m4a': true,
+    };
+    if (/avc1|mp4a\.40|mp4a|mp3|mpeg|vp8|vp9|av01|opus|vorbis|theora|pcm/.test(codecs)
+        || probably[mime]) {
+      return 'probably';
+    }
+    return '';
+  }
   load() {}
   play() {
     return Promise.reject(new DOMException(
@@ -7964,6 +8080,8 @@ function _evaluateMediaFeature(raw) {
   if (match) return match[1] === 'light';
   match = feature.match(/^prefers-reduced-motion\s*:\s*(reduce|no-preference)$/);
   if (match) return match[1] === 'no-preference';
+  match = feature.match(/^color-gamut\s*:\s*(srgb|p3|rec2020)$/);
+  if (match) return match[1] === 'srgb' || match[1] === 'p3';
 
   match = feature.match(/^(pointer|any-pointer)\s*:\s*(none|coarse|fine)$/);
   if (match) return match[2] === 'fine';
@@ -12297,10 +12415,97 @@ class _IframeWindow {
 }
 
 // Encode an RGBA pixel buffer into a valid PNG data URL.
-// Uses stored-block DEFLATE (no compression) wrapped in zlib.
-// This produces a larger file than a real browser but the hash is unique
-// per session (from _fpNoise) and valid, so it does not match the known
-// headless stub.
+// zlib+DEFLATE with fixed Huffman and RLE so fingerprint canvases stay at
+// Chrome-like sizes (stored blocks of a 300x150 RGBA buffer were ~240KB and
+// tripped hasModifiedCanvasFingerprint).
+function _deflateZlib(raw) {
+  var bits = [], nbits = 0;
+  function putBits(v, n) {
+    for (var i = 0; i < n; i++) {
+      bits.push((v >> i) & 1);
+      nbits++;
+    }
+  }
+  function putRev(v, n) {
+    for (var i = n - 1; i >= 0; i--) {
+      bits.push((v >> i) & 1);
+      nbits++;
+    }
+  }
+  function putLiteral(c) {
+    if (c <= 143) putRev(0x30 + c, 8);
+    else putRev(0x190 + (c - 144), 9);
+  }
+  function putLength(len) {
+    // RFC 1951 length codes 257-285. Extra bits follow, LSB first.
+    var table = [
+      [257,3,0],[258,4,0],[259,5,0],[260,6,0],[261,7,0],[262,8,0],[263,9,0],[264,10,0],
+      [265,11,1],[266,13,1],[267,15,1],[268,17,1],
+      [269,19,2],[270,23,2],[271,27,2],[272,31,2],
+      [273,35,3],[274,43,3],[275,51,3],[276,59,3],
+      [277,67,4],[278,83,4],[279,99,4],[280,115,4],
+      [281,131,5],[282,163,5],[283,195,5],[284,227,5],
+      [285,258,0],
+    ];
+    var best = table[0];
+    for (var i = 0; i < table.length; i++) {
+      var base = table[i][1], extra = table[i][2];
+      var max = base + (extra ? ((1 << extra) - 1) : 0);
+      if (len >= base && len <= max) { best = table[i]; break; }
+    }
+    var code = best[0], base = best[1], extra = best[2];
+    if (code <= 279) putRev(code - 256, 7);
+    else putRev(0xC0 + (code - 280), 8);
+    if (extra) putBits(len - base, extra);
+  }
+  // BFINAL=1, BTYPE=01 (fixed Huffman)
+  putBits(3, 3);
+  var i = 0;
+  while (i < raw.length) {
+    if (i >= 4) {
+      var pixRun = 0;
+      while (i + pixRun < raw.length && pixRun < 258
+          && raw[i + pixRun] === raw[i + pixRun - 4]) pixRun++;
+      if (pixRun >= 3) {
+        var take = pixRun < 258 ? pixRun : 258;
+        putLength(take);
+        putRev(3, 5);
+        i += take;
+        continue;
+      }
+    }
+    var b = raw[i], run = 1;
+    while (i + run < raw.length && raw[i + run] === b && run < 258) run++;
+    putLiteral(b);
+    var rest = run - 1;
+    if (rest >= 3) {
+      putLength(rest);
+      putRev(0, 5);
+      i += run;
+    } else {
+      i++;
+    }
+  }
+  putRev(0, 7);
+  while (nbits % 8) putBits(0, 1);
+  var out = new Uint8Array(2 + (nbits / 8) + 4);
+  out[0] = 0x78; out[1] = 0x9C;
+  var p = 2;
+  for (var bi = 0; bi < nbits; bi += 8) {
+    var byte = 0;
+    for (var k = 0; k < 8 && bi + k < nbits; k++) byte |= bits[bi + k] << k;
+    out[p++] = byte;
+  }
+  var s1 = 1, s2 = 0, M = 65521;
+  for (var ai = 0; ai < raw.length; ai++) { s1 = (s1 + raw[ai]) % M; s2 = (s2 + s1) % M; }
+  var adler = ((s2 << 16) | s1) >>> 0;
+  out[p++] = (adler >>> 24) & 0xff;
+  out[p++] = (adler >>> 16) & 0xff;
+  out[p++] = (adler >>> 8) & 0xff;
+  out[p++] = adler & 0xff;
+  return out.subarray(0, p);
+}
+
 function _encodePNG(w, h, rgba) {
   // RGBA scanlines: filter byte (0) + 4 bytes per pixel.
   var rowLen = 1 + w * 4;
@@ -12313,23 +12518,7 @@ function _encodePNG(w, h, rgba) {
       raw[d] = rgba[s]; raw[d+1] = rgba[s+1]; raw[d+2] = rgba[s+2]; raw[d+3] = rgba[s+3];
     }
   }
-  // Adler32 of raw
-  var s1 = 1, s2 = 0, M = 65521;
-  for (var i = 0; i < raw.length; i++) { s1 = (s1 + raw[i]) % M; s2 = (s2 + s1) % M; }
-  var adler = ((s2 << 16) | s1) >>> 0;
-  // Stored DEFLATE blocks (zlib level 0)
-  var MAXB = 65535, nb = Math.ceil(raw.length / MAXB) || 1;
-  var dlen = 2 + nb * 5 + raw.length + 4;
-  var def = new Uint8Array(dlen), dp = 0;
-  def[dp++] = 0x78; def[dp++] = 0x01;
-  for (var bi = 0; bi < nb; bi++) {
-    var bs = bi * MAXB, be = Math.min(raw.length, bs + MAXB), bl = be - bs;
-    def[dp++] = bi === nb-1 ? 1 : 0;
-    def[dp++] = bl&0xff; def[dp++] = (bl>>8)&0xff;
-    def[dp++] = (~bl)&0xff; def[dp++] = (~bl>>8)&0xff;
-    def.set(raw.subarray(bs, be), dp); dp += bl;
-  }
-  def[dp++]=(adler>>24)&0xff; def[dp++]=(adler>>16)&0xff; def[dp++]=(adler>>8)&0xff; def[dp]=adler&0xff;
+  var def = _deflateZlib(raw);
   // CRC32 (lazy table)
   if (!_encodePNG._t) {
     var t = new Uint32Array(256);
@@ -12351,7 +12540,7 @@ function _encodePNG(w, h, rgba) {
   ihd[0]=(w>>24)&0xff; ihd[1]=(w>>16)&0xff; ihd[2]=(w>>8)&0xff; ihd[3]=w&0xff;
   ihd[4]=(h>>24)&0xff; ihd[5]=(h>>16)&0xff; ihd[6]=(h>>8)&0xff; ihd[7]=h&0xff;
   ihd[8]=8; ihd[9]=6; // 8-bit RGBA
-  var png = new Uint8Array(8 + 25 + (12+dlen) + 12);
+  var png = new Uint8Array(8 + 25 + (12 + def.length) + 12);
   png.set([0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A]);
   var p = 8;
   p = putChunk(png, p, 'IHDR', ihd);
@@ -12371,8 +12560,12 @@ globalThis.__ariaQuerySelector = function(root, selector) { return null; };
 globalThis.__ariaQuerySelectorAll = async function*(root, selector) { /* yields nothing */ };
 const _MAX_CANVAS_DIMENSION = 32767;
 const _MAX_CANVAS_PIXELS = 67108864;
-class _Canvas2D {
+if (typeof CanvasRenderingContext2D === 'undefined') {
+  globalThis.CanvasRenderingContext2D = class CanvasRenderingContext2D {};
+}
+class _Canvas2D extends CanvasRenderingContext2D {
   constructor(canvas) {
+    super();
     this.canvas = canvas;
     this._damageQueued = false;
     this._resizeFromCanvas();
@@ -12413,9 +12606,7 @@ class _Canvas2D {
         this._buf.byteOffset,
         this._buf.byteLength,
       );
-      if (!register(this.canvas._nid, this._w, this._h, bytes)) {
-        throw new RangeError('Canvas backing store allocation failed');
-      }
+      register(this.canvas._nid, this._w, this._h, bytes);
     }
   }
   _markPaintDamage() {
@@ -12496,15 +12687,18 @@ class _Canvas2D {
     let cx = Math.round(x);
     for (let i = 0; i < str.length; i++) {
       const code = str.charCodeAt(i);
-      for (let row = 0; row < 7; row++) {
-        for (let col = 0; col < 5; col++) {
-          const on = ((_fpRand(code * 100 + row * 10 + col) > 0.45) &&
-                      (row > 0 && row < 6 && col > 0 && col < 4)) ||
-                     (_fpRand(code * 200 + row * 7 + col) > 0.7);
-          if (on) {
-            for (let sy = 0; sy < scale; sy++) {
-              for (let sx = 0; sx < scale; sx++) {
-                this._setPixel(cx + col*scale + sx, Math.round(y) - 7*scale + row*scale + sy, r, g, b, a);
+      if (code !== 32) {
+        const seed = (code * 0x9E3779B1) >>> 0;
+        for (let row = 0; row < 7; row++) {
+          let bits = 0x11;
+          if (row === 0 || row === 6) bits = 0x1F;
+          else if (row > 1 && row < 5) bits = ((seed >>> (row * 5)) & 0x1F) | 0x11;
+          for (let col = 0; col < 5; col++) {
+            if (bits & (1 << col)) {
+              for (let sy = 0; sy < scale; sy++) {
+                for (let sx = 0; sx < scale; sx++) {
+                  this._setPixel(cx + col*scale + sx, Math.round(y) - 7*scale + row*scale + sy, r, g, b, a);
+                }
               }
             }
           }
@@ -12518,7 +12712,21 @@ class _Canvas2D {
   measureText(t) {
     const fontSize = parseInt(this.font) || 10;
     const scale = Math.max(1, Math.round(fontSize / 10));
-    return { width: String(t).length * 6 * scale, actualBoundingBoxAscent: 7*scale, actualBoundingBoxDescent: 2*scale };
+    const str = String(t);
+    const font = String(this.font).toLowerCase();
+    let advance = 5.5;
+    for (let i = 0; i < _commonFonts.length; i++) {
+      const name = _commonFonts[i].toLowerCase();
+      if (font.indexOf(name) !== -1) {
+        advance = 5.2 + (i % 7) * 0.15 + (name.length % 5) * 0.05;
+        break;
+      }
+    }
+    if (/monospace|courier|consolas/.test(font)) advance = 6;
+    else if (/serif|times|georgia|garamond/.test(font) && advance === 5.5) advance = 5.35;
+    else if (/sans-serif|arial|helvetica|segoe|tahoma|verdana/.test(font) && advance === 5.5) advance = 5.55;
+    const width = str.length * advance * scale;
+    return { width, actualBoundingBoxAscent: 7*scale, actualBoundingBoxDescent: 2*scale };
   }
   getImageData(x, y, w, h) {
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
@@ -12651,29 +12859,306 @@ class HTMLCanvasElement extends Element {
 }
 globalThis.HTMLCanvasElement = HTMLCanvasElement;
 
+var _createWebGLContext = null;
+(function _installWebGL() {
+  const C = {
+    DEPTH_BUFFER_BIT: 0x0100, STENCIL_BUFFER_BIT: 0x0400, COLOR_BUFFER_BIT: 0x4000,
+    POINTS: 0x0000, LINES: 0x0001, LINE_LOOP: 0x0002, LINE_STRIP: 0x0003,
+    TRIANGLES: 0x0004, TRIANGLE_STRIP: 0x0005, TRIANGLE_FAN: 0x0006,
+    ZERO: 0, ONE: 1, SRC_ALPHA: 0x0302, ONE_MINUS_SRC_ALPHA: 0x0303,
+    CW: 0x0900, CCW: 0x0901, CULL_FACE: 0x0B44, DEPTH_TEST: 0x0B71, BLEND: 0x0BE2,
+    DITHER: 0x0BD0, SCISSOR_TEST: 0x0C11,
+    MAX_TEXTURE_SIZE: 0x0D33, MAX_VIEWPORT_DIMS: 0x0D3A,
+    MAX_VERTEX_ATTRIBS: 0x8869, MAX_VERTEX_UNIFORM_VECTORS: 0x8DFB,
+    MAX_VARYING_VECTORS: 0x8DFC, MAX_FRAGMENT_UNIFORM_VECTORS: 0x8DFD,
+    MAX_TEXTURE_IMAGE_UNITS: 0x8872, MAX_VERTEX_TEXTURE_IMAGE_UNITS: 0x8B4C,
+    MAX_COMBINED_TEXTURE_IMAGE_UNITS: 0x8B4D, MAX_CUBE_MAP_TEXTURE_SIZE: 0x851C,
+    MAX_RENDERBUFFER_SIZE: 0x84E8,
+    ALIASED_LINE_WIDTH_RANGE: 0x846E, ALIASED_POINT_SIZE_RANGE: 0x846D,
+    RED_BITS: 0x0D52, GREEN_BITS: 0x0D53, BLUE_BITS: 0x0D54, ALPHA_BITS: 0x0D55,
+    DEPTH_BITS: 0x0D56, STENCIL_BITS: 0x0D57,
+    VENDOR: 0x1F00, RENDERER: 0x1F01, VERSION: 0x1F02, SHADING_LANGUAGE_VERSION: 0x8B8C,
+    NEAREST: 0x2600, LINEAR: 0x2601, TEXTURE_2D: 0x0DE1, TEXTURE_BINDING_2D: 0x8069,
+    TEXTURE0: 0x84C0, ARRAY_BUFFER: 0x8892, ELEMENT_ARRAY_BUFFER: 0x8893,
+    STATIC_DRAW: 0x88E4, FLOAT: 0x1406, UNSIGNED_BYTE: 0x1401,
+    UNSIGNED_SHORT: 0x1403, UNSIGNED_INT: 0x1405,
+    RGBA: 0x1908, RGB: 0x1907, RGBA8: 0x8058, DEPTH_COMPONENT: 0x1902,
+    NO_ERROR: 0, NONE: 0, INVALID_ENUM: 0x0500, INVALID_VALUE: 0x0501,
+    VERTEX_SHADER: 0x8B31, FRAGMENT_SHADER: 0x8B30,
+    COMPILE_STATUS: 0x8B81, LINK_STATUS: 0x8B82, VALIDATE_STATUS: 0x8B83,
+    DELETE_STATUS: 0x8B80, ATTACHED_SHADERS: 0x8B85, ACTIVE_UNIFORMS: 0x8B86,
+    ACTIVE_ATTRIBUTES: 0x8B89, SHADER_TYPE: 0x8B4F,
+    FRAMEBUFFER: 0x8D40, RENDERBUFFER: 0x8D41,
+    COLOR_ATTACHMENT0: 0x8CE0, DEPTH_ATTACHMENT: 0x8D00, STENCIL_ATTACHMENT: 0x8D20,
+    HIGH_FLOAT: 0x8DF2, MEDIUM_FLOAT: 0x8DF1, LOW_FLOAT: 0x8DF0,
+    HIGH_INT: 0x8DF5, MEDIUM_INT: 0x8DF4, LOW_INT: 0x8DF3,
+    COLOR_CLEAR_VALUE: 0x0C22, DEPTH_CLEAR_VALUE: 0x0B73, DEPTH_WRITEMASK: 0x0B72,
+    VIEWPORT: 0x0BA2, SCISSOR_BOX: 0x0C10, ARRAY_BUFFER_BINDING: 0x8894,
+    ELEMENT_ARRAY_BUFFER_BINDING: 0x8895, CURRENT_PROGRAM: 0x8B8D,
+    FRAMEBUFFER_BINDING: 0x8CA6, RENDERBUFFER_BINDING: 0x8CA7,
+  };
+  const EXTENSIONS = [
+    'ANGLE_instanced_arrays','EXT_blend_minmax','EXT_color_buffer_half_float',
+    'EXT_float_blend','EXT_frag_depth','EXT_shader_texture_lod',
+    'EXT_texture_compression_bptc','EXT_texture_compression_rgtc',
+    'EXT_texture_filter_anisotropic','OES_element_index_uint',
+    'OES_fbo_render_mipmap','OES_standard_derivatives','OES_texture_float',
+    'OES_texture_float_linear','OES_texture_half_float','OES_texture_half_float_linear',
+    'OES_vertex_array_object','WEBGL_color_buffer_float',
+    'WEBGL_compressed_texture_s3tc','WEBGL_compressed_texture_s3tc_srgb',
+    'WEBGL_debug_renderer_info','WEBGL_debug_shaders','WEBGL_depth_texture',
+    'WEBGL_draw_buffers','WEBGL_lose_context','WEBGL_multi_draw',
+  ];
+  function applyConstants(target) {
+    const names = Object.keys(C);
+    for (let i = 0; i < names.length; i++) target[names[i]] = C[names[i]];
+  }
+  function makeContext(canvas, webgl2) {
+    const gl = webgl2 ? new WebGL2RenderingContext() : new WebGLRenderingContext();
+    applyConstants(gl);
+    gl.canvas = canvas;
+    gl.drawingBufferWidth = canvas.width || 300;
+    gl.drawingBufferHeight = canvas.height || 150;
+    const params = {};
+    params[C.VENDOR] = 'WebKit';
+    params[C.RENDERER] = 'WebKit WebGL';
+    params[C.VERSION] = webgl2
+      ? 'WebGL 2.0 (OpenGL ES 3.0 Chromium)'
+      : 'WebGL 1.0 (OpenGL ES 2.0 Chromium)';
+    params[C.SHADING_LANGUAGE_VERSION] = webgl2
+      ? 'WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)'
+      : 'WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)';
+    params[0x9245] = _fp('gpuVendor');
+    params[0x9246] = _fp('gpu');
+    params[C.MAX_TEXTURE_SIZE] = 16384;
+    params[C.MAX_CUBE_MAP_TEXTURE_SIZE] = 16384;
+    params[C.MAX_RENDERBUFFER_SIZE] = 16384;
+    params[C.MAX_VIEWPORT_DIMS] = new Int32Array([32767, 32767]);
+    params[C.MAX_VERTEX_ATTRIBS] = 16;
+    params[C.MAX_VERTEX_UNIFORM_VECTORS] = 4096;
+    params[C.MAX_VARYING_VECTORS] = 30;
+    params[C.MAX_FRAGMENT_UNIFORM_VECTORS] = 1024;
+    params[C.MAX_TEXTURE_IMAGE_UNITS] = 16;
+    params[C.MAX_VERTEX_TEXTURE_IMAGE_UNITS] = 16;
+    params[C.MAX_COMBINED_TEXTURE_IMAGE_UNITS] = 32;
+    params[C.ALIASED_LINE_WIDTH_RANGE] = new Float32Array([1, 1]);
+    params[C.ALIASED_POINT_SIZE_RANGE] = new Float32Array([1, 1024]);
+    params[C.RED_BITS] = 8; params[C.GREEN_BITS] = 8; params[C.BLUE_BITS] = 8;
+    params[C.ALPHA_BITS] = 8; params[C.DEPTH_BITS] = 24; params[C.STENCIL_BITS] = 8;
+    params[C.COLOR_CLEAR_VALUE] = new Float32Array([0, 0, 0, 0]);
+    params[C.DEPTH_CLEAR_VALUE] = 1;
+    params[C.DEPTH_WRITEMASK] = true;
+    params[C.VIEWPORT] = new Int32Array([0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight]);
+    params[C.SCISSOR_BOX] = new Int32Array([0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight]);
+    params[C.ARRAY_BUFFER_BINDING] = null;
+    params[C.ELEMENT_ARRAY_BUFFER_BINDING] = null;
+    params[C.CURRENT_PROGRAM] = null;
+    params[C.FRAMEBUFFER_BINDING] = null;
+    params[C.RENDERBUFFER_BINDING] = null;
+    params[C.TEXTURE_BINDING_2D] = null;
+    const extensions = Object.create(null);
+    gl.getSupportedExtensions = function() { return EXTENSIONS.slice(); };
+    gl.getExtension = function(name) {
+      const key = String(name || '');
+      if (EXTENSIONS.indexOf(key) === -1) return null;
+      if (extensions[key]) return extensions[key];
+      let ext = {};
+      if (key === 'WEBGL_debug_renderer_info') {
+        ext = { UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246 };
+      } else if (key === 'WEBGL_lose_context') {
+        ext = { loseContext() {}, restoreContext() {} };
+      } else if (key === 'EXT_texture_filter_anisotropic') {
+        ext = { MAX_TEXTURE_MAX_ANISOTROPY_EXT: 0x84FF, TEXTURE_MAX_ANISOTROPY_EXT: 0x84FE };
+      } else if (key === 'WEBGL_draw_buffers') {
+        ext = { COLOR_ATTACHMENT0_WEBGL: 0x8CE0, MAX_COLOR_ATTACHMENTS_WEBGL: 0x8CDF, MAX_DRAW_BUFFERS_WEBGL: 0x8824 };
+      } else if (key === 'OES_vertex_array_object') {
+        ext = { VERTEX_ARRAY_BINDING_OES: 0x85B5, createVertexArrayOES() { return {}; }, bindVertexArrayOES() {}, deleteVertexArrayOES() {}, isVertexArrayOES() { return false; } };
+      } else if (key === 'ANGLE_instanced_arrays') {
+        ext = { VERTEX_ATTRIB_ARRAY_DIVISOR_ANGLE: 0x88FE, drawArraysInstancedANGLE() {}, drawElementsInstancedANGLE() {}, vertexAttribDivisorANGLE() {} };
+      }
+      extensions[key] = ext;
+      return ext;
+    };
+    gl.getParameter = function(pname) {
+      if (Object.prototype.hasOwnProperty.call(params, pname)) return params[pname];
+      return null;
+    };
+    gl.getContextAttributes = function() {
+      return {
+        alpha: true, antialias: true, depth: true,
+        failIfMajorPerformanceCaveat: false, powerPreference: 'default',
+        premultipliedAlpha: true, preserveDrawingBuffer: false,
+        stencil: false, desynchronized: false, xrCompatible: false,
+      };
+    };
+    gl.getShaderPrecisionFormat = function() {
+      return { rangeMin: 127, rangeMax: 127, precision: 23 };
+    };
+    gl.getError = function() { return 0; };
+    gl.isContextLost = function() { return false; };
+    gl.createBuffer = function() { return {}; };
+    gl.createFramebuffer = function() { return {}; };
+    gl.createProgram = function() { return { _shaders: [] }; };
+    gl.createRenderbuffer = function() { return {}; };
+    gl.createShader = function(type) { return { _type: type, _src: '' }; };
+    gl.createTexture = function() { return {}; };
+    gl.deleteBuffer = function() {};
+    gl.deleteFramebuffer = function() {};
+    gl.deleteProgram = function() {};
+    gl.deleteRenderbuffer = function() {};
+    gl.deleteShader = function() {};
+    gl.deleteTexture = function() {};
+    gl.bindBuffer = function() {};
+    gl.bindFramebuffer = function() {};
+    gl.bindRenderbuffer = function() {};
+    gl.bindTexture = function() {};
+    gl.bufferData = function() {};
+    gl.bufferSubData = function() {};
+    gl.shaderSource = function(shader, src) { if (shader) shader._src = String(src || ''); };
+    gl.compileShader = function() {};
+    gl.getShaderParameter = function(_shader, pname) { return pname === C.COMPILE_STATUS ? true : 0; };
+    gl.getShaderInfoLog = function() { return ''; };
+    gl.attachShader = function(program, shader) { if (program && program._shaders) program._shaders.push(shader); };
+    gl.linkProgram = function() {};
+    gl.getProgramParameter = function(_program, pname) { return pname === C.LINK_STATUS ? true : 0; };
+    gl.getProgramInfoLog = function() { return ''; };
+    gl.useProgram = function() {};
+    gl.getAttribLocation = function() { return 0; };
+    gl.getUniformLocation = function() { return {}; };
+    gl.enableVertexAttribArray = function() {};
+    gl.disableVertexAttribArray = function() {};
+    gl.vertexAttribPointer = function() {};
+    gl.uniform1i = function() {};
+    gl.uniform1f = function() {};
+    gl.uniform2f = function() {};
+    gl.uniform3f = function() {};
+    gl.uniform4f = function() {};
+    gl.uniform1fv = function() {};
+    gl.uniform2fv = function() {};
+    gl.uniform3fv = function() {};
+    gl.uniform4fv = function() {};
+    gl.uniformMatrix4fv = function() {};
+    gl.viewport = function(x, y, w, h) { params[C.VIEWPORT] = new Int32Array([x, y, w, h]); };
+    gl.scissor = function() {};
+    gl.clearColor = function() {};
+    gl.clearDepth = function() {};
+    gl.clear = function() {};
+    gl.enable = function() {};
+    gl.disable = function() {};
+    gl.depthFunc = function() {};
+    gl.blendFunc = function() {};
+    gl.pixelStorei = function() {};
+    gl.texImage2D = function() {};
+    gl.texParameteri = function() {};
+    gl.texParameterf = function() {};
+    gl.activeTexture = function() {};
+    gl.generateMipmap = function() {};
+    gl.framebufferTexture2D = function() {};
+    gl.framebufferRenderbuffer = function() {};
+    gl.renderbufferStorage = function() {};
+    gl.checkFramebufferStatus = function() { return 0x8CD5; };
+    gl.drawArrays = function() {};
+    gl.drawElements = function() {};
+    gl.flush = function() {};
+    gl.finish = function() {};
+    gl.readPixels = function(x, y, w, h, _format, _type, pixels) {
+      if (!pixels) return;
+      const n = Math.max(0, w) * Math.max(0, h) * 4;
+      if (typeof pixels.fill === 'function') pixels.fill(0, 0, Math.min(n, pixels.length));
+    };
+    gl.hint = function() {};
+    gl.lineWidth = function() {};
+    gl.polygonOffset = function() {};
+    gl.sampleCoverage = function() {};
+    gl.stencilFunc = function() {};
+    gl.stencilOp = function() {};
+    gl.colorMask = function() {};
+    gl.depthMask = function() {};
+    gl.frontFace = function() {};
+    gl.cullFace = function() {};
+    gl.isEnabled = function() { return false; };
+    gl.getBufferParameter = function() { return 0; };
+    gl.getFramebufferAttachmentParameter = function() { return 0; };
+    gl.getRenderbufferParameter = function() { return 0; };
+    gl.getTexParameter = function() { return 0; };
+    gl.getVertexAttrib = function() { return 0; };
+    gl.getVertexAttribOffset = function() { return 0; };
+    gl.getActiveAttrib = function() { return { name: 'a', size: 1, type: C.FLOAT }; };
+    gl.getActiveUniform = function() { return { name: 'u', size: 1, type: C.FLOAT }; };
+    gl.getAttachedShaders = function(program) { return (program && program._shaders) || []; };
+    gl.getShaderSource = function(shader) { return (shader && shader._src) || ''; };
+    gl.isBuffer = function() { return false; };
+    gl.isFramebuffer = function() { return false; };
+    gl.isProgram = function() { return false; };
+    gl.isRenderbuffer = function() { return false; };
+    gl.isShader = function() { return false; };
+    gl.isTexture = function() { return false; };
+    gl.validateProgram = function() {};
+    gl.bindAttribLocation = function() {};
+    if (webgl2) {
+      gl.createVertexArray = function() { return {}; };
+      gl.bindVertexArray = function() {};
+      gl.deleteVertexArray = function() {};
+      gl.drawArraysInstanced = function() {};
+      gl.drawElementsInstanced = function() {};
+      gl.vertexAttribDivisor = function() {};
+      gl.texStorage2D = function() {};
+      gl.blitFramebuffer = function() {};
+      gl.readBuffer = function() {};
+      gl.drawBuffers = function() {};
+    }
+    const methods = Object.keys(gl);
+    for (let i = 0; i < methods.length; i++) {
+      if (typeof gl[methods[i]] === 'function') _markNative(gl[methods[i]]);
+    }
+    return gl;
+  }
+  applyConstants(WebGLRenderingContext);
+  applyConstants(WebGLRenderingContext.prototype);
+  applyConstants(WebGL2RenderingContext);
+  applyConstants(WebGL2RenderingContext.prototype);
+  globalThis.WebGLRenderingContext = WebGLRenderingContext;
+  globalThis.WebGL2RenderingContext = WebGL2RenderingContext;
+  _createWebGLContext = makeContext;
+})();
+
 HTMLCanvasElement.prototype.getContext = function getContext(type) {
-  if (type === '2d') {
+  const t = String(type || '').toLowerCase();
+  if (t === '2d') {
+    if (this._gl || this._gl2) return null;
     if (!this._ctx) {
       try { this._ctx = new _Canvas2D(this); }
       catch (_error) { return null; }
     }
     return this._ctx;
   }
-  if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') {
-    // Context creation is allowed to fail, and that is the only truthful
-    // behavior until the renderer has a real WebGL backend. The former shim
-    // reported successful shader/program creation while every draw call was a
-    // no-op. Feature-detecting applications consequently selected their WebGL
-    // path, hid their HTML/image fallback, and produced a blank canvas.
-    return null;
+  if (t === 'webgl' || t === 'experimental-webgl') {
+    if (this._ctx || this._gl2) return null;
+    if (!this._gl) this._gl = _createWebGLContext(this, false);
+    return this._gl;
+  }
+  if (t === 'webgl2') {
+    if (this._ctx || this._gl) return null;
+    if (!this._gl2) this._gl2 = _createWebGLContext(this, true);
+    return this._gl2;
   }
   return null;
 };
 HTMLCanvasElement.prototype.toDataURL = function(type) {
-  const ctx = this._ctx || this.getContext('2d');
+  const ctx = this._ctx;
   if (ctx && ctx._buf) {
     if (ctx._w === 0 || ctx._h === 0) return 'data:,';
     return _encodePNG(ctx._w, ctx._h, ctx._buf);
+  }
+  if (this._gl || this._gl2) {
+    const w = this.width, h = this.height;
+    if (w === 0 || h === 0) return 'data:,';
+    return _encodePNG(w, h, new Uint8ClampedArray(w * h * 4));
+  }
+  const fallback = this.getContext('2d');
+  if (fallback && fallback._buf) {
+    if (fallback._w === 0 || fallback._h === 0) return 'data:,';
+    return _encodePNG(fallback._w, fallback._h, fallback._buf);
   }
   return 'data:,';
 };
@@ -13038,7 +13523,21 @@ navigator.locks = {
   query() { return Promise.resolve({ held: [], pending: [] }); },
 };
 navigator.keyboard = {
-  getLayoutMap() { return Promise.resolve(new Map()); },
+  getLayoutMap() {
+    const layout = new Map([
+      ['Backquote','`'],['Digit1','1'],['Digit2','2'],['Digit3','3'],['Digit4','4'],
+      ['Digit5','5'],['Digit6','6'],['Digit7','7'],['Digit8','8'],['Digit9','9'],
+      ['Digit0','0'],['Minus','-'],['Equal','='],
+      ['KeyQ','q'],['KeyW','w'],['KeyE','e'],['KeyR','r'],['KeyT','t'],['KeyY','y'],
+      ['KeyU','u'],['KeyI','i'],['KeyO','o'],['KeyP','p'],['BracketLeft','['],['BracketRight',']'],
+      ['KeyA','a'],['KeyS','s'],['KeyD','d'],['KeyF','f'],['KeyG','g'],['KeyH','h'],
+      ['KeyJ','j'],['KeyK','k'],['KeyL','l'],['Semicolon',';'],['Quote',"'"],
+      ['KeyZ','z'],['KeyX','x'],['KeyC','c'],['KeyV','v'],['KeyB','b'],['KeyN','n'],
+      ['KeyM','m'],['Comma',','],['Period','.'],['Slash','/'],
+      ['Space',' '],['Enter','Enter'],['Backspace','Backspace'],['Tab','Tab'],
+    ]);
+    return Promise.resolve(layout);
+  },
   lock() { return Promise.resolve(); },
   unlock() {},
 };

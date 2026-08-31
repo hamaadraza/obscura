@@ -871,7 +871,7 @@ async fn run_fetch(
         if let Some(ref expr) = eval {
             // Bound the eval by the same budget as navigation so a runaway
             // expression (infinite loop, never-settling sync work) cannot hang.
-            let result = page.evaluate_with_timeout(expr, Duration::from_secs(timeout_secs));
+            let result = eval_js(&mut page, expr, timeout_secs).await;
 
             // A bare --eval (no --selector, --dump, or --screenshot) returns the
             // eval value directly, so synchronous expressions
@@ -995,7 +995,7 @@ async fn run_fetch(
             if eval_at_capture_boundary {
                 if let Some(ref expr) = eval {
                     deferred_eval_output =
-                        Some(page.evaluate_with_timeout(expr, Duration::from_secs(timeout_secs)));
+                        Some(eval_js(&mut page, expr, timeout_secs).await);
                 }
             }
             let capture_state = deferred_eval_output.as_ref().map(|_| {
@@ -1291,6 +1291,29 @@ async fn run_batch_fetch(
     }
 
     Ok(())
+}
+
+async fn eval_js(page: &mut Page, expression: &str, timeout_secs: u64) -> serde_json::Value {
+    // Await promise-returning expressions so async IIFEs resolve before
+    // serialization. The sync path stringified an unresolved Promise as `{}`,
+    // unlike scrape workers (issue #693 / #697).
+    let timeout_ms = timeout_secs.saturating_mul(1000);
+    match page
+        .evaluate_for_cdp_with_timeout(expression, true, true, timeout_ms)
+        .await
+    {
+        Ok(info) => match info.value {
+            Some(v) => v,
+            None => {
+                if info.description.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(info.description)
+                }
+            }
+        },
+        Err(_) => serde_json::Value::Null,
+    }
 }
 
 async fn write_or_print(

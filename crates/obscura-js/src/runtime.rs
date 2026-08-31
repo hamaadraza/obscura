@@ -11536,24 +11536,30 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_webgl_context_does_not_claim_success() {
+    fn webgl_context_exposes_renderer_and_extensions() {
         let mut rt = setup_runtime("<html><body><canvas></canvas></body></html>");
         let result = rt
             .evaluate(
                 r#"
                 (() => {
                     const canvas = document.querySelector('canvas');
-                    const fallback = document.createElement('p');
-                    if (!canvas.getContext('webgl')) {
-                        fallback.textContent = 'static fallback';
-                        document.body.appendChild(fallback);
-                    }
+                    const gl = canvas.getContext('webgl');
+                    const gl2 = document.createElement('canvas').getContext('webgl2');
+                    const experimental = document.createElement('canvas').getContext('experimental-webgl');
+                    const ext = gl && gl.getExtension('WEBGL_debug_renderer_info');
+                    const twoD = document.createElement('canvas');
+                    twoD.getContext('2d');
                     return [
-                        canvas.getContext('webgl'),
-                        canvas.getContext('webgl2'),
-                        canvas.getContext('experimental-webgl'),
-                        fallback.isConnected,
-                        fallback.textContent,
+                        gl instanceof WebGLRenderingContext,
+                        gl2 instanceof WebGL2RenderingContext,
+                        experimental instanceof WebGLRenderingContext,
+                        Array.isArray(gl.getSupportedExtensions()) && gl.getSupportedExtensions().includes('WEBGL_debug_renderer_info'),
+                        typeof gl.getParameter(gl.VENDOR),
+                        typeof gl.getParameter(gl.RENDERER),
+                        !!(ext && gl.getParameter(ext.UNMASKED_VENDOR_WEBGL)),
+                        !!(ext && gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)),
+                        twoD.getContext('webgl') === null,
+                        canvas.getContext('2d') === null,
                     ];
                 })()
                 "#,
@@ -11561,8 +11567,102 @@ mod tests {
             .unwrap();
         assert_eq!(
             result,
-            serde_json::json!([null, null, null, true, "static fallback"])
+            serde_json::json!([
+                true,
+                true,
+                true,
+                true,
+                "string",
+                "string",
+                true,
+                true,
+                true,
+                true
+            ])
         );
+    }
+
+    #[test]
+    fn castle_intl_prototype_probe_yields_string_stack() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt
+            .evaluate(
+                r#"
+                (() => {
+                    let stackType = null;
+                    let splitType = null;
+                    let firstLine = '';
+                    try {
+                        Object.setPrototypeOf(Intl, Intl);
+                    } catch (e) {
+                        stackType = typeof e.stack;
+                        splitType = typeof e.stack.split;
+                        firstLine = e.stack.split('\n')[0].slice(0, 50);
+                    }
+                    const saved = Error.prepareStackTrace;
+                    Error.prepareStackTrace = (_err, sites) => sites;
+                    let coercedType = null;
+                    let coercedSplit = null;
+                    let coercedArray = null;
+                    try {
+                        Object.setPrototypeOf(Intl, Intl);
+                    } catch (e) {
+                        coercedType = typeof e.stack;
+                        coercedSplit = typeof (e.stack && e.stack.split);
+                        coercedArray = Array.isArray(e.stack);
+                    }
+                    Error.prepareStackTrace = saved;
+                    return [
+                        stackType, splitType, firstLine.length > 0, firstLine.includes('TypeError'),
+                        coercedType, coercedSplit, coercedArray,
+                    ];
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "string",
+                "function",
+                true,
+                true,
+                "string",
+                "function",
+                false
+            ])
+        );
+    }
+
+    #[test]
+    fn canvas_todataurl_is_compact_png() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt
+            .evaluate(
+                r#"
+                (() => {
+                    const blank = document.createElement('canvas');
+                    const encoded = blank.toDataURL();
+                    const ctx = blank.getContext('2d');
+                    ctx.fillStyle = '#f60';
+                    ctx.fillRect(10, 10, 80, 40);
+                    ctx.fillStyle = '#069';
+                    ctx.font = '18px Arial';
+                    ctx.fillText('Cwm fjordbank', 10, 35);
+                    const drawn = blank.toDataURL();
+                    const bytes = atob(encoded.split(',')[1]);
+                    return [
+                        encoded.startsWith('data:image/png;base64,'),
+                        bytes.charCodeAt(25) === 6,
+                        encoded.length < 8000,
+                        drawn.length < 20000,
+                        drawn.startsWith('data:image/png;base64,'),
+                    ];
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, true, true, true, true]));
     }
 
     #[cfg(feature = "render")]
@@ -16329,7 +16429,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_media_capabilities_and_readiness_are_honest() {
+    fn media_codec_strings_match_chrome_while_playback_stays_unavailable() {
         let mut rt = setup_runtime(
             r#"<video id="media" src="https://example.test/movie.mp4"
                 poster="https://example.test/poster.png"></video>"#,
@@ -16355,8 +16455,8 @@ mod tests {
         assert_eq!(
             result,
             serde_json::json!([
-                "",
-                "",
+                "probably",
+                "probably",
                 0,
                 0,
                 0,
