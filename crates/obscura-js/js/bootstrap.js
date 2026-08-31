@@ -1613,8 +1613,16 @@ const _CSS_PROPERTY_NAMES = [
   "transformStyle","transition","transitionDelay","transitionDuration","transitionProperty",
   "transitionTimingFunction","translate","unicodeBidi","userSelect","verticalAlign","visibility",
   "whiteSpace","width","willChange","wordBreak","wordSpacing","wordWrap","writingMode","zIndex","zoom",
+  // Names Blink exposes on the CSSOM, including at-rule descriptors, which
+  // its property registry carries alongside ordinary properties. Kept in step
+  // with supports_declaration in obscura-render so both surfaces agree.
+  "additiveSymbols","appRegion","ascentOverride","basePalette","baselineSource","borderEndEndRadius","borderEndStartRadius","borderStartEndRadius","borderStartStartRadius","containIntrinsicBlockSize","containIntrinsicHeight","containIntrinsicInlineSize","containIntrinsicSize","containIntrinsicWidth","descentOverride","fallback","fontPalette","fontSynthesis","fontSynthesisSmallCaps","fontSynthesisStyle","fontSynthesisWeight","fontVariantAlternates","forcedColorAdjust","hyphenateCharacter","hyphenateLimitChars","imageOrientation","inherits","initialLetter","initialValue","lineGapOverride","mathDepth","mathShift","mathStyle","negative","objectViewBox","overflowClipMargin","overrideColors","pad","pageOrientation","prefix","range","rubyPosition","sizeAdjust","speakAs","suffix","symbols","syntax","system","textEmphasisColor","textEmphasisPosition","textEmphasisStyle","viewTransitionName","whiteSpaceCollapse",
 ];
 const _CSS_PROP_SET = new Set(_CSS_PROPERTY_NAMES);
+// Dashed CSS property names withheld because the browser version being
+// presented predates them (see _applyVersionFeatureGate). Consulted by
+// `CSS.supports` so a probe agrees with the version in the user agent.
+const _cssGatedOut = new Set();
 
 // Parse a `style` attribute string (`"color: red; margin: 5px"`) into the given
 // dashed-key store, replacing its contents in place.
@@ -11100,6 +11108,9 @@ function _cssTopLevelComma(text) {
 function _cssSupportsDeclaration(name, value) {
   name = name.trim().toLowerCase();
   value = value.trim();
+  // Checked before the engine is asked: the renderer supports the property,
+  // but the browser version being presented shipped before it existed.
+  if (_cssGatedOut.has(name)) return false;
   if (typeof Deno.core.ops.op_css_supports === "function") {
     try { return !!Deno.core.ops.op_css_supports(name, value); }
     catch (_) { return false; }
@@ -15490,6 +15501,246 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
   };
 }
 
+
+// Web IDL interface objects.
+//
+// A version's identity is partly the set of interface names on the global:
+// `typeof CSSContainerRule` is how a page decides which Chrome it is talking
+// to, and the version gate below can only withhold names that exist in the
+// first place. These carry no behaviour, which is deliberate -- an interface
+// whose *use* a page would attempt is deliberately absent instead, because a
+// page that feature-detects `CompressionStream` and then constructs one is
+// better served by the honest absence that sends it down its fallback path
+// than by a stub that throws in the middle of its work. So the rule for this
+// list is: a name goes here when scripts read it, and stays out when scripts
+// call it. The ones held back are recorded in IDL_WITHHELD.
+(function _installIdlInterfaces() {
+  // Interfaces whose prototype chain continues into something already defined.
+  const PARENTS = {
+    AnimationPlaybackEvent: 'Event',
+    CookieChangeEvent: 'Event',
+    TaskPriorityChangeEvent: 'Event',
+    VirtualKeyboardGeometryChangeEvent: 'Event',
+    CSSPropertyRule: 'CSSRule',
+    CSSCounterStyleRule: 'CSSRule',
+    CSSLayerBlockRule: 'CSSRule',
+    CSSLayerStatementRule: 'CSSRule',
+    CSSFontPaletteValuesRule: 'CSSRule',
+    CSSContainerRule: 'CSSRule',
+    CSSAnimation: 'Animation',
+    CSSTransition: 'Animation',
+    MathMLElement: 'Element',
+    XRSystem: 'EventTarget',
+    WakeLockSentinel: 'EventTarget',
+    VirtualKeyboard: 'EventTarget',
+  };
+
+  const NAMES = [
+    'FeaturePolicy', 'FragmentDirective', 'PeriodicSyncManager', 'VideoPlaybackQuality',
+    'XRHitTestResult', 'XRHitTestSource', 'XRRay', 'XRTransientInputHitTestResult',
+    'XRTransientInputHitTestSource', 'XRDOMOverlayState', 'XRSystem',
+    'AnimationPlaybackEvent', 'AnimationTimeline', 'CSSAnimation', 'CSSTransition',
+    'LayoutShiftAttribution', 'WakeLock', 'WakeLockSentinel', 'XRLayer',
+    'CSSPropertyRule', 'EventCounts', 'XRAnchor', 'XRAnchorSet',
+    'RTCEncodedAudioFrame', 'RTCEncodedVideoFrame',
+    'CookieChangeEvent', 'CookieStoreManager', 'Scheduling',
+    'ReadableByteStreamController', 'ReadableStreamBYOBReader',
+    'ReadableStreamBYOBRequest', 'ReadableStreamDefaultController', 'XRWebGLBinding',
+    'AbstractRange', 'CustomStateSet', 'NavigatorUAData', 'XRCPUDepthInformation',
+    'XRDepthInformation', 'XRLightEstimate', 'XRLightProbe', 'XRWebGLDepthInformation',
+    'CSSCounterStyleRule', 'NavigatorManagedData', 'WritableStreamDefaultController',
+    'EncodedAudioChunk', 'EncodedVideoChunk', 'VideoColorSpace', 'ImageTrack',
+    'ImageTrackList', 'Profiler', 'VirtualKeyboard', 'DelegatedInkTrailPresenter', 'Ink',
+    'TaskPriorityChangeEvent', 'VirtualKeyboardGeometryChangeEvent',
+    'CanvasFilter', 'CSSLayerBlockRule', 'CSSLayerStatementRule', 'CSSMathClamp',
+    'CSSFontPaletteValuesRule', 'CSSContainerRule', 'XRCamera', 'MathMLElement',
+    'AudioSinkInfo', 'ViewTransition',
+  ];
+
+  function define(name) {
+    if (typeof globalThis[name] !== 'undefined') return;
+    // Named function expression so `.name` matches; the interface object is a
+    // constructor, so an own `prototype` is correct here.
+    const ctor = {
+      [name]: function () {
+        throw new TypeError("Failed to construct '" + name + "': Illegal constructor");
+      },
+    }[name];
+    const parentName = PARENTS[name];
+    const parent = parentName ? globalThis[parentName] : null;
+    const proto = Object.create(parent && parent.prototype ? parent.prototype : Object.prototype);
+    Object.defineProperty(proto, 'constructor', {
+      value: ctor, writable: true, enumerable: false, configurable: true,
+    });
+    Object.defineProperty(proto, Symbol.toStringTag, {
+      value: name, writable: false, enumerable: false, configurable: true,
+    });
+    Object.defineProperty(ctor, 'prototype', {
+      value: proto, writable: false, enumerable: false, configurable: false,
+    });
+    if (parent) { try { Object.setPrototypeOf(ctor, parent); } catch (_e) {} }
+    _markNative(ctor);
+    // Non-enumerable, as every interface on a real global is.
+    Object.defineProperty(globalThis, name, {
+      value: ctor, writable: true, enumerable: false, configurable: true,
+    });
+  }
+  for (let i = 0; i < NAMES.length; i++) { try { define(NAMES[i]); } catch (_e) {} }
+
+  // Instances that already existed without their interface. Brand them so
+  // `Object.prototype.toString` and `instanceof` agree with the type.
+  try {
+    const uaData = navigator.userAgentData;
+    if (uaData && globalThis.NavigatorUAData &&
+        Object.getPrototypeOf(uaData) === Object.prototype) {
+      Object.setPrototypeOf(uaData, globalThis.NavigatorUAData.prototype);
+    }
+  } catch (_e) {}
+  // These interfaces are the parents of types already present, so the chain has
+  // to be reconnected or `document.timeline instanceof AnimationTimeline` and
+  // `range instanceof AbstractRange` contradict the names now on the global.
+  try {
+    if (globalThis.DocumentTimeline && globalThis.AnimationTimeline) {
+      Object.setPrototypeOf(DocumentTimeline.prototype, AnimationTimeline.prototype);
+      Object.setPrototypeOf(DocumentTimeline, AnimationTimeline);
+    }
+  } catch (_e) {}
+  try {
+    if (globalThis.Range && globalThis.AbstractRange) {
+      Object.setPrototypeOf(Range.prototype, AbstractRange.prototype);
+      Object.setPrototypeOf(Range, AbstractRange);
+    }
+  } catch (_e) {}
+})();
+
+// Interfaces deliberately not installed above: each one is something a page
+// calls rather than merely reads, so an inert stub would break the page that
+// found it. Implementing any of these for real is what lets it move into the
+// list above.
+const IDL_WITHHELD = [
+  'CompressionStream', 'DecompressionStream', 'BarcodeDetector', 'CookieStore',
+  'GravitySensor', 'IdleDetector', 'AudioDecoder', 'AudioEncoder', 'ImageDecoder',
+  'VideoDecoder', 'VideoEncoder', 'AudioData', 'VideoFrame',
+  'MediaStreamTrackGenerator', 'MediaStreamTrackProcessor', 'TaskController',
+  'TaskSignal', 'WebTransport', 'WebTransportBidirectionalStream',
+  'WebTransportDatagramDuplexStream', 'WebTransportError',
+];
+
+
+// Version feature gate.
+//
+// The browser version in the user agent is a claim, and a feature probe is how
+// that claim gets checked: a page asks whether `CSS.supports('container-type')`
+// or `typeof WebTransport` answers the way the named release would. The engine
+// here is one build, so without gating it answers the same regardless of which
+// version is being presented, and every profile in the rotation looks like the
+// same browser wearing different version numbers.
+//
+// The gate only ever *removes*. A feature can be withheld to present an older
+// release; nothing can conjure a feature the engine does not implement, so the
+// engine build is the ceiling and profiles must stay at or below it.
+//
+// Each key is the Chrome major that introduced the features listed under it.
+// `j:` is a JavaScript or DOM member (`Namespace.member`), `w:` a global
+// interface, `c:` a dashed CSS property. A leading `!` marks a feature that was
+// *removed* in that version, so it is withheld from that version onward.
+const _VERSION_FEATURES = {
+  76: ["c:backdrop-filter","j:Document.onsecuritypolicyviolation","j:Promise.allSettled"],
+  77: ["j:Document.onformdata","j:Document.onpointerrawupdate"],
+  78: ["j:Element.elementTiming"],
+  79: ["j:Document.onanimationend","j:Document.onanimationiteration","j:Document.onanimationstart","j:Document.ontransitionend"],
+  80: ["!j:Document.registerElement","!j:Element.createShadowRoot","!j:Element.getDestinationInsertionPoints","c:overscroll-behavior-block","c:overscroll-behavior-inline","w:CompressionStream","w:DecompressionStream","w:FeaturePolicy","w:FragmentDirective","w:PeriodicSyncManager","w:VideoPlaybackQuality"],
+  81: ["c:color-scheme","c:image-orientation","j:Document.onwebkitanimationend","j:Document.onwebkitanimationiteration","j:Document.onwebkitanimationstart","j:Document.onwebkittransitionend","j:Element.ariaAtomic","j:Element.ariaAutoComplete","j:Element.ariaBusy","j:Element.ariaChecked","j:Element.ariaColCount","j:Element.ariaColIndex","j:Element.ariaColSpan","j:Element.ariaCurrent","j:Element.ariaDisabled","j:Element.ariaExpanded","j:Element.ariaHasPopup","j:Element.ariaHidden","j:Element.ariaKeyShortcuts","j:Element.ariaLabel","j:Element.ariaLevel","j:Element.ariaLive","j:Element.ariaModal","j:Element.ariaMultiLine","j:Element.ariaMultiSelectable","j:Element.ariaOrientation","j:Element.ariaPlaceholder","j:Element.ariaPosInSet","j:Element.ariaPressed","j:Element.ariaReadOnly","j:Element.ariaRelevant","j:Element.ariaRequired","j:Element.ariaRoleDescription","j:Element.ariaRowCount","j:Element.ariaRowIndex","j:Element.ariaRowSpan","j:Element.ariaSelected","j:Element.ariaSort","j:Element.ariaValueMax","j:Element.ariaValueMin","j:Element.ariaValueNow","j:Element.ariaValueText","j:Intl.DisplayNames","w:SubmitEvent","w:XRHitTestResult","w:XRHitTestSource","w:XRRay","w:XRTransientInputHitTestResult","w:XRTransientInputHitTestSource"],
+  83: ["c:contain-intrinsic-size","j:Element.ariaDescription","j:Element.onbeforexrselect","w:BarcodeDetector","w:XRDOMOverlayState","w:XRSystem"],
+  84: ["c:appearance","c:ruby-position","j:Document.getAnimations","j:Document.timeline","j:Element.ariaSetSize","j:Element.getAnimations","w:AnimationPlaybackEvent","w:AnimationTimeline","w:CSSAnimation","w:CSSTransition","w:DocumentTimeline","w:FinalizationRegistry","w:LayoutShiftAttribution","w:ResizeObserverSize","w:WakeLock","w:WakeLockSentinel","w:WeakRef","w:XRLayer"],
+  85: ["j:Promise.any","j:String.replaceAll","w:AggregateError","w:CSSPropertyRule","w:EventCounts","w:XRAnchor","w:XRAnchorSet"],
+  86: ["!j:Atomics.wake","c:content-visibility","c:counter-set","c:inherits","c:initial-value","c:page-orientation","c:syntax","j:Document.fragmentDirective","j:Document.replaceChildren","j:Element.replaceChildren","w:RTCEncodedAudioFrame","w:RTCEncodedVideoFrame"],
+  87: ["c:ascent-override","c:border-block","c:border-block-color","c:border-block-style","c:border-block-width","c:border-inline","c:border-inline-color","c:border-inline-style","c:border-inline-width","c:descent-override","c:inset","c:inset-block","c:inset-block-end","c:inset-block-start","c:inset-inline","c:inset-inline-end","c:inset-inline-start","c:line-gap-override","c:margin-block","c:margin-inline","c:padding-block","c:padding-inline","c:text-decoration-thickness","c:text-underline-offset","w:CookieChangeEvent","w:CookieStore","w:CookieStoreManager","w:Scheduling"],
+  88: ["!w:BarcodeDetector","c:aspect-ratio","w:Scheduling"],
+  89: ["c:border-end-end-radius","c:border-end-start-radius","c:border-start-end-radius","c:border-start-start-radius","c:forced-color-adjust","j:Atomics.waitAsync","j:Document.ontransitioncancel","j:Document.ontransitionrun","j:Document.ontransitionstart","j:Intl.Segmenter","w:ReadableByteStreamController","w:ReadableStreamBYOBReader","w:ReadableStreamBYOBRequest","w:ReadableStreamDefaultController","w:XRWebGLBinding"],
+  90: ["!j:Element.onbeforexrselect","c:overflow-clip-margin","j:Document.onbeforexrselect","j:RegExp.hasIndices","w:AbstractRange","w:CustomStateSet","w:NavigatorUAData","w:XRCPUDepthInformation","w:XRDepthInformation","w:XRLightEstimate","w:XRLightProbe","w:XRWebGLDepthInformation"],
+  91: ["c:additive-symbols","c:fallback","c:negative","c:pad","c:prefix","c:range","c:speak-as","c:suffix","c:symbols","c:system","j:Element.getInnerHTML","w:CSSCounterStyleRule","w:GravitySensor","w:NavigatorManagedData"],
+  92: ["!w:SharedArrayBuffer","c:size-adjust","j:Array.at","j:String.at","w:CSSCounterStyleRule"],
+  93: ["c:accent-color","j:Error.cause","j:Object.hasOwn","w:WritableStreamDefaultController"],
+  94: ["!j:Error.cause","c:scrollbar-gutter","j:Object.hasOwn","w:AudioData","w:AudioDecoder","w:AudioEncoder","w:DelegatedInkTrailPresenter","w:EncodedAudioChunk","w:EncodedVideoChunk","w:IdleDetector","w:ImageDecoder","w:ImageTrack","w:ImageTrackList","w:Ink","w:MediaStreamTrackGenerator","w:MediaStreamTrackProcessor","w:Profiler","w:Scheduler","w:TaskController","w:TaskPriorityChangeEvent","w:TaskSignal","w:VideoColorSpace","w:VideoDecoder","w:VideoEncoder","w:VideoFrame","w:VirtualKeyboard","w:VirtualKeyboardGeometryChangeEvent"],
+  96: ["c:app-region","c:contain-intrinsic-block-size","c:contain-intrinsic-height","c:contain-intrinsic-inline-size","c:contain-intrinsic-width","j:WebAssembly.Exception","j:WebAssembly.Tag","w:URLPattern"],
+  98: ["c:font-synthesis","c:font-synthesis-small-caps","c:font-synthesis-style","c:font-synthesis-weight","j:Array.findLast","j:Array.findLastIndex","j:Document.onslotchange","w:WebTransport","w:WebTransportBidirectionalStream","w:WebTransportDatagramDuplexStream","w:WebTransportError"],
+  99: ["w:CSSLayerBlockRule","w:CSSLayerStatementRule","w:CanvasFilter"],
+  100: ["c:text-emphasis","c:text-emphasis-color","c:text-emphasis-position","c:text-emphasis-style","w:CSSMathClamp"],
+  101: ["j:Document.oncontextlost","j:Document.oncontextrestored","j:Intl.supportedValuesOf"],
+  102: ["j:Document.onbeforematch","j:Element.ariaInvalid"],
+  103: ["c:base-palette","c:font-palette","c:override-colors"],
+  104: ["c:object-view-box","w:CSSFontPaletteValuesRule"],
+  105: ["c:container","c:container-name","c:container-type"],
+  106: ["j:Element.role","w:CSSContainerRule"],
+  107: ["c:hyphenate-character"],
+  108: ["!c:max-zoom","!c:min-zoom","!c:orientation","!c:user-zoom","c:hyphenate-character","w:XRCamera"],
+  109: ["c:hyphenate-limit-chars","c:math-depth","c:math-shift","c:math-style","j:Element.ariaBrailleLabel","j:Element.ariaBrailleRoleDescription","w:MathMLElement"],
+  110: ["c:initial-letter","j:Array.toReversed","j:Array.toSorted","j:Array.toSpliced","j:Array.with","w:AudioSinkInfo"],
+  111: ["j:Document.startViewTransition","j:String.isWellFormed","j:String.toWellFormed"],
+  112: ["w:ViewTransition"],
+  113: ["c:baseline-source","c:font-variant-alternates","c:view-transition-name","j:RegExp.unicodeSets"],
+  115: ["!w:CanvasFilter","c:text-wrap","c:white-space-collapse","j:JSON.isRawJSON","j:JSON.rawJSON","w:ViewTransition"],
+};
+
+// Withhold one feature from this realm. Deleting rather than shadowing keeps
+// `in`, `hasOwnProperty` and property enumeration all agreeing.
+function _hideVersionFeature(kind, name) {
+  try {
+    if (kind === 'w') {
+      delete globalThis[name];
+      return;
+    }
+    if (kind === 'c') {
+      _cssGatedOut.add(name);
+      _CSS_PROP_SET.delete(name);
+      // The CSSOM surface carries both spellings.
+      const camel = name.replace(/-([a-z])/g, (m, c) => c.toUpperCase());
+      _CSS_PROP_SET.delete(camel);
+      if (typeof _CSS_SUPPORTED_DECLARATIONS !== 'undefined') {
+        _CSS_SUPPORTED_DECLARATIONS.delete(name);
+      }
+      try { delete CSSStyleDeclaration.prototype[camel]; } catch (_e) {}
+      try { delete CSSStyleDeclaration.prototype[name]; } catch (_e) {}
+      return;
+    }
+    // 'j': a member of a global object or of its prototype.
+    const dot = name.indexOf('.');
+    if (dot < 0) return;
+    const owner = globalThis[name.slice(0, dot)];
+    const member = name.slice(dot + 1);
+    if (!owner) return;
+    if (Object.prototype.hasOwnProperty.call(owner, member)) {
+      delete owner[member];
+    }
+    if (owner.prototype &&
+        Object.prototype.hasOwnProperty.call(owner.prototype, member)) {
+      delete owner.prototype[member];
+    }
+  } catch (_e) {}
+}
+
+// Bring the feature surface into line with the version being presented.
+function _applyVersionFeatureGate(major) {
+  if (!(major > 0)) return;
+  for (const key in _VERSION_FEATURES) {
+    const version = +key;
+    const entries = _VERSION_FEATURES[key];
+    for (let i = 0; i < entries.length; i++) {
+      let entry = entries[i];
+      const removedHere = entry.charCodeAt(0) === 33; // '!'
+      if (removedHere) entry = entry.slice(1);
+      const kind = entry[0];
+      const name = entry.slice(2);
+      // Introduced in `version`: absent from anything older.
+      // Removed in `version`: absent from that version onward.
+      if (removedHere ? major >= version : major < version) {
+        _hideVersionFeature(kind, name);
+      }
+    }
+  }
+}
+
 globalThis.__obscura_init = function() {
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
@@ -15510,6 +15761,12 @@ globalThis.__obscura_init = function() {
       globalThis.__obscura_nativeRegs.indexOf(_localNativeRegistry) === -1) {
     globalThis.__obscura_nativeRegs.push(_localNativeRegistry);
   }
+  // The user agent is set before this runs (the host copies it into a frame
+  // realm with the rest of the identity), so the version is known here. Runs
+  // before any document script, because a feature probe in the first inline
+  // script has to see the same surface as one that runs later. Every realm
+  // gates itself, so a frame agrees with its parent.
+  _applyVersionFeatureGate(_chromeMajor());
   _fpCache = null;
   // A real navigation just completed (this runs after set_url), so drop any
   // URL a location setter previewed synchronously and let document_url drive
