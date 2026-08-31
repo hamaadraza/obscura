@@ -159,29 +159,45 @@ const _origToString = Function.prototype.toString;
 // does not add an own `prototype` property.
 const _functionToString = {
   toString() {
-    // WeakSet.has throws on primitives. V8's stack formatter can call
-    // Function.prototype.toString with a non-function this; a throw there
-    // makes Error.stack a CallSite array instead of a string (Castle's
-    // `error.stack.split` then dies with `n[Hk] is not a function`).
-    try {
-      if (this != null && (typeof this === 'function' || typeof this === 'object')) {
-        if (_nativeStr.has(this)) { return _nativeStr.get(this); }
-        if (_nativeFns.has(this)) {
-          return `function ${this.name || ''}() { [native code] }`;
-        }
-      }
-      return _origToString.call(this);
-    } catch (_e) {
-      try { return _origToString.call(this); } catch (_e2) {
-        return 'function () { [native code] }';
+    // A masked native reports as native code. Everything else defers to the
+    // real Function.prototype.toString, INCLUDING its throw behaviour: Chrome
+    // raises `TypeError: Function.prototype.toString requires that 'this' be a
+    // Function` for a non-function this, and fingerprinting scripts (CreepJS
+    // hasToStringProxy) call toString on primitives specifically to catch a
+    // wrapper that swallows that throw. Returning a fake native string there
+    // was the tell. WeakSet.has is primitive-safe only for object keys, so the
+    // typeof guard keeps the map lookups off primitives; a primitive this then
+    // falls through to _origToString, which throws exactly as V8 does.
+    //
+    // Error.stack staying a string across this throw is handled separately by
+    // _coerceErrStack (it reads err.stack inside its own try/catch), so letting
+    // the TypeError propagate here does not reintroduce the Castle CallSite-array
+    // regression.
+    if (this != null && (typeof this === 'function' || typeof this === 'object')) {
+      if (_nativeStr.has(this)) { return _nativeStr.get(this); }
+      if (_nativeFns.has(this)) {
+        const name = typeof this.name === 'string' ? this.name : '';
+        return `function ${name}() { [native code] }`;
       }
     }
+    return _origToString.call(this);
   },
 }.toString;
 Function.prototype.toString = _functionToString;
 function _markNative(fn) { if (typeof fn === 'function') _nativeFns.add(fn); return fn; }
 // Mark a function with an exact native-code toString (used for accessors).
 function _markNativeAs(fn, str) { if (typeof fn === 'function') _nativeStr.set(fn, str); return fn; }
+// Re-shape `fn` to look like a native method to a fingerprinting probe: a
+// method-shorthand function has no own `prototype` and its own property names
+// are exactly ['length','name'] (CreepJS lie checks 9 and 12-14). Plain
+// `function(){}` methods carry a `.prototype`, so any section using one is
+// flagged as lied. The returned method forwards `this` and arguments to `fn`.
+function _asNativeMethod(name, fn) {
+  const holder = { [name](...args) { return fn.apply(this, args); } };
+  const method = holder[name];
+  try { Object.defineProperty(method, 'length', { value: fn.length, configurable: true }); } catch (_e) {}
+  return _markNative(method);
+}
 _nativeFns.add(_functionToString);
 
 // unusualWindowProperties: obscura's internal globals are made non-enumerable
@@ -6781,9 +6797,16 @@ globalThis.navigator = {
   var _navProto = Object.create(Navigator.prototype);
 
   function defGetter(key, fn) {
-    _markNative(fn);
+    // Build the accessor with getter shorthand so the getter function has the
+    // native shape CreepJS's lie detector checks for: name "get <key>", no own
+    // `prototype`, and own property names exactly ['length','name']. A plain
+    // `function(){}` getter fails all three (anonymous, has a prototype), which
+    // marked the whole Navigator section as lied.
+    const holder = { get [key]() { return fn.call(this); } };
+    const getter = Object.getOwnPropertyDescriptor(holder, key).get;
+    _markNative(getter);
     Object.defineProperty(_navProto, key, {
-      get: fn, set: undefined, enumerable: true, configurable: true,
+      get: getter, set: undefined, enumerable: true, configurable: true,
     });
   }
 
@@ -10390,6 +10413,43 @@ var _commonFonts = [
   'Verdana',
   'Webdings', 'Wingdings',
 ];
+// Resolve a CSS font shorthand to a per-character advance by walking the
+// family stack in order, exactly as font fallback does: the first family that
+// is installed (in _commonFonts) or a CSS generic wins. An uninstalled family
+// is skipped to the next, so `"'Some Uninstalled Font', monospace"` measures
+// identically to `"monospace"`. Previously any unknown family produced a
+// distinct advance, so CreepJS's width-difference probe reported hundreds of
+// fonts (including macOS/Linux-only ones) as installed on a Windows profile.
+const _fontGenericAdvance = {
+  'serif': 5.35, 'sans-serif': 5.55, 'monospace': 6,
+  'cursive': 5.6, 'fantasy': 5.6, 'math': 5.5,
+  'system-ui': 5.55, 'ui-serif': 5.35, 'ui-sans-serif': 5.55,
+  'ui-monospace': 6, 'ui-rounded': 5.55,
+  '-apple-system': 5.55, 'blinkmacsystemfont': 5.55,
+};
+let _fontInstalledAdvance = null;
+function _resolveFontAdvance(fontStr) {
+  if (!_fontInstalledAdvance) {
+    _fontInstalledAdvance = Object.create(null);
+    for (let i = 0; i < _commonFonts.length; i++) {
+      const name = _commonFonts[i].toLowerCase();
+      _fontInstalledAdvance[name] = 5.2 + (i % 7) * 0.15 + (name.length % 5) * 0.05;
+    }
+  }
+  // Drop the leading style/size tokens so only the family list remains.
+  let famPart = String(fontStr).replace(
+    /^.*?\d+(?:\.\d+)?(?:px|pt|pc|em|rem|ex|ch|%|vh|vw|vmin|vmax|cm|mm|in|q)\s*/i, '');
+  const families = famPart.split(',');
+  for (let i = 0; i < families.length; i++) {
+    const fam = families[i].trim().replace(/^["']|["']$/g, '').toLowerCase();
+    if (!fam) continue;
+    if (_fontInstalledAdvance[fam] != null) return _fontInstalledAdvance[fam];
+    if (_fontGenericAdvance[fam] != null) return _fontGenericAdvance[fam];
+    // An uninstalled specific family contributes nothing; fall through.
+  }
+  // No installed or generic family named: the canvas default is sans-serif.
+  return _fontGenericAdvance['sans-serif'];
+}
 Object.defineProperty(Document.prototype, 'fonts', {
   get() {
     const _set = _commonFonts.map((name, i) => ({
@@ -12643,12 +12703,12 @@ globalThis.__ariaQuerySelector = function(root, selector) { return null; };
 globalThis.__ariaQuerySelectorAll = async function*(root, selector) { /* yields nothing */ };
 const _MAX_CANVAS_DIMENSION = 32767;
 const _MAX_CANVAS_PIXELS = 67108864;
-if (typeof CanvasRenderingContext2D === 'undefined') {
-  globalThis.CanvasRenderingContext2D = class CanvasRenderingContext2D {};
-}
-class _Canvas2D extends CanvasRenderingContext2D {
+// The 2D context is the real CanvasRenderingContext2D, not a _Canvas2D
+// subclass of an empty placeholder: fingerprinting scripts read
+// CanvasRenderingContext2D.prototype.getImageData and ctx.constructor.name,
+// both of which were wrong when the methods lived on a private subclass.
+class CanvasRenderingContext2D {
   constructor(canvas) {
-    super();
     this.canvas = canvas;
     this._damageQueued = false;
     this._resizeFromCanvas();
@@ -12793,22 +12853,11 @@ class _Canvas2D extends CanvasRenderingContext2D {
   }
   strokeText(text, x, y) { this.fillText(text, x, y); }
   measureText(t) {
-    const fontSize = parseInt(this.font) || 10;
+    const raw = String(this.font);
+    const fontSize = parseInt(raw) || 10;
     const scale = Math.max(1, Math.round(fontSize / 10));
     const str = String(t);
-    const font = String(this.font).toLowerCase();
-    let advance = 5.5;
-    for (let i = 0; i < _commonFonts.length; i++) {
-      const name = _commonFonts[i].toLowerCase();
-      if (font.indexOf(name) !== -1) {
-        advance = 5.2 + (i % 7) * 0.15 + (name.length % 5) * 0.05;
-        break;
-      }
-    }
-    if (/monospace|courier|consolas/.test(font)) advance = 6;
-    else if (/serif|times|georgia|garamond/.test(font) && advance === 5.5) advance = 5.35;
-    else if (/sans-serif|arial|helvetica|segoe|tahoma|verdana/.test(font) && advance === 5.5) advance = 5.55;
-    const width = str.length * advance * scale;
+    const width = str.length * _resolveFontAdvance(raw) * scale;
     return { width, actualBoundingBoxAscent: 7*scale, actualBoundingBoxDescent: 2*scale };
   }
   getImageData(x, y, w, h) {
@@ -12911,6 +12960,21 @@ class _Canvas2D extends CanvasRenderingContext2D {
   createConicGradient() { return { addColorStop(){} }; }
   getContextAttributes() { return { alpha: true, desynchronized: false, colorSpace: "srgb", willReadFrequently: false }; }
 }
+globalThis.CanvasRenderingContext2D = CanvasRenderingContext2D;
+// These context methods are part of the standard 2D surface, so they must
+// report as native code. They were previously unmarked (their toString leaked
+// the real source, a direct automation tell).
+(function _markCanvas2DNative() {
+  const proto = CanvasRenderingContext2D.prototype;
+  const names = Object.getOwnPropertyNames(proto);
+  for (let i = 0; i < names.length; i++) {
+    if (names[i] === 'constructor' || names[i].charCodeAt(0) === 95) continue; // skip internal _-prefixed
+    const desc = Object.getOwnPropertyDescriptor(proto, names[i]);
+    if (desc && typeof desc.value === 'function') _markNative(desc.value);
+    if (desc && typeof desc.get === 'function') _markNative(desc.get);
+    if (desc && typeof desc.set === 'function') _markNative(desc.set);
+  }
+})();
 
 class HTMLCanvasElement extends Element {
   get width() {
@@ -12996,12 +13060,13 @@ var _createWebGLContext = null;
     const names = Object.keys(C);
     for (let i = 0; i < names.length; i++) target[names[i]] = C[names[i]];
   }
-  function makeContext(canvas, webgl2) {
-    const gl = webgl2 ? new WebGL2RenderingContext() : new WebGLRenderingContext();
-    applyConstants(gl);
-    gl.canvas = canvas;
-    gl.drawingBufferWidth = canvas.width || 300;
-    gl.drawingBufferHeight = canvas.height || 150;
+  // Per-instance state kept off the instance so enumerating the context does
+  // not leak internal `_gl*` properties (a real WebGL context exposes only the
+  // spec surface). Methods below live on the prototype and read state via this
+  // map, matching Chrome, where getParameter et al. are inherited prototype
+  // methods, not own properties of each context.
+  const _glState = new WeakMap();
+  function buildParams(gl, webgl2) {
     const params = {};
     params[C.VENDOR] = 'WebKit';
     params[C.RENDERER] = 'WebKit WebGL';
@@ -13039,12 +13104,19 @@ var _createWebGLContext = null;
     params[C.FRAMEBUFFER_BINDING] = null;
     params[C.RENDERBUFFER_BINDING] = null;
     params[C.TEXTURE_BINDING_2D] = null;
-    const extensions = Object.create(null);
-    gl.getSupportedExtensions = function() { return EXTENSIONS.slice(); };
-    gl.getExtension = function(name) {
+    return params;
+  }
+
+  // Shared WebGL1 method surface. Method shorthand gives each function its
+  // proper name, so their toString reads `function getParameter() { [native
+  // code] }` rather than the anonymous form that member assignment produced.
+  const webgl1Methods = {
+    getSupportedExtensions() { return EXTENSIONS.slice(); },
+    getExtension(name) {
       const key = String(name || '');
       if (EXTENSIONS.indexOf(key) === -1) return null;
-      if (extensions[key]) return extensions[key];
+      const cache = _glState.get(this).extensions;
+      if (cache[key]) return cache[key];
       let ext = {};
       if (key === 'WEBGL_debug_renderer_info') {
         ext = { UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246 };
@@ -13059,141 +13131,181 @@ var _createWebGLContext = null;
       } else if (key === 'ANGLE_instanced_arrays') {
         ext = { VERTEX_ATTRIB_ARRAY_DIVISOR_ANGLE: 0x88FE, drawArraysInstancedANGLE() {}, drawElementsInstancedANGLE() {}, vertexAttribDivisorANGLE() {} };
       }
-      extensions[key] = ext;
+      cache[key] = ext;
       return ext;
-    };
-    gl.getParameter = function(pname) {
+    },
+    getParameter(pname) {
+      const params = _glState.get(this).params;
       if (Object.prototype.hasOwnProperty.call(params, pname)) return params[pname];
       return null;
-    };
-    gl.getContextAttributes = function() {
+    },
+    getContextAttributes() {
       return {
         alpha: true, antialias: true, depth: true,
         failIfMajorPerformanceCaveat: false, powerPreference: 'default',
         premultipliedAlpha: true, preserveDrawingBuffer: false,
         stencil: false, desynchronized: false, xrCompatible: false,
       };
-    };
-    gl.getShaderPrecisionFormat = function() {
+    },
+    getShaderPrecisionFormat() {
       return { rangeMin: 127, rangeMax: 127, precision: 23 };
-    };
-    gl.getError = function() { return 0; };
-    gl.isContextLost = function() { return false; };
-    gl.createBuffer = function() { return {}; };
-    gl.createFramebuffer = function() { return {}; };
-    gl.createProgram = function() { return { _shaders: [] }; };
-    gl.createRenderbuffer = function() { return {}; };
-    gl.createShader = function(type) { return { _type: type, _src: '' }; };
-    gl.createTexture = function() { return {}; };
-    gl.deleteBuffer = function() {};
-    gl.deleteFramebuffer = function() {};
-    gl.deleteProgram = function() {};
-    gl.deleteRenderbuffer = function() {};
-    gl.deleteShader = function() {};
-    gl.deleteTexture = function() {};
-    gl.bindBuffer = function() {};
-    gl.bindFramebuffer = function() {};
-    gl.bindRenderbuffer = function() {};
-    gl.bindTexture = function() {};
-    gl.bufferData = function() {};
-    gl.bufferSubData = function() {};
-    gl.shaderSource = function(shader, src) { if (shader) shader._src = String(src || ''); };
-    gl.compileShader = function() {};
-    gl.getShaderParameter = function(_shader, pname) { return pname === C.COMPILE_STATUS ? true : 0; };
-    gl.getShaderInfoLog = function() { return ''; };
-    gl.attachShader = function(program, shader) { if (program && program._shaders) program._shaders.push(shader); };
-    gl.linkProgram = function() {};
-    gl.getProgramParameter = function(_program, pname) { return pname === C.LINK_STATUS ? true : 0; };
-    gl.getProgramInfoLog = function() { return ''; };
-    gl.useProgram = function() {};
-    gl.getAttribLocation = function() { return 0; };
-    gl.getUniformLocation = function() { return {}; };
-    gl.enableVertexAttribArray = function() {};
-    gl.disableVertexAttribArray = function() {};
-    gl.vertexAttribPointer = function() {};
-    gl.uniform1i = function() {};
-    gl.uniform1f = function() {};
-    gl.uniform2f = function() {};
-    gl.uniform3f = function() {};
-    gl.uniform4f = function() {};
-    gl.uniform1fv = function() {};
-    gl.uniform2fv = function() {};
-    gl.uniform3fv = function() {};
-    gl.uniform4fv = function() {};
-    gl.uniformMatrix4fv = function() {};
-    gl.viewport = function(x, y, w, h) { params[C.VIEWPORT] = new Int32Array([x, y, w, h]); };
-    gl.scissor = function() {};
-    gl.clearColor = function() {};
-    gl.clearDepth = function() {};
-    gl.clear = function() {};
-    gl.enable = function() {};
-    gl.disable = function() {};
-    gl.depthFunc = function() {};
-    gl.blendFunc = function() {};
-    gl.pixelStorei = function() {};
-    gl.texImage2D = function() {};
-    gl.texParameteri = function() {};
-    gl.texParameterf = function() {};
-    gl.activeTexture = function() {};
-    gl.generateMipmap = function() {};
-    gl.framebufferTexture2D = function() {};
-    gl.framebufferRenderbuffer = function() {};
-    gl.renderbufferStorage = function() {};
-    gl.checkFramebufferStatus = function() { return 0x8CD5; };
-    gl.drawArrays = function() {};
-    gl.drawElements = function() {};
-    gl.flush = function() {};
-    gl.finish = function() {};
-    gl.readPixels = function(x, y, w, h, _format, _type, pixels) {
+    },
+    getError() { return 0; },
+    isContextLost() { return false; },
+    createBuffer() { return {}; },
+    createFramebuffer() { return {}; },
+    createProgram() { return { _shaders: [] }; },
+    createRenderbuffer() { return {}; },
+    createShader(type) { return { _type: type, _src: '' }; },
+    createTexture() { return {}; },
+    deleteBuffer() {},
+    deleteFramebuffer() {},
+    deleteProgram() {},
+    deleteRenderbuffer() {},
+    deleteShader() {},
+    deleteTexture() {},
+    bindBuffer() {},
+    bindFramebuffer() {},
+    bindRenderbuffer() {},
+    bindTexture() {},
+    bufferData() {},
+    bufferSubData() {},
+    shaderSource(shader, src) { if (shader) shader._src = String(src || ''); },
+    compileShader() {},
+    getShaderParameter(_shader, pname) { return pname === C.COMPILE_STATUS ? true : 0; },
+    getShaderInfoLog() { return ''; },
+    attachShader(program, shader) { if (program && program._shaders) program._shaders.push(shader); },
+    linkProgram() {},
+    getProgramParameter(_program, pname) { return pname === C.LINK_STATUS ? true : 0; },
+    getProgramInfoLog() { return ''; },
+    useProgram() {},
+    getAttribLocation() { return 0; },
+    getUniformLocation() { return {}; },
+    enableVertexAttribArray() {},
+    disableVertexAttribArray() {},
+    vertexAttribPointer() {},
+    uniform1i() {},
+    uniform1f() {},
+    uniform2f() {},
+    uniform3f() {},
+    uniform4f() {},
+    uniform1fv() {},
+    uniform2fv() {},
+    uniform3fv() {},
+    uniform4fv() {},
+    uniformMatrix4fv() {},
+    viewport(x, y, w, h) { _glState.get(this).params[C.VIEWPORT] = new Int32Array([x, y, w, h]); },
+    scissor() {},
+    clearColor() {},
+    clearDepth() {},
+    clear() {},
+    enable() {},
+    disable() {},
+    depthFunc() {},
+    blendFunc() {},
+    pixelStorei() {},
+    texImage2D() {},
+    texParameteri() {},
+    texParameterf() {},
+    activeTexture() {},
+    generateMipmap() {},
+    framebufferTexture2D() {},
+    framebufferRenderbuffer() {},
+    renderbufferStorage() {},
+    checkFramebufferStatus() { return 0x8CD5; },
+    drawArrays() {},
+    drawElements() {},
+    flush() {},
+    finish() {},
+    readPixels(x, y, w, h, _format, _type, pixels) {
       if (!pixels) return;
       const n = Math.max(0, w) * Math.max(0, h) * 4;
       if (typeof pixels.fill === 'function') pixels.fill(0, 0, Math.min(n, pixels.length));
+    },
+    hint() {},
+    lineWidth() {},
+    polygonOffset() {},
+    sampleCoverage() {},
+    stencilFunc() {},
+    stencilOp() {},
+    colorMask() {},
+    depthMask() {},
+    frontFace() {},
+    cullFace() {},
+    isEnabled() { return false; },
+    getBufferParameter() { return 0; },
+    getFramebufferAttachmentParameter() { return 0; },
+    getRenderbufferParameter() { return 0; },
+    getTexParameter() { return 0; },
+    getVertexAttrib() { return 0; },
+    getVertexAttribOffset() { return 0; },
+    getActiveAttrib() { return { name: 'a', size: 1, type: C.FLOAT }; },
+    getActiveUniform() { return { name: 'u', size: 1, type: C.FLOAT }; },
+    getAttachedShaders(program) { return (program && program._shaders) || []; },
+    getShaderSource(shader) { return (shader && shader._src) || ''; },
+    isBuffer() { return false; },
+    isFramebuffer() { return false; },
+    isProgram() { return false; },
+    isRenderbuffer() { return false; },
+    isShader() { return false; },
+    isTexture() { return false; },
+    validateProgram() {},
+    bindAttribLocation() {},
+  };
+  const webgl2Methods = {
+    createVertexArray() { return {}; },
+    bindVertexArray() {},
+    deleteVertexArray() {},
+    drawArraysInstanced() {},
+    drawElementsInstanced() {},
+    vertexAttribDivisor() {},
+    texStorage2D() {},
+    blitFramebuffer() {},
+    readBuffer() {},
+    drawBuffers() {},
+  };
+  function installMethods(proto, methodsObj) {
+    const names = Object.keys(methodsObj);
+    for (let i = 0; i < names.length; i++) {
+      Object.defineProperty(proto, names[i], {
+        value: _markNative(methodsObj[names[i]]),
+        writable: true, enumerable: false, configurable: true,
+      });
+    }
+  }
+  installMethods(WebGLRenderingContext.prototype, webgl1Methods);
+  installMethods(WebGL2RenderingContext.prototype, webgl1Methods);
+  installMethods(WebGL2RenderingContext.prototype, webgl2Methods);
+  // canvas / drawingBuffer* are spec surface exposed as prototype getters in
+  // Chrome, not own data properties. Reading them off WeakMap state keeps the
+  // instance free of own properties beyond what the spec defines.
+  function _defGlGetter(proto, name, read) {
+    Object.defineProperty(proto, name, {
+      get: _markNative(function () { const st = _glState.get(this); return st ? read(st) : undefined; }),
+      enumerable: true, configurable: true,
+    });
+    try { Object.defineProperty(Object.getOwnPropertyDescriptor(proto, name).get, 'name', { value: 'get ' + name, configurable: true }); } catch (e) {}
+  }
+  [WebGLRenderingContext.prototype, WebGL2RenderingContext.prototype].forEach(function (proto) {
+    _defGlGetter(proto, 'canvas', function (st) { return st.canvas; });
+    _defGlGetter(proto, 'drawingBufferWidth', function (st) { return st.drawingBufferWidth; });
+    _defGlGetter(proto, 'drawingBufferHeight', function (st) { return st.drawingBufferHeight; });
+  });
+
+  function makeContext(canvas, webgl2) {
+    const gl = webgl2 ? new WebGL2RenderingContext() : new WebGLRenderingContext();
+    const dbw = canvas.width || 300;
+    const dbh = canvas.height || 150;
+    // drawingBufferWidth/Height are exposed via the prototype getters above,
+    // so they are NOT set as own properties here (that would shadow the getter
+    // and throw under strict mode).
+    const st = {
+      webgl2: !!webgl2, canvas: canvas,
+      drawingBufferWidth: dbw, drawingBufferHeight: dbh,
+      extensions: Object.create(null), params: null,
     };
-    gl.hint = function() {};
-    gl.lineWidth = function() {};
-    gl.polygonOffset = function() {};
-    gl.sampleCoverage = function() {};
-    gl.stencilFunc = function() {};
-    gl.stencilOp = function() {};
-    gl.colorMask = function() {};
-    gl.depthMask = function() {};
-    gl.frontFace = function() {};
-    gl.cullFace = function() {};
-    gl.isEnabled = function() { return false; };
-    gl.getBufferParameter = function() { return 0; };
-    gl.getFramebufferAttachmentParameter = function() { return 0; };
-    gl.getRenderbufferParameter = function() { return 0; };
-    gl.getTexParameter = function() { return 0; };
-    gl.getVertexAttrib = function() { return 0; };
-    gl.getVertexAttribOffset = function() { return 0; };
-    gl.getActiveAttrib = function() { return { name: 'a', size: 1, type: C.FLOAT }; };
-    gl.getActiveUniform = function() { return { name: 'u', size: 1, type: C.FLOAT }; };
-    gl.getAttachedShaders = function(program) { return (program && program._shaders) || []; };
-    gl.getShaderSource = function(shader) { return (shader && shader._src) || ''; };
-    gl.isBuffer = function() { return false; };
-    gl.isFramebuffer = function() { return false; };
-    gl.isProgram = function() { return false; };
-    gl.isRenderbuffer = function() { return false; };
-    gl.isShader = function() { return false; };
-    gl.isTexture = function() { return false; };
-    gl.validateProgram = function() {};
-    gl.bindAttribLocation = function() {};
-    if (webgl2) {
-      gl.createVertexArray = function() { return {}; };
-      gl.bindVertexArray = function() {};
-      gl.deleteVertexArray = function() {};
-      gl.drawArraysInstanced = function() {};
-      gl.drawElementsInstanced = function() {};
-      gl.vertexAttribDivisor = function() {};
-      gl.texStorage2D = function() {};
-      gl.blitFramebuffer = function() {};
-      gl.readBuffer = function() {};
-      gl.drawBuffers = function() {};
-    }
-    const methods = Object.keys(gl);
-    for (let i = 0; i < methods.length; i++) {
-      if (typeof gl[methods[i]] === 'function') _markNative(gl[methods[i]]);
-    }
+    st.params = buildParams({ drawingBufferWidth: dbw, drawingBufferHeight: dbh }, webgl2);
+    _glState.set(gl, st);
     return gl;
   }
   applyConstants(WebGLRenderingContext);
@@ -13205,12 +13317,12 @@ var _createWebGLContext = null;
   _createWebGLContext = makeContext;
 })();
 
-HTMLCanvasElement.prototype.getContext = function getContext(type) {
+HTMLCanvasElement.prototype.getContext = _asNativeMethod('getContext', function (type) {
   const t = String(type || '').toLowerCase();
   if (t === '2d') {
     if (this._gl || this._gl2) return null;
     if (!this._ctx) {
-      try { this._ctx = new _Canvas2D(this); }
+      try { this._ctx = new CanvasRenderingContext2D(this); }
       catch (_error) { return null; }
     }
     return this._ctx;
@@ -13226,8 +13338,8 @@ HTMLCanvasElement.prototype.getContext = function getContext(type) {
     return this._gl2;
   }
   return null;
-};
-HTMLCanvasElement.prototype.toDataURL = function(type) {
+});
+HTMLCanvasElement.prototype.toDataURL = _asNativeMethod('toDataURL', function (type) {
   const ctx = this._ctx;
   if (ctx && ctx._buf) {
     if (ctx._w === 0 || ctx._h === 0) return 'data:,';
@@ -13244,8 +13356,8 @@ HTMLCanvasElement.prototype.toDataURL = function(type) {
     return _encodePNG(fallback._w, fallback._h, fallback._buf);
   }
   return 'data:,';
-};
-HTMLCanvasElement.prototype.toBlob = function(cb, type, q) {
+});
+HTMLCanvasElement.prototype.toBlob = _asNativeMethod('toBlob', function (cb, type, q) {
   const url = this.toDataURL(type, q);
   const comma = url.indexOf(',');
   if (comma < 0 || !url.startsWith('data:image/')) { cb(null); return; }
@@ -13253,7 +13365,7 @@ HTMLCanvasElement.prototype.toBlob = function(cb, type, q) {
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   cb(new Blob([bytes], {type: String(type || 'image/png')}));
-};
+});
 Element.prototype.getBBox = function() { return { x: 0, y: 0, width: 0, height: 0 }; };
 Element.prototype.getComputedTextLength = function() { return 0; };
 Element.prototype.getExtentOfChar = function(ch) { return { x: 0, y: 0, width: 0, height: 0 }; };
@@ -13354,8 +13466,14 @@ globalThis.AudioContext = class AudioContext {
   createDynamicsCompressor() { return {context:this,threshold:this._ap(_fp('compThreshold'), -100, 0),knee:this._ap(_fp('compKnee'), 0, 40),ratio:this._ap(_fp('compRatio'), 1, 20),attack:this._ap(0.003, 0, 1),release:this._ap(0.25, 0, 1),reduction:0,connect(){},disconnect(){}}; }
   createAnalyser() {
     return {context:this,fftSize:2048,frequencyBinCount:1024,channelCount:2,channelCountMode:'max',channelInterpretation:'speakers',maxDecibels:-30,minDecibels:-100,numberOfInputs:1,numberOfOutputs:1,smoothingTimeConstant:0.8,connect(){},disconnect(){},
-      getByteFrequencyData(a){for(let i=0;i<a.length;i++)a[i]=Math.floor(_fpRand(600+i)*10);},
-      getFloatFrequencyData(a){for(let i=0;i<a.length;i++)a[i]=-100+_fpRand(700+i)*5;}
+      getByteFrequencyData:_markNative(function getByteFrequencyData(a){for(let i=0;i<a.length;i++)a[i]=Math.floor(_fpRand(600+i)*10);}),
+      getFloatFrequencyData:_markNative(function getFloatFrequencyData(a){for(let i=0;i<a.length;i++)a[i]=-100+_fpRand(700+i)*5;}),
+      // Time-domain readers: their absence made CreepJS report the audio "time"
+      // probe as unsupported while the frequency probe worked, an inconsistency
+      // a real AnalyserNode never has. Byte data centres on 128 (silence);
+      // float data on 0, both with a small deterministic dither.
+      getByteTimeDomainData:_markNative(function getByteTimeDomainData(a){for(let i=0;i<a.length;i++)a[i]=128+Math.round((_fpRand(800+i)-0.5)*2);}),
+      getFloatTimeDomainData:_markNative(function getFloatTimeDomainData(a){for(let i=0;i<a.length;i++)a[i]=(_fpRand(900+i)-0.5)*0.0009;})
     };
   }
   createGain() { return {context:this,gain:this._ap(1),connect(){},disconnect(){}}; }
@@ -15275,11 +15393,22 @@ globalThis.__obscura_init = function() {
   // standalone runtime has the same 1x default as Obscura's render surface.
   globalThis.devicePixelRatio = 1;
   globalThis.innerWidth = vw; globalThis.innerHeight = vh;
-  globalThis.outerWidth = sw; globalThis.outerHeight = sh - 40;
+  // The outer window tracks the viewport, not the screen. A browser has no
+  // horizontal chrome, so outerWidth == innerWidth; setting it to the screen
+  // width made outerWidth - innerWidth hundreds of pixels of impossible side
+  // chrome (a CreepJS screen lie). Vertical chrome (~88px: tab strip + address
+  // bar) is added but clamped so the window never claims to be taller than the
+  // display's available height.
+  globalThis.outerWidth = vw;
+  globalThis.outerHeight = Math.min(vh + 88, sh - 40);
 
   var hwValues = globalThis.__obscura_stealth ? [4, 6, 8, 12, 16] : [2, 4, 6, 8, 12, 16];
   globalThis.__obscura_hw = hwValues[Math.floor(_fpRand(400) * hwValues.length)];
-  var memValues = globalThis.__obscura_stealth ? [4, 8] : [0.25, 0.5, 1, 2, 4, 8];
+  // navigator.deviceMemory is quantised by Chrome to {0.25,0.5,1,2,4,8} but a
+  // real desktop effectively only ever reports 4 or 8; the low buckets read as
+  // a memory-limited mobile device and clash with a Win32 desktop profile
+  // (CreepJS navigator lie). Draw only from the plausible desktop values.
+  var memValues = [4, 8];
   globalThis.__obscura_mem = memValues[Math.floor(_fpRand(401) * memValues.length)];
 
   // A navigation start precedes the wall clock, so skew into the past only: an
