@@ -604,7 +604,7 @@ impl ObscuraJsRuntime {
     ) {
         use deno_core::v8;
 
-        const IDENTITY_GLOBALS: [&str; 11] = [
+        const IDENTITY_GLOBALS: [&str; 12] = [
             "__obscura_ua",
             "__obscura_platform",
             "__obscura_ua_platform",
@@ -617,6 +617,10 @@ impl ObscuraJsRuntime {
             // frame rolled its own and disagreed with its parent about the
             // machine they are both supposedly running on.
             "__obscura_fpSeed",
+            // The shared native-function registry. Copied by reference, so a
+            // function one realm masked still reports as native code when it
+            // is read through another realm's Function.prototype.toString.
+            "__obscura_nativeRegs",
             // The display is a property of the screen, not of a browsing
             // context, so an override the page carries applies in its frames.
             "__obscura_screen_w",

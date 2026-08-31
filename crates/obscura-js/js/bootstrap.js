@@ -24,7 +24,7 @@
     '__markParserScripts', '__obscura_hasPendingDynamicScripts',
     '__obscura_hasPendingLoadDelayingScripts',
     '__obscura_nextPendingTimeoutDelay',
-    '__obscura_hw', '__obscura_mem', '__obscura_fpSeed',
+    '__obscura_hw', '__obscura_mem', '__obscura_fpSeed', '__obscura_nativeRegs',
     '__documentReadyState__', '__currentUrl',
     // internal helpers (var-declared throughout the file)
     '__processDynScriptQueue', '_decodeDataScriptUrl', '_markNative', '_fpRand', '_fpNoise',
@@ -154,6 +154,42 @@ const _nativeFns = new Set();
 // `function <name>()`, e.g. accessors (`function get x() { [native code] }`)
 // or functions whose `.name` does not match the real builtin.
 const _nativeStr = new Map();
+// Every realm's registries, shared by reference so any realm can recognise a
+// function another realm masked.
+//
+// These registries are per-realm, but the question "is this a native?" is not:
+// fingerprinting scripts read one realm's function through *another* realm's
+// Function.prototype.toString (CreepJS calls
+// `phantom.Function.prototype.toString.call(pageFunction)`). Consulting only
+// the local registry made that call miss and fall through to the real
+// Function.prototype.toString, which printed this file's source for every
+// masked member — and for the toString override itself, so every API in every
+// section came back as tampered with. The host copies this array into a frame
+// realm before its bootstrap runs (IDENTITY_GLOBALS in runtime.rs) and each
+// realm appends its own, so one lookup covers the whole page.
+const _localNativeRegistry = { fns: _nativeFns, strs: _nativeStr };
+if (!globalThis.__obscura_nativeRegs) {
+  globalThis.__obscura_nativeRegs = [_localNativeRegistry];
+} else if (globalThis.__obscura_nativeRegs.indexOf(_localNativeRegistry) === -1) {
+  globalThis.__obscura_nativeRegs.push(_localNativeRegistry);
+}
+// The exact native string for a function some realm has masked, or null.
+function _sharedNativeStr(fn) {
+  const regs = globalThis.__obscura_nativeRegs;
+  if (!regs) return null;
+  for (let i = 0; i < regs.length; i++) {
+    const reg = regs[i];
+    if (reg === _localNativeRegistry) continue;
+    try {
+      if (reg.strs.has(fn)) return reg.strs.get(fn);
+      if (reg.fns.has(fn)) {
+        const name = typeof fn.name === 'string' ? fn.name : '';
+        return `function ${name}() { [native code] }`;
+      }
+    } catch (_e) {}
+  }
+  return null;
+}
 const _origToString = Function.prototype.toString;
 // Method syntax matches the native function's non-constructible shape and
 // does not add an own `prototype` property.
@@ -179,6 +215,9 @@ const _functionToString = {
         const name = typeof this.name === 'string' ? this.name : '';
         return `function ${name}() { [native code] }`;
       }
+      // Masked by another realm of this page (see _sharedNativeRegistry).
+      const shared = _sharedNativeStr(this);
+      if (shared !== null) { return shared; }
     }
     return _origToString.call(this);
   },
@@ -13561,8 +13600,12 @@ globalThis.AudioContext = class AudioContext {
   createDynamicsCompressor() { return {context:this,threshold:this._ap(_fp('compThreshold'), -100, 0),knee:this._ap(_fp('compKnee'), 0, 40),ratio:this._ap(_fp('compRatio'), 1, 20),attack:this._ap(0.003, 0, 1),release:this._ap(0.25, 0, 1),reduction:0,connect(){},disconnect(){}}; }
   createAnalyser() {
     return {context:this,fftSize:2048,frequencyBinCount:1024,channelCount:2,channelCountMode:'max',channelInterpretation:'speakers',maxDecibels:-30,minDecibels:-100,numberOfInputs:1,numberOfOutputs:1,smoothingTimeConstant:0.8,connect(){},disconnect(){},
-      getByteFrequencyData:_markNative(function getByteFrequencyData(a){for(let i=0;i<a.length;i++)a[i]=Math.floor(_fpRand(600+i)*10);}),
-      getFloatFrequencyData:_markNative(function getFloatFrequencyData(a){for(let i=0;i<a.length;i++)a[i]=-100+_fpRand(700+i)*5;}),
+      // An analyser with nothing connected to it observes silence, which is
+      // -Infinity in the float scale and 0 in the byte scale. Reporting a
+      // dithered -100 instead was itself the tell: CreepJS asks an unconnected
+      // analyser for its spectrum and expects silence back.
+      getByteFrequencyData:_markNative(function getByteFrequencyData(a){for(let i=0;i<a.length;i++)a[i]=0;}),
+      getFloatFrequencyData:_markNative(function getFloatFrequencyData(a){for(let i=0;i<a.length;i++)a[i]=-Infinity;}),
       // Time-domain readers: their absence made CreepJS report the audio "time"
       // probe as unsupported while the frequency probe worked, an inconsistency
       // a real AnalyserNode never has. Byte data centres on 128 (silence);
@@ -15460,6 +15503,13 @@ globalThis.__obscura_init = function() {
     ? globalThis.__obscura_fpSeed
     : (Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0));
   globalThis.__obscura_fpSeed = _fpSeed;
+  // This realm's bootstrap registered its native table before the host copied
+  // the page's shared array in, which replaced it. Re-append so a function
+  // this realm masked is still recognised from the page and its siblings.
+  if (globalThis.__obscura_nativeRegs &&
+      globalThis.__obscura_nativeRegs.indexOf(_localNativeRegistry) === -1) {
+    globalThis.__obscura_nativeRegs.push(_localNativeRegistry);
+  }
   _fpCache = null;
   // A real navigation just completed (this runs after set_url), so drop any
   // URL a location setter previewed synchronously and let document_url drive
