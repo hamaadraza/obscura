@@ -10637,9 +10637,16 @@ mod tests {
         );
     }
 
+    /// Nobody scrolls a headless page, so an infinite-scroll sentinel must
+    /// keep firing as content growth moves it, including once it is pushed
+    /// out through the bottom edge, or feeds load exactly one batch (the
+    /// obstacle stage observer-intersection). This replaces the transition-
+    /// only assertion that contradicted that stage: growth re-fires are the
+    /// documented accommodation, and the scrolled-page test below covers the
+    /// parity side.
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
-    async fn intersection_observer_does_not_refire_while_target_stays_intersecting() {
+    async fn intersection_observer_growth_refires_keep_unscrolled_feed_loading() {
         let dom = parse_html(
             r#"<html><body>
                 <div id="feed"></div>
@@ -10659,19 +10666,23 @@ mod tests {
                     let loaded = 0;
                     const observer = new IntersectionObserver(entries => {
                         for (const entry of entries) {
-                            if (!entry.isIntersecting) continue;
+                            if (!entry.isIntersecting || loaded >= 50) continue;
                             for (let i = 0; i < 10; i++) {
                                 const card = document.createElement("div");
                                 card.textContent = "Item " + loaded++;
                                 feed.appendChild(card);
                             }
+                            if (loaded >= 50) {
+                                observer.disconnect();
+                                resolve([
+                                    loaded,
+                                    feed.querySelectorAll("div").length,
+                                ]);
+                            }
                         }
                     });
                     observer.observe(document.getElementById("sentinel"));
-                    setTimeout(() => resolve([
-                        loaded,
-                        feed.querySelectorAll("div").length,
-                    ]), 200);
+                    setTimeout(() => resolve(["timed out", loaded]), 500);
                 })
                 "#,
                 true,
@@ -10679,7 +10690,55 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(result.value.unwrap(), serde_json::json!([10, 10]));
+        assert_eq!(result.value.unwrap(), serde_json::json!([50, 50]));
+    }
+
+    /// One real scroll means something is driving the viewport (a CDP client
+    /// or the page itself), so the growth accommodation switches off and only
+    /// spec transitions are delivered from then on.
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn intersection_observer_stops_growth_refires_once_the_page_scrolls() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div id="feed"></div>
+                <div id="sentinel" style="height:20px"></div>
+                <div style="height:400px"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(200.0, 100.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    const records = [];
+                    const observer = new IntersectionObserver(entries => {
+                        records.push(...entries.map(entry => entry.isIntersecting));
+                    });
+                    observer.observe(document.getElementById("sentinel"));
+                    // The sentinel stays partially visible after the scroll
+                    // (top -10, height 20), so there is no transition, and the
+                    // appended card moves it while it is still intersecting,
+                    // which only the unscrolled accommodation would deliver.
+                    setTimeout(() => window.scrollTo(0, 10), 25);
+                    setTimeout(() => {
+                        const card = document.createElement("div");
+                        card.style.height = "30px";
+                        document.getElementById("feed").appendChild(card);
+                    }, 50);
+                    setTimeout(() => resolve(records), 100);
+                })
+                "#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!([true]));
     }
 
     #[cfg(feature = "render")]

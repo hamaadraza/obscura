@@ -9155,6 +9155,12 @@ globalThis.NodeFilter = {
 // IntersectionObserver. Render builds provide real, scroll-relative target,
 // element-root, and overflow-ancestor boxes from one prepared layout snapshot.
 globalThis.__intersectionObservers = [];
+// Upper bound on growth re-deliveries per observer (the unscrolled-page
+// infinite-scroll accommodation in _queueChanged). Real feeds disconnect or
+// unobserve long before this; the cap exists so a page that mutates forever
+// cannot spin a callback loop. Spec-mandated transition records are never
+// capped.
+const _IO_GROWTH_REFIRE_CAP = 64;
 let _intersectionRenderCheckpointPending = false;
 const _intersectionDeliveryObservers = new Set();
 let _intersectionDeliveryTaskPending = false;
@@ -9322,6 +9328,7 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     this._targets = new Set();
     this._previous = new Map();
     this._records = [];
+    this._growthRefires = 0;
     this._connected = true;
     globalThis.__intersectionObservers.push(this);
   }
@@ -9422,8 +9429,48 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     return index;
   }
   _queueChanged(target, forceInitial, root, measurements) {
-    const entry = this._entry(target, root, measurements);
+    let entry = this._entry(target, root, measurements);
     const previous = this._previous.get(target);
+    const rect = entry.boundingClientRect;
+
+    // Headless pages are never scrolled by a person, so a feed sentinel that
+    // content growth pushes down (or out through the bottom edge) would go
+    // permanently silent under strict transition-only records and infinite
+    // scroll would stop after one batch (pattern 2 of the pre-layout
+    // implementation; obstacle stage observer-intersection). While the page
+    // has never scrolled, re-deliver for a previously intersecting
+    // viewport-root target that layout growth moved, and treat an exit
+    // through the bottom edge as still intersecting: the reader would have
+    // scrolled after it. Element roots, overflow-clipped targets, and
+    // below-fold targets that never intersected keep strict records, one
+    // real scroll restores full transition semantics for the rest of the
+    // page's life, and the per-observer cap bounds a page that mutates
+    // forever. Once growth stops, the next checkpoint delivers the real
+    // (non-intersecting) state so a later scroll sees correct transitions.
+    let growthRefire = false;
+    if (
+      !forceInitial && previous && previous.isIntersecting && previous.rect &&
+      !(this._root instanceof Element) &&
+      !(globalThis.scrollX || globalThis.scrollY) &&
+      this._growthRefires < _IO_GROWTH_REFIRE_CAP &&
+      (Math.abs(rect.top - previous.rect.top) >= 1 ||
+        Math.abs(rect.left - previous.rect.left) >= 1 ||
+        Math.abs(rect.height - previous.rect.height) >= 1 ||
+        Math.abs(rect.width - previous.rect.width) >= 1)
+    ) {
+      if (entry.isIntersecting) {
+        growthRefire = true;
+      } else if (rect.top >= root.bottom) {
+        growthRefire = true;
+        entry = {
+          ...entry,
+          isIntersecting: true,
+          intersectionRatio: 1,
+          intersectionRect: entry.boundingClientRect,
+        };
+      }
+    }
+
     const changed = forceInitial || !previous ||
       previous.isIntersecting !== entry.isIntersecting ||
       this._thresholdIndex(previous.intersectionRatio) !==
@@ -9431,8 +9478,15 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     this._previous.set(target, {
       isIntersecting: entry.isIntersecting,
       intersectionRatio: entry.intersectionRatio,
+      rect: {
+        top: rect.top, left: rect.left,
+        width: rect.width, height: rect.height,
+      },
     });
-    if (changed) this._records.push(entry);
+    if (changed || growthRefire) {
+      if (growthRefire && !changed) this._growthRefires++;
+      this._records.push(entry);
+    }
   }
   _check(targets, forceInitial, measurements = new Map()) {
     if (!this._connected) return;
