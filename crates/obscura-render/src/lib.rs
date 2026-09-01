@@ -96,6 +96,7 @@ mod image_capability_tests {
 #[cfg(feature = "paint")]
 mod paint;
 #[cfg(feature = "paint")]
+pub use paint::decode_image_rgba;
 pub use paint::{
     image_intrinsic_dimensions, paint_dom, paint_dom_scrolled,
     paint_dom_scrolled_at_animation_time,

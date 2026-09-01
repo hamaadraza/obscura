@@ -235,6 +235,11 @@ pub struct ObscuraState {
     /// updates this resource independently of retained style/layout geometry.
     #[cfg(feature = "render")]
     pub(crate) canvas_surfaces: HashMap<NodeId, CanvasBackingSurface>,
+    /// Live CompressionStream/DecompressionStream contexts, keyed by the id
+    /// handed to JS. A stream is a long-lived object with interleaved writes,
+    /// so the codec has to persist between calls rather than run per chunk.
+    pub(crate) compression_streams: HashMap<u32, CompressionCodec>,
+    pub(crate) compression_stream_counter: u32,
     #[cfg(feature = "render")]
     pub viewport: (f32, f32),
     /// Root scrolling offset in CSS pixels. With render enabled this is
@@ -349,6 +354,8 @@ impl ObscuraState {
             dynamic_fonts: Vec::new(),
             #[cfg(feature = "render")]
             canvas_surfaces: HashMap::new(),
+            compression_streams: HashMap::new(),
+            compression_stream_counter: 0,
             #[cfg(feature = "render")]
             viewport: (1280.0, 720.0),
             #[cfg(feature = "render")]
@@ -3734,6 +3741,156 @@ fn op_binding_called(state: &OpState, #[string] name: &str, #[string] payload: &
 /// FIPS 180-4 truncated variants `SHA-512/224` and `SHA-512/256`). The JS
 /// shim validates the name; any other value is unreachable.
 /// Returns the raw digest bytes so the JS shim can hand them back as an ArrayBuffer.
+/// Decodes an encoded image for `ImageDecoder`.
+///
+/// The reply is the dimensions followed by straight RGBA8, so one call carries
+/// both without decoding twice; an empty reply means the bytes were not an
+/// image this build can read.
+#[cfg(feature = "render")]
+#[op2]
+#[buffer]
+fn op_image_decode(#[buffer] data: &[u8]) -> Vec<u8> {
+    let Some((width, height, rgba)) = obscura_render::decode_image_rgba(data) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(8 + rgba.len());
+    out.extend_from_slice(&width.to_le_bytes());
+    out.extend_from_slice(&height.to_le_bytes());
+    out.extend_from_slice(&rgba);
+    out
+}
+
+/// One direction of one compression format, holding whatever the codec has
+/// produced but JS has not collected yet.
+pub(crate) enum CompressionCodec {
+    GzipEncode(flate2::write::GzEncoder<Vec<u8>>),
+    DeflateEncode(flate2::write::ZlibEncoder<Vec<u8>>),
+    RawEncode(flate2::write::DeflateEncoder<Vec<u8>>),
+    GzipDecode(flate2::write::GzDecoder<Vec<u8>>),
+    DeflateDecode(flate2::write::ZlibDecoder<Vec<u8>>),
+    RawDecode(flate2::write::DeflateDecoder<Vec<u8>>),
+}
+
+impl CompressionCodec {
+    /// Hands over the bytes produced so far. Deliberately not a flush: a flush
+    /// per chunk would emit sync markers and change the encoded stream, so the
+    /// codec is left to emit on its own schedule and this only drains it.
+    fn take_output(&mut self) -> Vec<u8> {
+        use std::mem::take;
+        match self {
+            Self::GzipEncode(w) => take(w.get_mut()),
+            Self::DeflateEncode(w) => take(w.get_mut()),
+            Self::RawEncode(w) => take(w.get_mut()),
+            Self::GzipDecode(w) => take(w.get_mut()),
+            Self::DeflateDecode(w) => take(w.get_mut()),
+            Self::RawDecode(w) => take(w.get_mut()),
+        }
+    }
+
+    fn write(&mut self, chunk: &[u8]) -> std::io::Result<()> {
+        use std::io::Write as _;
+        match self {
+            Self::GzipEncode(w) => w.write_all(chunk),
+            Self::DeflateEncode(w) => w.write_all(chunk),
+            Self::RawEncode(w) => w.write_all(chunk),
+            Self::GzipDecode(w) => w.write_all(chunk),
+            Self::DeflateDecode(w) => w.write_all(chunk),
+            Self::RawDecode(w) => w.write_all(chunk),
+        }
+    }
+
+    fn finish(self) -> std::io::Result<Vec<u8>> {
+        match self {
+            Self::GzipEncode(w) => w.finish(),
+            Self::DeflateEncode(w) => w.finish(),
+            Self::RawEncode(w) => w.finish(),
+            Self::GzipDecode(w) => w.finish(),
+            Self::DeflateDecode(w) => w.finish(),
+            Self::RawDecode(w) => w.finish(),
+        }
+    }
+}
+
+/// Opens a codec for `format`, returning the id JS uses for the rest of the
+/// stream's life. 0 means the format is not one of the three the spec defines.
+#[op2(fast)]
+fn op_compression_create(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    #[string] format: &str,
+    decompress: bool,
+) -> u32 {
+    use flate2::write as fw;
+    use flate2::Compression;
+    let codec = match (format, decompress) {
+        ("gzip", false) => CompressionCodec::GzipEncode(fw::GzEncoder::new(Vec::new(), Compression::default())),
+        ("deflate", false) => CompressionCodec::DeflateEncode(fw::ZlibEncoder::new(Vec::new(), Compression::default())),
+        ("deflate-raw", false) => CompressionCodec::RawEncode(fw::DeflateEncoder::new(Vec::new(), Compression::default())),
+        ("gzip", true) => CompressionCodec::GzipDecode(fw::GzDecoder::new(Vec::new())),
+        ("deflate", true) => CompressionCodec::DeflateDecode(fw::ZlibDecoder::new(Vec::new())),
+        ("deflate-raw", true) => CompressionCodec::RawDecode(fw::DeflateDecoder::new(Vec::new())),
+        _ => return 0,
+    };
+    let gs = realm_state(scope, state);
+    let mut gs = gs.borrow_mut();
+    let Some(id) = gs.compression_stream_counter.checked_add(1) else {
+        return 0;
+    };
+    gs.compression_stream_counter = id;
+    gs.compression_streams.insert(id, codec);
+    id
+}
+
+/// Pushes one chunk through and returns whatever came out, which is often
+/// nothing until the codec has enough to emit a block.
+#[op2]
+#[buffer]
+fn op_compression_transform(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    id: u32,
+    #[buffer] chunk: &[u8],
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    let gs = realm_state(scope, state);
+    let mut gs = gs.borrow_mut();
+    let Some(codec) = gs.compression_streams.get_mut(&id) else {
+        return Err(deno_error::JsErrorBox::type_error("compression stream is closed"));
+    };
+    if let Err(error) = codec.write(chunk) {
+        // Corrupt input is the stream's error, so drop the codec: the JS side
+        // errors the TransformStream and will not write again.
+        gs.compression_streams.remove(&id);
+        return Err(deno_error::JsErrorBox::type_error(error.to_string()));
+    }
+    Ok(codec.take_output())
+}
+
+/// Ends the stream and returns the tail: the trailer for gzip, the final block
+/// for deflate, and for decompression whatever the last input completed.
+#[op2]
+#[buffer]
+fn op_compression_finish(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    id: u32,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    let gs = realm_state(scope, state);
+    let mut gs = gs.borrow_mut();
+    let Some(codec) = gs.compression_streams.remove(&id) else {
+        return Err(deno_error::JsErrorBox::type_error("compression stream is closed"));
+    };
+    codec
+        .finish()
+        .map_err(|error| deno_error::JsErrorBox::type_error(error.to_string()))
+}
+
+/// Releases a stream abandoned without being finished.
+#[op2(fast)]
+fn op_compression_free(scope: &mut v8::HandleScope, state: &OpState, id: u32) {
+    let gs = realm_state(scope, state);
+    gs.borrow_mut().compression_streams.remove(&id);
+}
+
 #[op2]
 #[buffer]
 fn op_subtle_digest(#[string] algorithm: &str, #[buffer] data: &[u8]) -> Vec<u8> {
@@ -4452,6 +4609,12 @@ pub fn build_extension() -> Extension {
         op_navigate(),
         op_frame_document_ready(),
         op_take_blank_frame_realm(),
+        op_compression_create(),
+        op_compression_transform(),
+        op_compression_finish(),
+        op_compression_free(),
+        #[cfg(feature = "render")]
+        op_image_decode(),
         op_post_frame_message(),
         op_sleep(),
         op_async_runtime_available(),

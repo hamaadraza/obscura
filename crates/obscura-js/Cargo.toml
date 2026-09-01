@@ -38,6 +38,10 @@ reqwest = { workspace = true }
 html5ever = { workspace = true }
 deno_error = "0.6"
 base64 = { workspace = true }
+# CompressionStream/DecompressionStream. Already in the tree for HTTP content
+# encoding; taken directly here so the streams can compress without a detour
+# through the network layer.
+flate2 = "1"
 sha1 = "0.10"
 sha2 = "0.10"
 # WebCrypto (crypto.subtle) primitives. RustCrypto, pure Rust, no CMake/OpenSSL,

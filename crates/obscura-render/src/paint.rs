@@ -595,6 +595,16 @@ impl RenderResourceCache {
 /// Inspect already-fetched image bytes without inserting them into a resource
 /// cache. HTMLImageElement keeps request-profile-specific lifecycle outcomes
 /// even though the renderer's ordinary paint cache is URL-keyed.
+/// Decodes an encoded image to its pixels for `ImageDecoder`.
+///
+/// Returns the dimensions alongside straight RGBA8, which is the layout the
+/// WebCodecs `VideoFrame` this ends up in reports as its format.
+pub fn decode_image_rgba(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let decoded = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let (width, height) = decoded.dimensions();
+    Some((width, height, decoded.into_raw()))
+}
+
 pub fn image_intrinsic_dimensions(bytes: &[u8]) -> Option<(f32, f32)> {
     image_metadata_from_bytes(bytes)
 }

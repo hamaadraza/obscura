@@ -10166,8 +10166,103 @@ _markNative(globalThis.StorageEvent);
     constructor() { this.signal = new globalThis.AbortSignal(BRAND); }
     abort(reason) { fire(this.signal, reason); }
   };
+  // TaskController / TaskSignal.
+  //
+  // A TaskSignal is an AbortSignal that also carries a scheduling priority, so
+  // it is built here where the constructor brand lives. `scheduler.postTask`
+  // already reads `signal` and `priority` from its options, so a signal from
+  // this controller works with it unchanged.
+  const TASK_PRIORITIES = ['user-blocking', 'user-visible', 'background'];
+  const checkPriority = (value, where) => {
+    const priority = String(value);
+    if (TASK_PRIORITIES.indexOf(priority) === -1) {
+      throw new TypeError("Failed to " + where + ": The provided value '" + priority +
+        "' is not a valid enum value of type TaskPriority.");
+    }
+    return priority;
+  };
+
+  globalThis.TaskSignal = class TaskSignal extends globalThis.AbortSignal {
+    constructor(brand) {
+      if (brand !== BRAND) {
+        throw new TypeError("Failed to construct 'TaskSignal': Illegal constructor");
+      }
+      super(BRAND);
+      this._priority = 'user-visible';
+      this._priorityListeners = [];
+      this.onprioritychange = null;
+    }
+    get priority() { return this._priority; }
+    addEventListener(type, cb) {
+      if (type === 'prioritychange') {
+        if (cb != null) this._priorityListeners.push(cb);
+        return;
+      }
+      super.addEventListener(type, cb);
+    }
+    removeEventListener(type, cb) {
+      if (type === 'prioritychange') {
+        const at = this._priorityListeners.indexOf(cb);
+        if (at >= 0) this._priorityListeners.splice(at, 1);
+        return;
+      }
+      super.removeEventListener(type, cb);
+    }
+    dispatchEvent(evt) {
+      if (evt && evt.type === 'prioritychange') {
+        for (const cb of this._priorityListeners.slice()) {
+          try { cb.call(this, evt); } catch (_e) {}
+        }
+        if (typeof this.onprioritychange === 'function') {
+          try { this.onprioritychange(evt); } catch (_e) {}
+        }
+        return true;
+      }
+      return super.dispatchEvent(evt);
+    }
+  };
+
+  globalThis.TaskController = class TaskController extends globalThis.AbortController {
+    constructor(init) {
+      super();
+      const priority = (init && init.priority !== undefined)
+        ? checkPriority(init.priority, "construct 'TaskController'")
+        : 'user-visible';
+      // AbortController gave us a plain AbortSignal; a TaskController's signal
+      // is the richer one, so it is replaced before anything can observe it.
+      this.signal = new globalThis.TaskSignal(BRAND);
+      this.signal._priority = priority;
+    }
+    setPriority(priority) {
+      const next = checkPriority(priority, "execute 'setPriority' on 'TaskController'");
+      const signal = this.signal;
+      const previous = signal._priority;
+      if (previous === next) return;
+      signal._priority = next;
+      let event;
+      try { event = new Event('prioritychange'); } catch (_e) { return; }
+      if (globalThis.TaskPriorityChangeEvent) {
+        try { Object.setPrototypeOf(event, TaskPriorityChangeEvent.prototype); } catch (_e) {}
+      }
+      Object.defineProperty(event, 'previousPriority', {
+        value: previous, enumerable: true, configurable: true,
+      });
+      Object.defineProperty(event, 'target', { value: signal, enumerable: true, configurable: true });
+      try { signal.dispatchEvent(event); } catch (_e) {}
+    }
+  };
+
   _markNative(globalThis.AbortSignal);
   _markNative(globalThis.AbortController);
+  _markNative(globalThis.TaskSignal);
+  _markNative(globalThis.TaskController);
+  // Interfaces are not enumerable on a real global.
+  for (const name of ['TaskSignal', 'TaskController']) {
+    const value = globalThis[name];
+    Object.defineProperty(globalThis, name, {
+      value, writable: true, enumerable: false, configurable: true,
+    });
+  }
 })();
 // Normalize one Blob part to bytes. `native` newline normalization applies to
 // string parts when the Blob/File `endings` option is "native".
@@ -14443,6 +14538,88 @@ if (typeof TransformStream === 'undefined') {
     }
   };
 }
+// CompressionStream / DecompressionStream.
+//
+// Backed by the same deflate implementation the network layer already uses, so
+// the bytes are a real gzip/zlib stream rather than a placeholder. The codec
+// lives in the host because a stream interleaves writes with reads and has to
+// keep its state between chunks.
+if (typeof CompressionStream === 'undefined') {
+  const _compressionBytes = (chunk, label) => {
+    if (chunk instanceof Uint8Array) return chunk;
+    if (ArrayBuffer.isView(chunk)) {
+      return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+    }
+    if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
+    throw new TypeError(
+      "Failed to execute 'write' on '" + label + "': The provided value is not of type 'BufferSource'.");
+  };
+
+  const _defineCompressionClass = (name, decompress) => {
+    const ctor = {
+      [name]: function (format) {
+        if (!new.target) {
+          throw new TypeError("Failed to construct '" + name +
+            "': Please use the 'new' operator.");
+        }
+        if (arguments.length < 1) {
+          throw new TypeError("Failed to construct '" + name +
+            "': 1 argument required, but only 0 present.");
+        }
+        const requested = String(format);
+        const id = Deno.core.ops.op_compression_create(requested, decompress);
+        if (!id) {
+          throw new TypeError("Failed to construct '" + name +
+            "': Unsupported compression format: '" + requested + "'.");
+        }
+        const transform = new TransformStream({
+          transform(chunk, controller) {
+            const out = Deno.core.ops.op_compression_transform(
+              id, _compressionBytes(chunk, name));
+            // A codec emits on its own schedule, so most chunks produce
+            // nothing; enqueueing an empty chunk would be observable.
+            if (out && out.length) controller.enqueue(out);
+          },
+          flush(controller) {
+            const out = Deno.core.ops.op_compression_finish(id);
+            if (out && out.length) controller.enqueue(out);
+          },
+        });
+        _compressionEnds.set(this, transform);
+      },
+    }[name];
+
+    const proto = ctor.prototype;
+    const accessor = (member, read) => {
+      const getter = { ['get ' + member]() {
+        const ends = _compressionEnds.get(this);
+        if (!ends) {
+          throw new TypeError("Illegal invocation");
+        }
+        return read(ends);
+      } }['get ' + member];
+      _markNativeAs(getter, 'function get ' + member + '() { [native code] }');
+      Object.defineProperty(proto, member, {
+        get: getter, enumerable: true, configurable: true,
+      });
+    };
+    accessor('readable', (ends) => ends.readable);
+    accessor('writable', (ends) => ends.writable);
+    Object.defineProperty(proto, Symbol.toStringTag, {
+      value: name, writable: false, enumerable: false, configurable: true,
+    });
+    _markNative(ctor);
+    // Non-enumerable on the global, like every other interface.
+    Object.defineProperty(globalThis, name, {
+      value: ctor, writable: true, enumerable: false, configurable: true,
+    });
+  };
+
+  const _compressionEnds = new WeakMap();
+  _defineCompressionClass('CompressionStream', false);
+  _defineCompressionClass('DecompressionStream', true);
+}
+
 if (typeof TextEncoderStream === 'undefined') {
   globalThis.TextEncoderStream = class TextEncoderStream {
     constructor() {
@@ -15615,6 +15792,342 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
 }
 
 
+// CookieStore.
+//
+// The asynchronous cookie API, over the same jar `document.cookie` reads and
+// writes, so the two views never disagree. The jar exposes the document view --
+// name and value -- so attributes that view cannot carry are reported the way a
+// host-only cookie reports them rather than invented.
+//
+// `EventTarget` here is an alias for `Node`, whose listener storage is tied to
+// a node id, so this carries its own listener table the way the other non-node
+// targets in this file do.
+(function _installCookieStore() {
+  if (typeof globalThis.CookieStore !== 'undefined') return;
+
+  const describe = (name, value) => ({
+    name, value,
+    // A cookie set without a Domain is host-only, which is what the document
+    // view can express, and that is reported as a null domain.
+    domain: null,
+    path: '/',
+    expires: null,
+    secure: (globalThis.location && location.protocol === 'https:') || false,
+    sameSite: 'lax',
+    partitioned: false,
+  });
+  const parsePairs = () => {
+    const items = [];
+    for (const part of String(document.cookie || '').split(';')) {
+      const text = part.trim();
+      if (!text) continue;
+      const eq = text.indexOf('=');
+      items.push(eq < 0 ? describe('', text)
+        : describe(text.slice(0, eq).trim(), text.slice(eq + 1)));
+    }
+    return items;
+  };
+  const nameOf = (first) => (first && typeof first === 'object')
+    ? String(first.name != null ? first.name : '')
+    : String(first);
+
+  const CookieStore = { CookieStore: function () {
+    throw new TypeError("Failed to construct 'CookieStore': Illegal constructor");
+  } }.CookieStore;
+  const proto = {};
+  const method = (name, fn) => {
+    Object.defineProperty(proto, name, {
+      value: _asNativeMethod(name, fn), writable: true, enumerable: true, configurable: true,
+    });
+  };
+
+  method('addEventListener', function (type, handler) {
+    if (typeof handler !== 'function') return;
+    if (!this._listeners) this._listeners = Object.create(null);
+    (this._listeners[type] || (this._listeners[type] = [])).push(handler);
+  });
+  method('removeEventListener', function (type, handler) {
+    if (this._listeners && this._listeners[type]) {
+      this._listeners[type] = this._listeners[type].filter((h) => h !== handler);
+    }
+  });
+  method('dispatchEvent', function (event) {
+    if (!event || !event.type) return false;
+    const handlers = (this._listeners && this._listeners[event.type]) || [];
+    for (const handler of handlers) { try { handler.call(this, event); } catch (_e) {} }
+    const reflected = this['on' + event.type];
+    if (typeof reflected === 'function') { try { reflected.call(this, event); } catch (_e) {} }
+    return true;
+  });
+
+  method('get', function (first) {
+    try {
+      const wanted = nameOf(first);
+      return Promise.resolve(parsePairs().find((item) => item.name === wanted) || null);
+    } catch (error) { return Promise.reject(error); }
+  });
+  method('getAll', function (first) {
+    try {
+      const all = parsePairs();
+      if (first === undefined) return Promise.resolve(all);
+      const wanted = nameOf(first);
+      return Promise.resolve(all.filter((item) => item.name === wanted));
+    } catch (error) { return Promise.reject(error); }
+  });
+  method('set', function (first, second) {
+    try {
+      const options = (first && typeof first === 'object')
+        ? first : { name: first, value: second };
+      const name = String(options.name != null ? options.name : '');
+      const value = String(options.value != null ? options.value : '');
+      if (!name) {
+        return Promise.reject(new TypeError(
+          "Failed to execute 'set' on 'CookieStore': Cookie name is required."));
+      }
+      let cookie = name + '=' + value + '; path=' + (options.path || '/');
+      if (options.domain) cookie += '; domain=' + options.domain;
+      if (options.expires != null) {
+        const when = new Date(options.expires);
+        if (!Number.isNaN(when.getTime())) cookie += '; expires=' + when.toUTCString();
+      }
+      if (options.secure) cookie += '; secure';
+      document.cookie = cookie;
+      notify(this, [describe(name, value)], []);
+      return Promise.resolve(undefined);
+    } catch (error) { return Promise.reject(error); }
+  });
+  method('delete', function (first) {
+    try {
+      const options = (first && typeof first === 'object') ? first : { name: first };
+      const name = String(options.name != null ? options.name : '');
+      // Expiring in the past is how the document view deletes.
+      document.cookie = name + '=; path=' + (options.path || '/') +
+        '; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+      notify(this, [], [describe(name, '')]);
+      return Promise.resolve(undefined);
+    } catch (error) { return Promise.reject(error); }
+  });
+
+  // A change is delivered after the write settles, never during it. Held in
+  // this closure rather than on the prototype: an own property of a public
+  // interface is visible to anything that walks it.
+  const notify = (target, changed, deleted) => {
+      Promise.resolve().then(() => {
+        let event;
+        try { event = new Event('change'); } catch (_e) { return; }
+        if (globalThis.CookieChangeEvent) {
+          try { Object.setPrototypeOf(event, CookieChangeEvent.prototype); } catch (_e) {}
+        }
+        Object.defineProperty(event, 'changed', { value: Object.freeze(changed), enumerable: true, configurable: true });
+        Object.defineProperty(event, 'deleted', { value: Object.freeze(deleted), enumerable: true, configurable: true });
+        try { target.dispatchEvent(event); } catch (_e) {}
+      });
+  };
+
+  Object.defineProperty(proto, 'constructor', {
+    value: CookieStore, writable: true, enumerable: false, configurable: true });
+  Object.defineProperty(proto, Symbol.toStringTag, {
+    value: 'CookieStore', writable: false, enumerable: false, configurable: true });
+  Object.defineProperty(CookieStore, 'prototype', {
+    value: proto, writable: false, enumerable: false, configurable: false });
+  _markNative(CookieStore);
+
+  const store = Object.create(proto);
+  // `onchange` reflects like any other event handler property.
+  Object.defineProperty(store, 'onchange', {
+    value: null, writable: true, enumerable: true, configurable: true });
+
+  Object.defineProperty(globalThis, 'CookieStore', {
+    value: CookieStore, writable: true, enumerable: false, configurable: true });
+  Object.defineProperty(globalThis, 'cookieStore', {
+    value: store, writable: true, enumerable: false, configurable: true });
+})();
+
+
+// ImageDecoder, and the VideoFrame it hands back.
+//
+// Only defined where the host can actually decode: a build without the render
+// layer has no image codecs, and an ImageDecoder that cannot decode is worse
+// than none, because a page that finds it will use it. The frame carries real
+// pixels, so `copyTo` returns the image rather than a blank buffer.
+// The op table is not bound while the snapshot is being built, so whether the
+// host can decode is settled per page in __obscura_init, which withdraws these
+// again in a build without the render layer.
+if (typeof ImageDecoder === 'undefined') {
+  const framePixels = new WeakMap();
+  const decoderState = new WeakMap();
+
+  const asBytes = (source) => {
+    if (source instanceof Uint8Array) return source;
+    if (ArrayBuffer.isView(source)) {
+      return new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
+    }
+    if (source instanceof ArrayBuffer) return new Uint8Array(source);
+    return null;
+  };
+
+  const defineClass = (name, construct, members, accessors) => {
+    const ctor = { [name]: construct }[name];
+    const proto = ctor.prototype;
+    for (const member of Object.keys(members)) {
+      Object.defineProperty(proto, member, {
+        value: _asNativeMethod(member, members[member]),
+        writable: true, enumerable: true, configurable: true,
+      });
+    }
+    for (const member of Object.keys(accessors || {})) {
+      const read = accessors[member];
+      const getter = { ['get ' + member]() { return read.call(this); } }['get ' + member];
+      _markNativeAs(getter, 'function get ' + member + '() { [native code] }');
+      Object.defineProperty(proto, member, { get: getter, enumerable: true, configurable: true });
+    }
+    Object.defineProperty(proto, Symbol.toStringTag, {
+      value: name, writable: false, enumerable: false, configurable: true,
+    });
+    _markNative(ctor);
+    Object.defineProperty(globalThis, name, {
+      value: ctor, writable: true, enumerable: false, configurable: true,
+    });
+    return ctor;
+  };
+
+  const newFrame = (width, height, rgba, timestamp) => {
+    const frame = Object.create(globalThis.VideoFrame.prototype);
+    framePixels.set(frame, { width, height, rgba, timestamp: timestamp || 0 });
+    return frame;
+  };
+  const pixelsOf = (frame) => {
+    const held = framePixels.get(frame);
+    if (!held) throw new TypeError('Cannot read from a closed VideoFrame.');
+    return held;
+  };
+
+  defineClass('VideoFrame', function VideoFrame(source, init) {
+    if (!new.target) {
+      throw new TypeError("Failed to construct 'VideoFrame': Please use the 'new' operator.");
+    }
+    const bytes = asBytes(source);
+    const options = init || {};
+    if (!bytes || !options.codedWidth || !options.codedHeight) {
+      throw new TypeError("Failed to construct 'VideoFrame': Invalid arguments.");
+    }
+    framePixels.set(this, {
+      width: options.codedWidth >>> 0,
+      height: options.codedHeight >>> 0,
+      rgba: bytes,
+      timestamp: options.timestamp || 0,
+    });
+  }, {
+    allocationSize() { const p = pixelsOf(this); return p.width * p.height * 4; },
+    copyTo(destination) {
+      let p;
+      try { p = pixelsOf(this); } catch (error) { return Promise.reject(error); }
+      const out = asBytes(destination);
+      if (!out) {
+        return Promise.reject(new TypeError(
+          "Failed to execute 'copyTo' on 'VideoFrame': destination is not a BufferSource."));
+      }
+      out.set(p.rgba.subarray(0, Math.min(out.length, p.rgba.length)));
+      return Promise.resolve([{ offset: 0, stride: p.width * 4 }]);
+    },
+    clone() { const p = pixelsOf(this); return newFrame(p.width, p.height, p.rgba, p.timestamp); },
+    close() { framePixels.delete(this); },
+  }, {
+    format() { return framePixels.has(this) ? 'RGBA' : null; },
+    codedWidth() { return framePixels.has(this) ? framePixels.get(this).width : 0; },
+    codedHeight() { return framePixels.has(this) ? framePixels.get(this).height : 0; },
+    displayWidth() { return framePixels.has(this) ? framePixels.get(this).width : 0; },
+    displayHeight() { return framePixels.has(this) ? framePixels.get(this).height : 0; },
+    timestamp() { return framePixels.has(this) ? framePixels.get(this).timestamp : 0; },
+    duration() { return null; },
+    colorSpace() {
+      return { primaries: 'bt709', transfer: 'iec61966-2-1', matrix: 'rgb', fullRange: true };
+    },
+  });
+
+  // A still image is one track of one frame; nothing here decodes animation.
+  defineClass('ImageTrack', function ImageTrack() {
+    throw new TypeError("Failed to construct 'ImageTrack': Illegal constructor");
+  }, {}, {
+    animated() { return false; },
+    frameCount() { return 1; },
+    repetitionCount() { return 0; },
+    selected() { return true; },
+  });
+
+  defineClass('ImageTrackList', function ImageTrackList() {
+    throw new TypeError("Failed to construct 'ImageTrackList': Illegal constructor");
+  }, {}, {
+    length() { return 1; },
+    selectedIndex() { return 0; },
+    selectedTrack() { return this[0]; },
+    ready() { return Promise.resolve(undefined); },
+  });
+
+  const ImageDecoderCtor = defineClass('ImageDecoder', function ImageDecoder(init) {
+    if (!new.target) {
+      throw new TypeError("Failed to construct 'ImageDecoder': Please use the 'new' operator.");
+    }
+    const options = init || {};
+    const bytes = asBytes(options.data);
+    if (!bytes) {
+      throw new TypeError("Failed to construct 'ImageDecoder': data must be a BufferSource.");
+    }
+    const tracks = Object.create(globalThis.ImageTrackList.prototype);
+    const track = Object.create(globalThis.ImageTrack.prototype);
+    Object.defineProperty(tracks, '0', { value: track, enumerable: true, configurable: true });
+    decoderState.set(this, {
+      bytes,
+      type: String(options.type || ''),
+      tracks,
+      closed: false,
+    });
+  }, {
+    decode(options) {
+      const held = decoderState.get(this);
+      if (!held || held.closed) {
+        return Promise.reject(new DOMException('The decoder is closed.', 'InvalidStateError'));
+      }
+      const index = (options && options.frameIndex) ? options.frameIndex >>> 0 : 0;
+      if (index !== 0) {
+        return Promise.reject(new RangeError('Frame index out of range.'));
+      }
+      let decoded;
+      try { decoded = Deno.core.ops.op_image_decode(held.bytes); }
+      catch (_e) { decoded = null; }
+      if (!decoded || decoded.length < 8) {
+        return Promise.reject(new DOMException('The image could not be decoded.', 'EncodingError'));
+      }
+      const view = new DataView(decoded.buffer, decoded.byteOffset, decoded.byteLength);
+      const width = view.getUint32(0, true);
+      const height = view.getUint32(4, true);
+      const rgba = decoded.subarray(8);
+      return Promise.resolve({ image: newFrame(width, height, rgba, 0), complete: true });
+    },
+    reset() {},
+    close() {
+      const held = decoderState.get(this);
+      if (held) held.closed = true;
+    },
+  }, {
+    type() { const held = decoderState.get(this); return held ? held.type : ''; },
+    complete() { return true; },
+    completed() { return Promise.resolve(undefined); },
+    tracks() { const held = decoderState.get(this); return held ? held.tracks : undefined; },
+  });
+
+  // The formats this build can actually read.
+  const DECODABLE = ['image/png', 'image/jpeg', 'image/gif', 'image/bmp',
+    'image/x-icon', 'image/vnd.microsoft.icon', 'image/webp'];
+  Object.defineProperty(ImageDecoderCtor, 'isTypeSupported', {
+    value: _asNativeMethod('isTypeSupported', function (type) {
+      return Promise.resolve(DECODABLE.indexOf(String(type).toLowerCase()) !== -1);
+    }),
+    writable: true, enumerable: true, configurable: true,
+  });
+}
+
+
 // Web IDL interface objects.
 //
 // A version's identity is partly the set of interface names on the global:
@@ -15662,8 +16175,7 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
     'AbstractRange', 'CustomStateSet', 'NavigatorUAData', 'XRCPUDepthInformation',
     'XRDepthInformation', 'XRLightEstimate', 'XRLightProbe', 'XRWebGLDepthInformation',
     'CSSCounterStyleRule', 'NavigatorManagedData', 'WritableStreamDefaultController',
-    'EncodedAudioChunk', 'EncodedVideoChunk', 'VideoColorSpace', 'ImageTrack',
-    'ImageTrackList', 'Profiler', 'VirtualKeyboard', 'DelegatedInkTrailPresenter', 'Ink',
+    'EncodedAudioChunk', 'EncodedVideoChunk', 'VideoColorSpace', 'Profiler', 'VirtualKeyboard', 'DelegatedInkTrailPresenter', 'Ink',
     'TaskPriorityChangeEvent', 'VirtualKeyboardGeometryChangeEvent',
     'CanvasFilter', 'CSSLayerBlockRule', 'CSSLayerStatementRule', 'CSSMathClamp',
     'CSSFontPaletteValuesRule', 'CSSContainerRule', 'XRCamera', 'MathMLElement',
@@ -15731,11 +16243,10 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
 // found it. Implementing any of these for real is what lets it move into the
 // list above.
 const IDL_WITHHELD = [
-  'CompressionStream', 'DecompressionStream', 'BarcodeDetector', 'CookieStore',
-  'GravitySensor', 'IdleDetector', 'AudioDecoder', 'AudioEncoder', 'ImageDecoder',
-  'VideoDecoder', 'VideoEncoder', 'AudioData', 'VideoFrame',
-  'MediaStreamTrackGenerator', 'MediaStreamTrackProcessor', 'TaskController',
-  'TaskSignal', 'WebTransport', 'WebTransportBidirectionalStream',
+  'BarcodeDetector',
+  'GravitySensor', 'IdleDetector', 'AudioDecoder', 'AudioEncoder',
+  'VideoDecoder', 'VideoEncoder', 'AudioData',
+  'MediaStreamTrackGenerator', 'MediaStreamTrackProcessor', 'WebTransport', 'WebTransportBidirectionalStream',
   'WebTransportDatagramDuplexStream', 'WebTransportError',
 ];
 
@@ -15889,6 +16400,14 @@ globalThis.__obscura_init = function() {
   // before any document script, because a feature probe in the first inline
   // script has to see the same surface as one that runs later. Every realm
   // gates itself, so a frame agrees with its parent.
+  // A build with no image codecs must not advertise a decoder: a page that
+  // finds one will use it. Checked here rather than at bootstrap because the
+  // op table is empty while the snapshot is built.
+  if (typeof Deno.core.ops.op_image_decode !== 'function') {
+    for (const name of ['ImageDecoder', 'ImageTrack', 'ImageTrackList', 'VideoFrame']) {
+      try { delete globalThis[name]; } catch (_e) {}
+    }
+  }
   _applyVersionFeatureGate(_chromeMajor());
   _fpCache = null;
   // A real navigation just completed (this runs after set_url), so drop any
