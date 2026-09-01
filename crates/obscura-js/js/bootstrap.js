@@ -16128,6 +16128,57 @@ if (typeof ImageDecoder === 'undefined') {
 }
 
 
+// Illegal invocation on interface accessors.
+//
+// An accessor on an interface prototype has no instance behind it, so reading
+// `Screen.prototype.width` raises "Illegal invocation" in a browser instead of
+// answering. These getters answered -- with a number, a string, or undefined --
+// and a fingerprinting script walking the prototype reads any answer at all as
+// a tampered property, because the real one cannot produce one. The guard is
+// the receiver check the native getter performs before touching its state.
+(function _guardInterfaceAccessors() {
+  const guard = (ctor, names, holds) => {
+    const proto = ctor && ctor.prototype;
+    if (!proto) return;
+    for (const name of names) {
+      const descriptor = Object.getOwnPropertyDescriptor(proto, name);
+      if (!descriptor || typeof descriptor.get !== 'function') continue;
+      const read = descriptor.get;
+      const guarded = { ['get ' + name]() {
+        if (!holds(this)) throw new TypeError('Illegal invocation');
+        return read.call(this);
+      } }['get ' + name];
+      _markNativeAs(guarded, 'function get ' + name + '() { [native code] }');
+      Object.defineProperty(proto, name, {
+        get: guarded,
+        set: descriptor.set,
+        enumerable: descriptor.enumerable,
+        configurable: true,
+      });
+    }
+  };
+
+  // A node is identified by the backing tree id it carries, not by `instanceof`:
+  // a node reached out of a frame belongs to that realm's Element, and an
+  // identity check would refuse the very cross-realm reads that are legitimate.
+  const isNode = (value) => !!value && typeof value === 'object' &&
+    typeof value._nid === 'number';
+
+  guard(globalThis.Element, [
+    'clientHeight', 'clientWidth', 'offsetHeight', 'offsetWidth',
+    'scrollHeight', 'scrollWidth', 'contentDocument', 'contentWindow',
+  ], isNode);
+  guard(globalThis.HTMLCanvasElement, ['width', 'height'], isNode);
+  guard(globalThis.Document, ['referrer'], isNode);
+  guard(globalThis.Screen, ['width', 'height', 'availWidth', 'availHeight'],
+    (value) => !!value && typeof value === 'object' &&
+      value !== globalThis.Screen.prototype);
+  guard(globalThis.FontFace, ['family', 'status'],
+    (value) => !!value && typeof value === 'object' &&
+      value !== globalThis.FontFace.prototype);
+})();
+
+
 // Web IDL interface objects.
 //
 // A version's identity is partly the set of interface names on the global:
