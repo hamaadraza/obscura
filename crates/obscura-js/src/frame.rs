@@ -160,13 +160,15 @@ impl FrameRealm {
         data_json: &str,
         origin: &str,
         source_frame_id: u32,
+        target_origin: &str,
     ) -> Result<(), String> {
         self.execute_script(
             parent,
             &format!(
-                "globalThis.__obscura_deliverMessage({}, {}, {source_frame_id});",
+                "globalThis.__obscura_deliverMessage({}, {}, {source_frame_id}, {});",
                 encode_json_argument(data_json),
                 encode_json_argument(origin),
+                encode_json_argument(target_origin),
             ),
         )
     }
@@ -811,6 +813,146 @@ mod tests {
         assert_eq!(
             parent.evaluate("globalThis.got").unwrap(),
             serde_json::json!([[{"token": "ok"}, "https://child.example", true]]),
+        );
+    }
+
+    /// SEC-001 / #704 — postMessage must honour `targetOrigin`. A message
+    /// restricted to a specific origin must be dropped when the receiving realm
+    /// has a different origin, and delivered when the origins match. Before the
+    /// fix the argument was discarded end-to-end, so the first message leaked.
+    #[test]
+    fn post_message_honours_target_origin() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        parent
+            .execute_script(
+                "p",
+                "globalThis.got = [];\
+                 addEventListener('message', (e) => globalThis.got.push([e.data, e.origin]));",
+            )
+            .unwrap();
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/f",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+
+        // Deliver the way `Page` does, now carrying the queued targetOrigin.
+        let deliver = |parent: &mut ObscuraJsRuntime, m: &crate::ops::PendingFrameMessage| {
+            let script = format!(
+                "globalThis.__obscura_deliverMessage({}, {}, {}, {});",
+                serde_json::to_string(&m.data_json).unwrap(),
+                serde_json::to_string(&m.origin).unwrap(),
+                m.source_frame_id,
+                serde_json::to_string(&m.target_origin).unwrap(),
+            );
+            parent.execute_script("<frame-message>", &script).unwrap();
+        };
+
+        // Restricted to an origin the parent does NOT have -> must be dropped.
+        frame
+            .execute_script(
+                &mut parent,
+                "parent.postMessage({token: 'secret'}, 'https://attacker.example');",
+            )
+            .unwrap();
+        let queued = parent.take_pending_frame_messages();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].target_origin, "https://attacker.example");
+        deliver(&mut parent, &queued[0]);
+        assert_eq!(
+            parent.evaluate("globalThis.got").unwrap(),
+            serde_json::json!([]),
+            "a message whose targetOrigin does not match the receiver must be dropped",
+        );
+
+        // Restricted to the parent's real origin -> must be delivered.
+        frame
+            .execute_script(
+                &mut parent,
+                "parent.postMessage({token: 'ok'}, 'https://parent.example');",
+            )
+            .unwrap();
+        let queued = parent.take_pending_frame_messages();
+        deliver(&mut parent, &queued[0]);
+        assert_eq!(
+            parent.evaluate("globalThis.got").unwrap(),
+            serde_json::json!([[{"token": "ok"}, "https://child.example"]]),
+            "a message whose targetOrigin matches the receiver must be delivered",
+        );
+    }
+
+    /// SEC-001 / #704 — verifies the targetOrigin gate does NOT break legitimate
+    /// delivery *into* a frame (the "about:blank / empty origin" regression a
+    /// reviewer warned about): an explicit origin that matches the loaded frame
+    /// is delivered, the wildcard is always delivered (including to an opaque
+    /// about:blank frame), and only a genuine mismatch is dropped.
+    #[test]
+    fn post_message_into_a_frame_does_not_over_drop() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+
+        // A loaded, same-origin child frame.
+        let child = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://parent.example/child",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+        child
+            .execute_script(
+                &mut parent,
+                "globalThis.got = [];\
+                 addEventListener('message', (e) => globalThis.got.push(String(e.data)));",
+            )
+            .unwrap();
+
+        // Explicit matching origin -> delivered (the case that must not break).
+        child
+            .deliver_message(&mut parent, "{\"v\":\"m1\"}", "https://parent.example", 0, "https://parent.example")
+            .unwrap();
+        // Wildcard -> always delivered.
+        child
+            .deliver_message(&mut parent, "{\"v\":\"m2\"}", "https://parent.example", 0, "*")
+            .unwrap();
+        // Explicit non-matching origin -> dropped.
+        child
+            .deliver_message(&mut parent, "{\"v\":\"m3\"}", "https://parent.example", 0, "https://evil.example")
+            .unwrap();
+
+        assert_eq!(
+            child.evaluate(&mut parent, "globalThis.got").unwrap(),
+            serde_json::json!(["m1", "m2"]),
+            "matching origin and wildcard must deliver into the frame; only a real mismatch drops",
+        );
+
+        // An opaque (about:blank) frame: the wildcard must still deliver, so the
+        // common widget case never breaks even when the frame origin is 'null'.
+        let blank = FrameRealm::new(
+            &mut parent,
+            2,
+            0,
+            "about:blank",
+            "<html><body></body></html>",
+        )
+        .expect("blank frame realm");
+        blank
+            .execute_script(
+                &mut parent,
+                "globalThis.got = [];\
+                 addEventListener('message', (e) => globalThis.got.push(String(e.data)));",
+            )
+            .unwrap();
+        blank
+            .deliver_message(&mut parent, "{\"v\":\"w\"}", "https://parent.example", 0, "*")
+            .unwrap();
+        assert_eq!(
+            blank.evaluate(&mut parent, "globalThis.got").unwrap(),
+            serde_json::json!(["w"]),
+            "the wildcard must still deliver to an about:blank (opaque-origin) frame",
         );
     }
 

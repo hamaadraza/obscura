@@ -169,6 +169,42 @@ impl BrowserState {
         Ok(reached_idle && !navigated)
     }
 
+    /// Consume a navigation that a synthesized interaction just queued,
+    /// before the tool replies.
+    ///
+    /// A click on a submit button, an Enter keypress, or an evaluated
+    /// `location.href` assignment does not issue a request by itself. It runs
+    /// the page's own glue and leaves the navigation as pending state, which
+    /// becomes a request only when a driving layer converts it. The CDP path
+    /// already converts it, in `Input.dispatchMouseEvent` and after
+    /// `Runtime.evaluate`, which is why the same click POSTs over CDP and
+    /// does nothing over MCP (#618).
+    ///
+    /// [`Self::advance_active_page_tasks`] cannot cover this. It is armed
+    /// after every dispatch, but it sits in a `biased` select behind
+    /// `read_line`, so a client that sends its next tool call immediately,
+    /// which an agent does, wins that race every time. The reply is also
+    /// written before any pump turn could run, so the tool would answer
+    /// "Clicked" while the request has not left the process.
+    async fn settle_synthetic_navigation(&mut self) -> Result<(), String> {
+        let navigated = self
+            .page_mut()
+            .process_pending_navigation()
+            .await
+            .map_err(|error| error.to_string())?;
+        if navigated {
+            // The ref table names elements in a document that has gone away.
+            self.interactive_refs.clear();
+            // One slice on the landed document, so a tool that reads the URL
+            // or the text next sees the new page rather than an empty one.
+            self.page_mut()
+                .run_autonomous_event_loop_turn()
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     /// Resolve `ref=eN` to a CSS selector that uniquely targets the
     /// element. Snapshot writes `data-obscura-ref="eN"` onto every
     /// interactable, so the attribute survives across calls as long as
@@ -719,12 +755,12 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
     let result = match name {
         "browser_navigate" => tool_navigate(args, state).await,
         "browser_snapshot" => tool_snapshot(args, state),
-        "browser_click" => tool_click(args, state),
-        "browser_fill" => tool_fill(args, state),
-        "browser_type" => tool_type(args, state),
-        "browser_press_key" => tool_press_key(args, state),
+        "browser_click" => tool_click(args, state).await,
+        "browser_fill" => tool_fill(args, state).await,
+        "browser_type" => tool_type(args, state).await,
+        "browser_press_key" => tool_press_key(args, state).await,
         "browser_select_option" => tool_select_option(args, state),
-        "browser_evaluate" => tool_evaluate(args, state),
+        "browser_evaluate" => tool_evaluate(args, state).await,
         "browser_wait_for" => tool_wait_for(args, state).await,
         "browser_network_requests" => tool_network_requests(state),
         "browser_console_messages" => tool_console_messages(state),
@@ -942,7 +978,7 @@ fn tool_snapshot(args: &Value, state: &mut BrowserState) -> Result<String, Strin
     Ok(format!("URL: {url}\nTitle: {title}\n\n{body}{refs_summary}"))
 }
 
-fn tool_click(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+async fn tool_click(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let selector = resolve_target(args, state)?;
 
     let js = format!(
@@ -962,11 +998,12 @@ fn tool_click(args: &Value, state: &mut BrowserState) -> Result<String, String> 
         // A click can navigate or rewrite the DOM; the old ref table may
         // no longer match. Conservative: invalidate. Next snapshot rebuilds.
         state.interactive_refs.clear();
+        state.settle_synthetic_navigation().await?;
         Ok(format!("Clicked '{selector}'"))
     }
 }
 
-fn tool_fill(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+async fn tool_fill(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let selector = resolve_target(args, state)?;
     let value = args.get("value").and_then(Value::as_str)
         .ok_or("Missing value parameter")?;
@@ -988,11 +1025,12 @@ fn tool_fill(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     if result.as_str() == Some("error:element not found") {
         Err(format!("Element not found: {selector}"))
     } else {
+        state.settle_synthetic_navigation().await?;
         Ok(format!("Filled '{selector}' with value"))
     }
 }
 
-fn tool_type(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+async fn tool_type(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let selector = resolve_target(args, state)?;
     let text = args.get("text").and_then(Value::as_str)
         .ok_or("Missing text parameter")?;
@@ -1013,11 +1051,12 @@ fn tool_type(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     if result.as_str() == Some("error:element not found") {
         Err(format!("Element not found: {selector}"))
     } else {
+        state.settle_synthetic_navigation().await?;
         Ok(format!("Typed into '{selector}'"))
     }
 }
 
-fn tool_press_key(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+async fn tool_press_key(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let key = args.get("key").and_then(Value::as_str)
         .ok_or("Missing key parameter")?;
     let selector = args.get("selector").and_then(Value::as_str);
@@ -1040,6 +1079,7 @@ fn tool_press_key(args: &Value, state: &mut BrowserState) -> Result<String, Stri
     );
 
     state.page_mut().evaluate(&js);
+    state.settle_synthetic_navigation().await?;
     Ok(format!("Pressed key '{key}'"))
 }
 
@@ -1072,11 +1112,12 @@ fn tool_select_option(args: &Value, state: &mut BrowserState) -> Result<String, 
     }
 }
 
-fn tool_evaluate(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+async fn tool_evaluate(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let expression = args.get("expression").and_then(Value::as_str)
         .ok_or("Missing expression parameter")?;
 
     let result = state.page_mut().evaluate(expression);
+    state.settle_synthetic_navigation().await?;
     Ok(match &result {
         Value::String(s) => s.clone(),
         Value::Null => "null".to_string(),
@@ -2082,6 +2123,91 @@ mod tests {
         assert_eq!(invalid_pdf["isError"], true);
     }
 
+    /// Records the method, path and body of every request it serves, so a test
+    /// can assert what actually left the process rather than what the page
+    /// believes happened. Serves the issue's form at `/` and 200s everything
+    /// else.
+    fn spawn_form_recording_server() -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 8192];
+                let read = stream.read(&mut buf).unwrap_or(0);
+                let raw = String::from_utf8_lossy(&buf[..read]).to_string();
+                let start = raw.lines().next().unwrap_or("").to_string();
+                let mut parts = start.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let path = parts.next().unwrap_or("").to_string();
+                let body = raw.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+                let _ = tx.send(format!("{method} {path} body='{body}'"));
+                let page = "<!doctype html><meta charset=utf-8>\
+                    <form id=f method=POST action=/submitted>\
+                    <input name=q id=q value=><button type=submit id=go>Envoyer</button></form>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    page.len(),
+                    page
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (base, rx)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn click_on_a_submit_button_issues_the_request_before_replying() {
+        // A submit click runs the page's form glue and leaves the navigation as
+        // pending state; it only becomes a request when a driving layer converts
+        // it. The CDP path converts it, MCP did not, so the same click POSTed
+        // over CDP and did nothing over MCP (#618). Worse than doing nothing:
+        // `location.href` already reported the destination, so an agent was told
+        // the submit had happened while no request had left the process.
+        //
+        // The assertion is deliberately at the wire, not on `location.href`,
+        // because the URL was the thing that lied.
+        // nextest gives each test its own process, so this cannot reach a
+        // sibling. The recording server is on 127.0.0.1, which the SSRF gate
+        // refuses by default, exactly as the issue reporter had to pass
+        // --allow-private-network to run their repro.
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (base, requests) = spawn_form_recording_server();
+        let mut state = BrowserState::new(None, None, false);
+        state
+            .page_mut()
+            .navigate(&base)
+            .await
+            .expect("form page should navigate");
+        assert!(
+            requests
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("the form page itself must be fetched")
+                .starts_with("GET /"),
+        );
+
+        tool_fill(&json!({ "selector": "#q", "value": "hello" }), &mut state)
+            .await
+            .expect("browser_fill should succeed");
+        tool_click(&json!({ "selector": "#go" }), &mut state)
+            .await
+            .expect("browser_click should succeed");
+
+        let submitted = requests
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the submit must reach the server before browser_click replies");
+        assert!(
+            submitted.starts_with("POST /submitted"),
+            "expected a POST to the form action, got {submitted}"
+        );
+        assert!(
+            submitted.contains("q=hello"),
+            "the submitted body must carry the filled field, got {submitted}"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn fill_tools_notify_controlled_input_tracker() {
         let mut state = BrowserState::new(None, None, false);
@@ -2126,11 +2252,13 @@ mod tests {
             &json!({ "selector": "#field", "value": "filled" }),
             &mut state,
         )
+        .await
         .expect("browser_fill should succeed");
         tool_type(
             &json!({ "selector": "#field", "text": "-typed" }),
             &mut state,
         )
+        .await
         .expect("browser_type should succeed");
         tool_fill_form(
             &json!({

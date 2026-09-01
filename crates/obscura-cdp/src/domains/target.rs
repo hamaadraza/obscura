@@ -229,7 +229,12 @@ pub async fn handle(
         // Ack these so Chrome-shaped clients that call them do not warn (issue #340).
         "detachFromTarget" => {
             if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
+                let page_id = ctx.sessions.get(session_id).cloned();
                 ctx.sessions.remove(session_id);
+                ctx.runtime_enabled_sessions.remove(session_id);
+                if let Some(page_id) = page_id {
+                    ctx.refresh_runtime_event_collection(&page_id);
+                }
                 #[cfg(feature = "render")]
                 ctx.screencasts.remove(session_id);
             }

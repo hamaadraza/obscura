@@ -6,7 +6,6 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use deno_core::op2;
 use deno_core::Extension;
-#[cfg(feature = "render")]
 use deno_core::JsBuffer;
 use deno_core::v8;
 use deno_core::OpState;
@@ -130,6 +129,11 @@ pub struct ObscuraState {
     // `op_binding_called` op. Drained by the CDP layer after each dispatch
     // and emitted as `Runtime.bindingCalled` events.
     pub pending_binding_calls: Vec<(String, String)>,
+    // Console calls and uncaught script exceptions, in occurrence order.
+    // The CDP layer drains this after commands and autonomous event-loop turns.
+    pub pending_runtime_events: VecDeque<RuntimeEvent>,
+    pub runtime_events_enabled: bool,
+    pub runtime_exception_counter: u64,
     pub network_response_bodies: HashMap<String, StoredNetworkResponseBody>,
     pub network_response_body_order: VecDeque<String>,
     pub network_response_body_counter: u64,
@@ -183,6 +187,10 @@ pub struct ObscuraState {
     /// completions use this to discard bytes and lifecycle results belonging
     /// to a navigation that has already been replaced.
     pub document_generation: u64,
+    /// Cached document base URL. Computing it walks the tree and runs the selector engine, and
+    /// the JS layer asks for it on every relative URL, including the URL parts of `<a>`.
+    /// Interior mutability so the read path keeps its shared borrow.
+    pub base_url_cache: RefCell<Option<BaseUrlCache>>,
     /// Final image/font-aware layout shared by CSSOM geometry and screenshots.
     /// DOM/style/viewport changes clear this value but retain resource bytes.
     #[cfg(feature = "render")]
@@ -287,6 +295,12 @@ pub struct PendingFrameMessage {
     pub source_frame_id: u32,
     /// The sender's origin, for `event.origin`.
     pub origin: String,
+    /// The origin the sender restricted delivery to (postMessage's
+    /// `targetOrigin`). `"*"` means any origin; `"/"` means the receiver must be
+    /// same-origin as the sender; anything else is matched against the
+    /// receiver's own origin, and a mismatch drops the message. An empty string
+    /// means the sender did not specify one and delivery stays permissive.
+    pub target_origin: String,
     /// The payload, JSON encoded. Structured clone is not available across
     /// realms here, and JSON covers what postMessage is used for in practice:
     /// a widget reporting a result. Anything it cannot encode is rejected by
@@ -313,6 +327,9 @@ impl ObscuraState {
             intercept_counter: 0,
             intercept_enabled: false,
             pending_binding_calls: Vec::new(),
+            pending_runtime_events: VecDeque::new(),
+            runtime_events_enabled: false,
+            runtime_exception_counter: 0,
             network_response_bodies: HashMap::new(),
             network_response_body_order: VecDeque::new(),
             network_response_body_counter: 0,
@@ -328,6 +345,7 @@ impl ObscuraState {
             page_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             activity_generation: 0,
             document_generation: 0,
+            base_url_cache: RefCell::new(None),
             #[cfg(feature = "render")]
             prepared_render: None,
             #[cfg(feature = "render")]
@@ -371,6 +389,31 @@ impl ObscuraState {
             write_stream: RefCell::new(None),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeConsoleEvent {
+    pub kind: String,
+    pub args: Vec<serde_json::Value>,
+    pub timestamp: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeExceptionEvent {
+    pub exception_id: u64,
+    pub name: String,
+    pub description: String,
+    pub url: String,
+    pub line_number: i64,
+    pub column_number: i64,
+    pub stack_trace: Vec<serde_json::Value>,
+    pub timestamp: f64,
+}
+
+#[derive(Debug, Clone)]
+pub enum RuntimeEvent {
+    Console(RuntimeConsoleEvent),
+    Exception(RuntimeExceptionEvent),
 }
 
 pub(crate) fn node_is_script(dom: &DomTree, node_id: NodeId) -> bool {
@@ -472,6 +515,50 @@ fn response_body_byte_limit() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2 * 1024 * 1024)
+}
+
+/// Hard cap on a single JS fetch/XHR response body buffered fully in memory.
+/// `op_fetch_url` reads the whole body, then makes a UTF-8 copy and a base64
+/// copy of it, so an unbounded body OOMs the process. This bounds the initial
+/// read; it is far larger than `response_body_byte_limit()` (which only decides
+/// whether a body is *cached*) because real page fetches can be large.
+/// Configurable via `OBSCURA_FETCH_MAX_BODY_BYTES`.
+fn fetch_max_body_bytes() -> usize {
+    std::env::var("OBSCURA_FETCH_MAX_BODY_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100 * 1024 * 1024)
+}
+
+/// Read a response body into memory, refusing bodies larger than `max` bytes —
+/// both when the server advertises an oversized `Content-Length` and when the
+/// streamed chunks exceed the cap (a lying or chunked server). Streaming keeps
+/// a multi-GB response from ever being fully allocated.
+async fn read_body_capped(
+    mut response: reqwest::Response,
+    max: usize,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    if let Some(len) = response.content_length() {
+        if len > max as u64 {
+            return Err(deno_error::JsErrorBox::generic(format!(
+                "response body of {len} bytes exceeds the maximum of {max}"
+            )));
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?
+    {
+        if buf.len() + chunk.len() > max {
+            return Err(deno_error::JsErrorBox::generic(format!(
+                "response body exceeds the maximum of {max} bytes"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 pub type SharedState = Rc<RefCell<ObscuraState>>;
@@ -1324,6 +1411,18 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             serde_json::to_string(&title).unwrap_or("\"\"".into())
         }
         "document_url" => serde_json::to_string(&gs.url).unwrap_or("\"\"".into()),
+        // The base for relative URLs. It differs from document_url exactly when the page carries
+        // a <base href>, and that is the point: HTML resolves against the base, not the document.
+        "document_base_url" => serde_json::to_string(
+            &document_base_url_memoized(&gs).unwrap_or_else(|| gs.url.clone()),
+        )
+        .unwrap_or("\"\"".into()),
+        // The unresolved attribute. After history.pushState only JS knows the URL, so only JS
+        // can resolve a relative base against it.
+        "document_base_href" => {
+            serde_json::to_string(&document_base_href_memoized(&gs).unwrap_or_default())
+                .unwrap_or("\"\"".into())
+        }
         "document_referrer" => serde_json::to_string(&gs.referrer).unwrap_or("\"\"".into()),
         "document_encoding" => serde_json::to_string(&gs.encoding).unwrap_or("\"UTF-8\"".into()),
         "document_element" => {
@@ -2040,13 +2139,45 @@ fn compare_node_order(dom: &DomTree, a: NodeId, b: NodeId) -> i32 {
 }
 
 #[op2(fast)]
-fn op_console_msg(state: &OpState, #[string] level: &str, #[string] msg: &str) {
-    let _ = state;
+fn op_runtime_events_enabled(state: &OpState) -> bool {
+    state.borrow::<SharedState>().borrow().runtime_events_enabled
+}
+
+#[op2(fast)]
+fn op_console_msg(
+    state: &OpState,
+    #[string] level: &str,
+    #[string] msg: &str,
+    #[string] args_json: &str,
+) {
     match level {
-        "warn" => tracing::warn!(target: "obscura::console", "{}", msg),
+        "warn" | "warning" => tracing::warn!(target: "obscura::console", "{}", msg),
         "error" => tracing::error!(target: "obscura::console", "{}", msg),
         _ => tracing::info!(target: "obscura::console", "{}", msg),
     }
+
+    let page = state.borrow::<SharedState>().clone();
+    let mut page = page.borrow_mut();
+    if !page.runtime_events_enabled {
+        return;
+    }
+    let Ok(args) = serde_json::from_str::<Vec<serde_json::Value>>(args_json) else {
+        return;
+    };
+    if page.pending_runtime_events.len() >= 1_024 {
+        page.pending_runtime_events.pop_front();
+    }
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+        * 1_000.0;
+    page.pending_runtime_events
+        .push_back(RuntimeEvent::Console(RuntimeConsoleEvent {
+            kind: level.to_string(),
+            args,
+            timestamp,
+        }));
 }
 
 // Fallback cache for runtimes that have no owning ObscuraHttpClient, such as
@@ -2187,11 +2318,12 @@ async fn op_fetch_url(
     #[string] url: String,
     #[string] method: String,
     #[string] headers_json: String,
-    #[string] body: String,
+    #[buffer] body: JsBuffer,
     #[string] origin: String,
     #[string] mode: String,
     #[string] credentials: String,
 ) -> Result<String, deno_error::JsErrorBox> {
+    let body = body.to_vec();
     tracing::debug!(
         "op_fetch_url called: {} {} (intercept check pending)",
         method,
@@ -2284,7 +2416,7 @@ async fn op_fetch_url(
     let mut override_url: Option<String> = None;
     let mut override_method: Option<String> = None;
     let mut override_headers: Option<HashMap<String, String>> = None;
-    let mut override_body: Option<String> = None;
+    let mut override_body: Option<Vec<u8>> = None;
 
     if let Some((tx, request_id)) = intercept_tx {
         let custom_headers: HashMap<String, String> =
@@ -2334,7 +2466,7 @@ async fn op_fetch_url(
                     override_url = url;
                     override_method = method;
                     override_headers = headers;
-                    override_body = body;
+                    override_body = body.map(String::into_bytes);
                     tracing::debug!(
                         "Interception: continue (overrides url={} method={} headers={} body={})",
                         override_url.is_some(),
@@ -2673,10 +2805,7 @@ async fn op_fetch_url(
         }
     }
 
-    let resp_bytes = response
-        .bytes()
-        .await
-        .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+    let resp_bytes = read_body_capped(response, fetch_max_body_bytes()).await?;
     let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
     let resp_body_base64 = BASE64.encode(&resp_bytes);
     if let Some(ref cbs) = callbacks {
@@ -2787,7 +2916,7 @@ async fn stealth_fetch_all(
     url: String,
     method: String,
     custom_headers: HashMap<String, String>,
-    body: String,
+    body: Vec<u8>,
     page_origin: String,
     mode: String,
     credentials: FetchCredentials,
@@ -2968,6 +3097,7 @@ mod tests {
     #[cfg(feature = "render")]
     use obscura_dom::ShadowRootMode;
 
+    use super::read_body_capped;
     use super::{pbkdf2_derive, PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES};
 
     // SEC-006 / #580 — PBKDF2 parameters arrive straight from page JS. Without
@@ -3000,6 +3130,69 @@ mod tests {
         let dk = pbkdf2_derive("SHA-256", b"password", b"salt", 1_000, 32)
             .expect("ordinary parameters must derive successfully");
         assert_eq!(dk.len(), 32, "derived key must have the requested length");
+    }
+
+
+    // SEC-005 / #581 — op_fetch_url must not buffer an unbounded response body.
+    // read_body_capped streams the body and refuses anything larger than the
+    // cap, covering a server that just keeps sending with no Content-Length.
+
+    async fn serve_body_once(body_len: usize, with_content_length: bool) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut header = String::from("HTTP/1.1 200 OK\r\nConnection: close\r\n");
+            if with_content_length {
+                header.push_str(&format!("Content-Length: {body_len}\r\n"));
+            }
+            header.push_str("\r\n");
+            let _ = sock.write_all(header.as_bytes()).await;
+            let chunk = vec![b'a'; 64 * 1024];
+            let mut sent = 0;
+            while sent < body_len {
+                let n = std::cmp::min(chunk.len(), body_len - sent);
+                if sock.write_all(&chunk[..n]).await.is_err() {
+                    break;
+                }
+                sent += n;
+            }
+            let _ = sock.shutdown().await;
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn read_body_capped_rejects_oversized_streamed_body() {
+        // No Content-Length forces the streaming-cap branch (lying/chunked server).
+        let addr = serve_body_once(4 * 1024 * 1024, false).await;
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("request should reach the local server");
+        let err = read_body_capped(resp, 1024 * 1024)
+            .await
+            .expect_err("a body larger than the cap must be rejected");
+        assert!(
+            err.to_string().contains("maximum"),
+            "error should mention the cap: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_body_capped_reads_body_within_cap() {
+        let addr = serve_body_once(1024, true).await;
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("request should reach the local server");
+        let body = read_body_capped(resp, 1024 * 1024)
+            .await
+            .expect("a small body must be read successfully");
+        assert_eq!(body.len(), 1024, "should read the whole small body");
     }
 
     #[test]
@@ -3589,6 +3782,7 @@ fn op_post_frame_message(
     target_frame_id: u32,
     source_frame_id: u32,
     #[string] origin: &str,
+    #[string] target_origin: &str,
     #[string] data_json: &str,
 ) {
     let gs = state.borrow::<SharedState>().clone();
@@ -3612,6 +3806,7 @@ fn op_post_frame_message(
         target_frame_id,
         source_frame_id,
         origin: origin.to_string(),
+        target_origin: target_origin.to_string(),
         data_json: data_json.to_string(),
     });
 }
@@ -4602,6 +4797,7 @@ pub fn build_extension() -> Extension {
         op_script_try_start(),
         op_shadow_attach(),
         op_shadow_root_info(),
+        op_runtime_events_enabled(),
         op_console_msg(),
         op_fetch_url(),
         op_get_cookies(),
@@ -4827,7 +5023,8 @@ fn op_waapi_control(
     changed
 }
 
-#[cfg(feature = "render")]
+// Not tied to `render`: the JS layer resolves every relative URL through here, in all build
+// variants.
 pub(crate) fn document_base_url(state: &ObscuraState) -> Option<String> {
     let document_url = url::Url::parse(&state.url).ok()?;
     let base_href = state.dom.as_ref().and_then(|dom| {
@@ -4840,9 +5037,72 @@ pub(crate) fn document_base_url(state: &ObscuraState) -> Option<String> {
             })
     });
     match base_href {
-        Some(href) => document_url.join(&href).ok().map(|url| url.to_string()),
+        // https://html.spec.whatwg.org/multipage/semantics.html#set-the-frozen-base-url
+        // A data: or javascript: base falls back to the document URL. Accepting it would instead
+        // make every later relative resolution fail.
+        Some(href) => match document_url.join(&href) {
+            Ok(base) if base.scheme() != "data" && base.scheme() != "javascript" => {
+                Some(base.to_string())
+            }
+            _ => Some(document_url.to_string()),
+        },
         None => Some(document_url.to_string()),
     }
+}
+
+/// The raw `href` attribute of the first `<base href>`, unresolved. The JS layer needs it after
+/// `history.pushState`: the document URL has moved, only JS knows the new one, so only JS can
+/// resolve a relative base against it.
+fn document_base_href(state: &ObscuraState) -> Option<String> {
+    state.dom.as_ref().and_then(|dom| {
+        dom.query_selector("base[href]")
+            .ok()
+            .flatten()
+            .and_then(|id| {
+                dom.get_node(id)
+                    .and_then(|node| node.get_attribute("href").map(str::to_string))
+            })
+    })
+}
+
+/// What the cached values were computed from. If any of the three changes, they are recomputed.
+pub struct BaseUrlCache {
+    activity_generation: u64,
+    document_generation: u64,
+    url: String,
+    resolved: Option<String>,
+    raw_href: Option<String>,
+}
+
+/// Both base values behind a cache. Uncached, each one walks the tree and runs the selector
+/// engine, which would make `a.href` an O(nodes) read.
+fn base_values_memoized(state: &ObscuraState) -> (Option<String>, Option<String>) {
+    if let Some(cached) = state.base_url_cache.borrow().as_ref() {
+        if cached.activity_generation == state.activity_generation
+            && cached.document_generation == state.document_generation
+            && cached.url == state.url
+        {
+            return (cached.resolved.clone(), cached.raw_href.clone());
+        }
+    }
+    let resolved = document_base_url(state);
+    let raw_href = document_base_href(state);
+    *state.base_url_cache.borrow_mut() = Some(BaseUrlCache {
+        activity_generation: state.activity_generation,
+        document_generation: state.document_generation,
+        url: state.url.clone(),
+        resolved: resolved.clone(),
+        raw_href: raw_href.clone(),
+    });
+    (resolved, raw_href)
+}
+
+pub(crate) fn document_base_url_memoized(state: &ObscuraState) -> Option<String> {
+    base_values_memoized(state).0
+}
+
+pub(crate) fn document_base_href_memoized(state: &ObscuraState) -> Option<String> {
+    base_values_memoized(state).1
 }
 
 #[cfg(feature = "render")]

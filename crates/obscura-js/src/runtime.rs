@@ -13,7 +13,10 @@ use crate::import_map::ImportMap;
 use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
 use crate::ops::ensure_prepared_render;
-use crate::ops::{build_extension, node_is_script, ObscuraState, StoredNetworkResponseBody};
+use crate::ops::{
+    build_extension, node_is_script, ObscuraState, RuntimeEvent, RuntimeExceptionEvent,
+    StoredNetworkResponseBody,
+};
 #[cfg(feature = "render")]
 use crate::ops::{
     begin_animation_task, clamp_scroll_offset, document_base_url, ensure_resolved_scroll,
@@ -1023,6 +1026,101 @@ impl ObscuraJsRuntime {
 
     pub fn take_pending_binding_calls(&self) -> Vec<(String, String)> {
         std::mem::take(&mut self.state.borrow_mut().pending_binding_calls)
+    }
+
+    pub fn take_pending_runtime_events(&mut self) -> Vec<RuntimeEvent> {
+        let events: Vec<_> = self
+            .state
+            .borrow_mut()
+            .pending_runtime_events
+            .drain(..)
+            .collect();
+        for event in &events {
+            let RuntimeEvent::Console(event) = event else {
+                continue;
+            };
+            for arg in &event.args {
+                let Some(object_id) = arg.get("objectId").and_then(|value| value.as_str()) else {
+                    continue;
+                };
+                let frame_id = object_id
+                    .strip_prefix("console-")
+                    .and_then(|rest| rest.split_once('-'))
+                    .and_then(|(frame_id, _)| frame_id.parse::<u32>().ok())
+                    .unwrap_or(0);
+                let retrieval = if frame_id == 0 {
+                    format!("globalThis.__obscura_objects['{object_id}']")
+                } else {
+                    format!(
+                        "globalThis.__obscura_frameObjects[{frame_id}]?.window?.__obscura_objects['{object_id}']"
+                    )
+                };
+                self.object_store.insert(object_id.to_string(), retrieval);
+            }
+        }
+        events
+    }
+
+    pub fn set_runtime_events_enabled(&self, enabled: bool) {
+        self.state.borrow_mut().runtime_events_enabled = enabled;
+    }
+
+    fn record_uncaught_exception(&self, error: &deno_core::error::JsError, fallback_url: &str) {
+        let mut state = self.state.borrow_mut();
+        if !state.runtime_events_enabled {
+            return;
+        }
+        state.runtime_exception_counter = state.runtime_exception_counter.saturating_add(1);
+        let first = error.frames.first();
+        let url = first
+            .and_then(|frame| frame.file_name.clone())
+            .filter(|url| !url.is_empty())
+            .unwrap_or_else(|| fallback_url.to_string());
+        let line_number = first
+            .and_then(|frame| frame.line_number)
+            .unwrap_or(1)
+            .saturating_sub(1);
+        let column_number = first
+            .and_then(|frame| frame.column_number)
+            .unwrap_or(1)
+            .saturating_sub(1);
+        let stack_trace = error
+            .frames
+            .iter()
+            .map(|frame| {
+                serde_json::json!({
+                    "functionName": frame.function_name.as_deref().unwrap_or(""),
+                    "scriptId": "",
+                    "url": frame.file_name.as_deref().unwrap_or(fallback_url),
+                    "lineNumber": frame.line_number.unwrap_or(1).saturating_sub(1),
+                    "columnNumber": frame.column_number.unwrap_or(1).saturating_sub(1),
+                })
+            })
+            .collect();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64()
+            * 1_000.0;
+        if state.pending_runtime_events.len() >= 1_024 {
+            state.pending_runtime_events.pop_front();
+        }
+        let exception_id = state.runtime_exception_counter;
+        state
+            .pending_runtime_events
+            .push_back(RuntimeEvent::Exception(RuntimeExceptionEvent {
+                exception_id,
+                name: error.name.clone().unwrap_or_else(|| "Error".to_string()),
+                description: error
+                    .stack
+                    .clone()
+                    .unwrap_or_else(|| error.exception_message.clone()),
+                url,
+                line_number,
+                column_number,
+                stack_trace,
+                timestamp,
+            }));
     }
 
     pub fn get_network_response_body(&self, request_id: &str) -> Option<StoredNetworkResponseBody> {
@@ -2040,16 +2138,40 @@ impl ObscuraJsRuntime {
 
     pub fn release_object(&mut self, object_id: &str) {
         if self.object_store.remove(object_id).is_some() {
-            let code = format!("delete globalThis.__obscura_objects['{}'];", object_id,);
+            let frame_id = object_id
+                .strip_prefix("console-")
+                .and_then(|rest| rest.split_once('-'))
+                .and_then(|(frame_id, _)| frame_id.parse::<u32>().ok())
+                .unwrap_or(0);
+            let code = if frame_id == 0 {
+                format!("delete globalThis.__obscura_objects['{object_id}'];")
+            } else {
+                format!(
+                    "delete globalThis.__obscura_frameObjects[{frame_id}]?.window?.__obscura_objects['{object_id}'];"
+                )
+            };
             let _ = self.execute_runtime_script("<release>", code);
         }
     }
 
     pub fn release_object_group(&mut self) {
-        let _ = self.execute_runtime_script(
-            "<releaseGroup>",
-            "globalThis.__obscura_objects = {};".to_string(),
-        );
+        let mut frame_ids: Vec<u32> = self
+            .object_store
+            .keys()
+            .filter_map(|object_id| object_id.strip_prefix("console-"))
+            .filter_map(|rest| rest.split_once('-'))
+            .filter_map(|(frame_id, _)| frame_id.parse().ok())
+            .filter(|frame_id| *frame_id != 0)
+            .collect();
+        frame_ids.sort_unstable();
+        frame_ids.dedup();
+        let mut code = "globalThis.__obscura_objects = {};".to_string();
+        for frame_id in frame_ids {
+            code.push_str(&format!(
+                "if(globalThis.__obscura_frameObjects[{frame_id}]?.window)globalThis.__obscura_frameObjects[{frame_id}].window.__obscura_objects={{}};"
+            ));
+        }
+        let _ = self.execute_runtime_script("<releaseGroup>", code);
         self.object_store.clear();
     }
     pub async fn load_module(&mut self, url: &str, budget_ms: u64) -> Result<(), String> {
@@ -2307,16 +2429,17 @@ impl ObscuraJsRuntime {
 
     fn execute_classic_script(&mut self, name: &str, source: &str) -> Result<(), String> {
         self.begin_javascript_task();
+        let script_url = name.to_string();
         // JsRuntime::execute_script in deno_core 0.350 restricts `name` to a
         // &'static str. Browser script URLs are runtime data, and V8 uses this
         // origin as import()'s referrer, so compile in the runtime's main
         // context directly instead of substituting the fixed "<script>" name.
-        let result = (|| {
+        let result: Result<(), (String, Option<deno_core::error::JsError>)> = (|| {
             let scope = &mut self.runtime.handle_scope();
             let source = deno_core::v8::String::new(scope, source)
-                .ok_or_else(|| "JS error: source allocation failed".to_string())?;
+                .ok_or_else(|| ("JS error: source allocation failed".to_string(), None))?;
             let name = deno_core::v8::String::new(scope, name)
-                .ok_or_else(|| "JS error: script URL allocation failed".to_string())?;
+                .ok_or_else(|| ("JS error: script URL allocation failed".to_string(), None))?;
             let origin = deno_core::v8::ScriptOrigin::new(
                 scope,
                 name.into(),
@@ -2335,35 +2458,46 @@ impl ObscuraJsRuntime {
             let Some(script) = script else {
                 if scope.is_execution_terminating() {
                     scope.cancel_terminate_execution();
-                    return Err("JS error: Uncaught Error: execution terminated".to_string());
+                    return Err(("JS error: Uncaught Error: execution terminated".to_string(), None));
                 }
                 return match scope.exception() {
                     Some(exception) => {
                         let error = deno_core::error::JsError::from_v8_exception(scope, exception);
-                        Err(format!("JS error: {error}"))
+                        Err((format!("JS error: {error}"), Some(error)))
                     }
-                    None => {
-                        Err("JS error: script compilation failed without an exception".to_string())
-                    }
+                    None => Err((
+                        "JS error: script compilation failed without an exception".to_string(),
+                        None,
+                    )),
                 };
             };
             if script.run(scope).is_none() {
                 if scope.is_execution_terminating() {
                     scope.cancel_terminate_execution();
-                    return Err("JS error: Uncaught Error: execution terminated".to_string());
+                    return Err(("JS error: Uncaught Error: execution terminated".to_string(), None));
                 }
                 return match scope.exception() {
                     Some(exception) => {
                         let error = deno_core::error::JsError::from_v8_exception(scope, exception);
-                        Err(format!("JS error: {error}"))
+                        Err((format!("JS error: {error}"), Some(error)))
                     }
-                    None => {
-                        Err("JS error: script execution failed without an exception".to_string())
-                    }
+                    None => Err((
+                        "JS error: script execution failed without an exception".to_string(),
+                        None,
+                    )),
                 };
             }
             Ok(())
         })();
+        let result = match result {
+            Ok(()) => Ok(()),
+            Err((message, error)) => {
+                if let Some(error) = error.as_ref() {
+                    self.record_uncaught_exception(error, &script_url);
+                }
+                Err(message)
+            }
+        };
         self.finish_heap_checked(result)
     }
 
@@ -13587,6 +13721,48 @@ mod tests {
     }
 
     #[test]
+    fn test_checkbox_indeterminate_is_idl_only_and_cleared_by_activation() {
+        // `indeterminate` has no content attribute, so it exists only if the
+        // prototype defines it -- `'indeterminate' in el` is the check that
+        // fails when it is missing. Activation clears it as well as toggling
+        // checkedness (HTML legacy-pre-activation behaviour), and a cancelled
+        // click puts both back, so a script-set flag is never left stuck.
+        let mut rt = setup_runtime(
+            r#"<input type="checkbox" id="fresh">
+               <input type="checkbox" id="click">
+               <input type="checkbox" id="cancel">"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const fresh = document.getElementById('fresh');
+            const present = 'indeterminate' in fresh;
+            const initial = fresh.indeterminate;
+            fresh.indeterminate = true;
+            const roundTrip = fresh.indeterminate;
+
+            const clicked = document.getElementById('click');
+            clicked.indeterminate = true;
+            clicked.click();
+
+            const cancelled = document.getElementById('cancel');
+            cancelled.indeterminate = true;
+            cancelled.addEventListener('click', e => e.preventDefault());
+            cancelled.click();
+
+            return [present, initial, roundTrip,
+                    clicked.checked, clicked.indeterminate,
+                    cancelled.checked, cancelled.indeterminate];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, false, true, true, false, false, true])
+        );
+    }
+
+    #[test]
     fn test_disabled_only_applies_to_disableable_elements() {
         // A `disabled` attribute is meaningless on anything that cannot be
         // disabled, and only listed form controls inherit it from a fieldset.
@@ -14642,6 +14818,320 @@ mod tests {
         );
     }
 
+    /// Document URL two levels deep, base one level deep and the origin root on neither of the
+    /// two. The three possible bases land on three different paths, and one assert keeps them
+    /// apart:
+    ///   document base URL  ->  /app/data/x.json   (the spec)
+    ///   document URL       ->  /deep/data/x.json  (the bug)
+    ///   origin root        ->  /data/x.json       (a base "/" would hide this one)
+    fn setup_runtime_at_deep_url(html: &str) -> ObscuraJsRuntime {
+        let dom = parse_html(html);
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url("http://example.com/deep/page");
+        rt.run_page_init();
+        rt
+    }
+
+    const BASE_HREF_PAGE: &str = r#"<html><head><base href="/app/"></head><body>
+            <a id="link" href="data/x.json"></a>
+            <form id="form" action="submit"></form>
+            <script id="script" src="chunk.js"></script>
+        </body></html>"#;
+
+    #[test]
+    fn base_href_governs_dom_url_reflection() {
+        let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
+
+        // One evaluate, one assert: a bundle of assert_eq! aborts at the first failure and
+        // reports one broken path while hiding the others.
+        let seen = rt
+            .evaluate(
+                r#"return [
+                    document.baseURI,
+                    document.getElementById('link').href,
+                    document.getElementById('form').action,
+                    document.getElementById('script').src,
+                ]"#,
+            )
+            .unwrap();
+        assert_eq!(
+            seen.as_array().unwrap(),
+            &vec![
+                serde_json::json!("http://example.com/app/"),
+                serde_json::json!("http://example.com/app/data/x.json"),
+                serde_json::json!("http://example.com/app/submit"),
+                serde_json::json!("http://example.com/app/chunk.js"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_relative_location_assignment_follows_the_base() {
+        // _resolveUrl serves location.href=, assign, replace and window.location=. Of the six
+        // call sites it has the largest external effect, so it gets its own test.
+        let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
+        rt.evaluate("location.href = 'users/42'").unwrap();
+
+        let landed = rt.evaluate("location.href").unwrap();
+        assert_eq!(landed.as_str().unwrap(), "http://example.com/app/users/42");
+    }
+
+    #[test]
+    fn without_base_href_resolution_stays_on_the_document_url() {
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head></head><body>
+                <a id="link" href="data/x.json"></a>
+                <form id="form" action="submit"></form>
+                <script id="script" src="chunk.js"></script>
+            </body></html>"#,
+        );
+
+        // Every call site, not just the anchor: a site that resolves to the origin root instead
+        // of the document URL slips through on a page without a base only when nobody is looking.
+        let seen = rt
+            .evaluate(
+                r#"return [
+                    document.baseURI,
+                    document.getElementById('link').href,
+                    document.getElementById('form').action,
+                    document.getElementById('script').src,
+                ]"#,
+            )
+            .unwrap();
+        assert_eq!(
+            seen.as_array().unwrap(),
+            &vec![
+                serde_json::json!("http://example.com/deep/page"),
+                serde_json::json!("http://example.com/deep/data/x.json"),
+                serde_json::json!("http://example.com/deep/submit"),
+                serde_json::json!("http://example.com/deep/chunk.js"),
+            ]
+        );
+    }
+
+    #[test]
+    fn base_element_href_reflects_the_resolved_url() {
+        // Resolved against the fallback base URL, i.e. the document URL and not /app/.
+        let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
+        let href = rt.evaluate("document.querySelector('base').href").unwrap();
+        assert_eq!(href.as_str().unwrap(), "http://example.com/app/");
+
+        let mut relative = setup_runtime_at_deep_url(
+            r#"<html><head><base href="assets/"></head><body></body></html>"#,
+        );
+        let href = relative
+            .evaluate("document.querySelector('base').href")
+            .unwrap();
+        assert_eq!(href.as_str().unwrap(), "http://example.com/deep/assets/");
+    }
+
+    #[test]
+    fn the_first_base_with_an_href_wins() {
+        // Tree order, and a <base> without href does not count.
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head><base><base href="/a/"><base href="/b/"></head><body>
+                <a id="link" href="x.json"></a>
+            </body></html>"#,
+        );
+        let link = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(link.as_str().unwrap(), "http://example.com/a/x.json");
+    }
+
+    #[test]
+    fn an_empty_base_href_resolves_to_the_document_url() {
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head><base href=""></head><body>
+                <a id="link" href="x.json"></a>
+            </body></html>"#,
+        );
+        let link = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(link.as_str().unwrap(), "http://example.com/deep/x.json");
+    }
+
+    #[test]
+    fn a_cross_origin_base_moves_the_target_but_not_the_page_origin() {
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head><base href="https://cdn.example.net/v2/"></head><body>
+                <a id="link" href="x.json"></a>
+            </body></html>"#,
+        );
+        let seen = rt
+            .evaluate("return [document.getElementById('link').href, location.origin]")
+            .unwrap();
+        assert_eq!(
+            seen.as_array().unwrap(),
+            &vec![
+                serde_json::json!("https://cdn.example.net/v2/x.json"),
+                serde_json::json!("http://example.com"),
+            ]
+        );
+    }
+
+    #[test]
+    fn base_href_rejects_a_data_url_base() {
+        // https://html.spec.whatwg.org/multipage/semantics.html#set-the-frozen-base-url
+        // Accepting it would make every later relative resolution fail instead of falling back.
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head><base href="data:text/html,x"></head><body>
+                <a id="link" href="data/x.json"></a>
+            </body></html>"#,
+        );
+
+        let base_uri = rt.evaluate("document.baseURI").unwrap();
+        assert_eq!(base_uri.as_str().unwrap(), "http://example.com/deep/page");
+
+        let link = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(link.as_str().unwrap(), "http://example.com/deep/data/x.json");
+    }
+
+    #[test]
+    fn base_resolution_follows_the_url_set_by_push_state() {
+        // pushState changes the document URL, and without <base> that very URL is the base.
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head></head><body><a id="link" href="x.json"></a></body></html>"#,
+        );
+        rt.evaluate("history.pushState({}, '', '/other/route')").unwrap();
+
+        let link = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(link.as_str().unwrap(), "http://example.com/other/x.json");
+    }
+
+    #[test]
+    fn a_relative_base_href_resolves_against_the_push_state_url() {
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head><base href="assets/"></head><body>
+                <a id="link" href="x.json"></a>
+            </body></html>"#,
+        );
+        rt.evaluate("history.pushState({}, '', '/other/route')").unwrap();
+
+        let link = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(link.as_str().unwrap(), "http://example.com/other/assets/x.json");
+    }
+
+    /// Guards the cache in `document_base_url_memoized`. Without it, each of these reads walked
+    /// the tree and ran the selector engine, and `a.href` went from a field read to O(nodes).
+    /// The bound is deliberately loose: it should catch the regression, not watch the allocator.
+    #[test]
+    fn anchor_href_reads_do_not_scale_with_document_size() {
+        let mut body = String::from(r#"<html><head></head><body><a id="link" href="x.json"></a>"#);
+        for i in 0..4000 {
+            body.push_str(&format!("<div id=\"n{i}\"><span>text</span></div>"));
+        }
+        body.push_str("</body></html>");
+        let mut rt = setup_runtime_at_deep_url(&body);
+
+        let elapsed = rt
+            .evaluate(
+                r#"
+                const link = document.getElementById('link');
+                const started = Date.now();
+                for (let i = 0; i < 2000; i++) { link.href; }
+                return Date.now() - started;
+                "#,
+            )
+            .unwrap();
+        let ms = elapsed.as_f64().expect("elapsed ms");
+        assert!(
+            ms < 500.0,
+            "2000 a.href reads on a document with 12000 nodes took {ms} ms, the base query is not cached"
+        );
+    }
+
+    #[test]
+    fn the_base_memo_still_sees_a_base_element_added_later() {
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head></head><body><a id="link" href="x.json"></a></body></html>"#,
+        );
+        let before = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(before.as_str().unwrap(), "http://example.com/deep/x.json");
+
+        rt.evaluate(
+            r#"
+            const base = document.createElement('base');
+            base.setAttribute('href', '/');
+            document.head.appendChild(base);
+            "#,
+        )
+        .unwrap();
+
+        let after = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(after.as_str().unwrap(), "http://example.com/x.json");
+    }
+
+    #[test]
+    fn the_base_memo_notices_a_changed_href_attribute() {
+        let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
+        let before = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(before.as_str().unwrap(), "http://example.com/app/data/x.json");
+
+        rt.evaluate("document.querySelector('base').setAttribute('href', '/other/')")
+            .unwrap();
+
+        let after = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(after.as_str().unwrap(), "http://example.com/other/data/x.json");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn base_href_governs_fetch_and_xhr_targets() {
+        let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                const originalFetchOp = Deno.core.ops.op_fetch_url;
+                const seen = [];
+                try {
+                    Deno.core.ops.op_fetch_url = (url) => {
+                        seen.push(url);
+                        return JSON.stringify({ status: 200, headers: {}, body: "{}", url });
+                    };
+                    await fetch("data/x.json");
+                    const xhr = new XMLHttpRequest();
+                    xhr.open("GET", "data/y.json");
+                    xhr.send();
+                    await new Promise((r) => setTimeout(r, 0));
+                    return seen;
+                } finally {
+                    Deno.core.ops.op_fetch_url = originalFetchOp;
+                }
+            }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let value = result.value.expect("captured URLs");
+        let seen = value.as_array().expect("captured URLs");
+        // The XHR entry cannot isolate its own layer: send() passes the already absolute URL on
+        // to fetch, so fetch takes over the resolution if it is removed from send, and the assert
+        // still holds. It pins the result, not the layer.
+        assert_eq!(seen.len(), 2, "one fetch, one XHR");
+        assert_eq!(seen[0].as_str().unwrap(), "http://example.com/app/data/x.json");
+        assert_eq!(seen[1].as_str().unwrap(), "http://example.com/app/data/y.json");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_fetch_url_input_decodes_binary_body_base64() {
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -14757,6 +15247,229 @@ mod tests {
             })
         );
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_preserves_binary_body_sources_at_the_op_boundary() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const calls = [];
+                    try {
+                        Deno.core.ops.op_fetch_url =
+                            (url, method, headers, body) => {
+                                calls.push({
+                                    path: new URL(url).pathname,
+                                    method,
+                                    headers: JSON.parse(headers),
+                                    isUint8Array: body instanceof Uint8Array,
+                                    bytes: Array.from(
+                                        body instanceof Uint8Array
+                                            ? body
+                                            : new TextEncoder().encode(body),
+                                    ),
+                                });
+                                return JSON.stringify({
+                                    status: 200,
+                                    headers: {},
+                                    body: "ok",
+                                    url,
+                                });
+                            };
+
+                        const sentinel = [0, 128, 255, 16];
+                        await fetch("/blob", {
+                            method: "POST",
+                            body: new Blob([new Uint8Array(sentinel)]),
+                        });
+
+                        const arrayBuffer = new Uint8Array(sentinel).buffer;
+                        await fetch("/array-buffer", { method: "POST", body: arrayBuffer });
+
+                        const backing = new Uint8Array([9, ...sentinel, 8]);
+                        await fetch("/typed-array-view", {
+                            method: "POST",
+                            body: backing.subarray(1, 5),
+                        });
+
+                        const request = new Request("/request", {
+                            method: "POST",
+                            headers: {
+                                authorization: "Bearer test-token",
+                                "x-request-source": "request",
+                            },
+                            body: new Uint8Array(sentinel),
+                        });
+                        await fetch(request);
+                        await fetch(request, {
+                            headers: { "x-init-override": "yes" },
+                        });
+
+                        await fetch(new Request("/request-params-object", {
+                            method: "POST",
+                            body: new URLSearchParams({ a: "b" }),
+                        }), { headers: {} });
+                        await fetch(new Request("/request-params-headers", {
+                            method: "POST",
+                            body: new URLSearchParams({ a: "b" }),
+                        }), { headers: new Headers() });
+
+                        return calls;
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!([
+                { "path": "/blob", "method": "POST", "headers": {}, "isUint8Array": true, "bytes": [0, 128, 255, 16] },
+                { "path": "/array-buffer", "method": "POST", "headers": {}, "isUint8Array": true, "bytes": [0, 128, 255, 16] },
+                { "path": "/typed-array-view", "method": "POST", "headers": {}, "isUint8Array": true, "bytes": [0, 128, 255, 16] },
+                { "path": "/request", "method": "POST", "headers": { "authorization": "Bearer test-token", "x-request-source": "request" }, "isUint8Array": true, "bytes": [0, 128, 255, 16] },
+                { "path": "/request", "method": "POST", "headers": { "x-init-override": "yes" }, "isUint8Array": true, "bytes": [0, 128, 255, 16] },
+                { "path": "/request-params-object", "method": "POST", "headers": {}, "isUint8Array": true, "bytes": [97, 61, 98] },
+                { "path": "/request-params-headers", "method": "POST", "headers": {}, "isUint8Array": true, "bytes": [97, 61, 98] },
+            ])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_form_urlencoded_and_xhr_bodies_reach_the_op_as_bytes() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const calls = [];
+                    const includesBytes = (bytes, needle) => {
+                        outer: for (let i = 0; i <= bytes.length - needle.length; i++) {
+                            for (let j = 0; j < needle.length; j++) {
+                                if (bytes[i + j] !== needle[j]) continue outer;
+                            }
+                            return true;
+                        }
+                        return false;
+                    };
+                    try {
+                        Deno.core.ops.op_fetch_url =
+                            (url, method, headers, body) => {
+                                const bytes = Array.from(
+                                    body instanceof Uint8Array
+                                        ? body
+                                        : new TextEncoder().encode(body),
+                                );
+                                calls.push({
+                                    path: new URL(url).pathname,
+                                    headers: JSON.parse(headers),
+                                    isUint8Array: body instanceof Uint8Array,
+                                    bytes,
+                                    hasRawSentinel: includesBytes(bytes, [0, 128, 255, 16]),
+                                });
+                                return JSON.stringify({
+                                    status: 200,
+                                    headers: {},
+                                    body: "ok",
+                                    url,
+                                });
+                            };
+
+                        const form = new FormData();
+                        form.append("note", "snow \u96ea");
+                        form.append(
+                            "upload",
+                            new File([new Uint8Array([0, 128, 255, 16])], "sentinel.bin", {
+                                type: "application/octet-stream",
+                            }),
+                        );
+                        await fetch("/form-data", { method: "POST", body: form });
+
+                        const params = new URLSearchParams();
+                        params.append("greeting", "\u96ea space&");
+                        await fetch("/url-search-params", { method: "POST", body: params });
+
+                        await new Promise((resolve, reject) => {
+                            const xhr = new XMLHttpRequest();
+                            xhr.open("POST", "/xhr-typed-array");
+                            xhr.onload = resolve;
+                            xhr.onerror = reject;
+                            const backing = new Uint8Array([9, 0, 128, 255, 16, 8]);
+                            xhr.send(backing.subarray(1, 5));
+                        });
+
+                        const formCall = calls.find(call => call.path === "/form-data");
+                        const paramsCall = calls.find(call => call.path === "/url-search-params");
+                        const xhrCall = calls.find(call => call.path === "/xhr-typed-array");
+                        return {
+                            formData: {
+                                isUint8Array: formCall.isUint8Array,
+                                contentType: Object.entries(formCall.headers)
+                                    .find(([name]) => name.toLowerCase() === "content-type")[1]
+                                    .startsWith("multipart/form-data; boundary=----WebKitFormBoundary"),
+                                hasText: includesBytes(
+                                    formCall.bytes,
+                                    Array.from(new TextEncoder().encode("snow \u96ea")),
+                                ),
+                                hasFilename: includesBytes(
+                                    formCall.bytes,
+                                    Array.from(new TextEncoder().encode('filename="sentinel.bin"')),
+                                ),
+                                hasRawSentinel: formCall.hasRawSentinel,
+                            },
+                            urlSearchParams: {
+                                isUint8Array: paramsCall.isUint8Array,
+                                contentType: Object.entries(paramsCall.headers)
+                                    .find(([name]) => name.toLowerCase() === "content-type")[1],
+                                bytes: paramsCall.bytes,
+                            },
+                            xhr: {
+                                isUint8Array: xhrCall.isUint8Array,
+                                bytes: xhrCall.bytes,
+                            },
+                        };
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "formData": {
+                    "isUint8Array": true,
+                    "contentType": true,
+                    "hasText": true,
+                    "hasFilename": true,
+                    "hasRawSentinel": true,
+                },
+                "urlSearchParams": {
+                    "isUint8Array": true,
+                    "contentType": "application/x-www-form-urlencoded;charset=UTF-8",
+                    "bytes": "greeting=%E9%9B%AA+space%26".as_bytes(),
+                },
+                "xhr": {
+                    "isUint8Array": true,
+                    "bytes": [0, 128, 255, 16],
+                },
+            })
+        );
+    }
+
     /// Serves a redirect chain across `connections` consecutive
     /// requests: `/hop/N` replies with 302 to `/hop/N-1`, `/hop/0` is the
     /// target. To a path the fixture cannot read it replies with 400

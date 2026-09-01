@@ -555,7 +555,7 @@ impl StealthHttpClient {
         method: &str,
         url: &Url,
         headers: &HashMap<String, String>,
-        body: &str,
+        body: &[u8],
         send_cookies: bool,
         store_cookies: bool,
     ) -> Result<Response, ObscuraNetError> {
@@ -590,7 +590,7 @@ impl StealthHttpClient {
             req = req.header(k.as_str(), v.as_str());
         }
         if !body.is_empty() {
-            req = req.body(body.to_string());
+            req = req.body(body.to_vec());
         }
 
         let in_flight = InFlightGuard::new(&self.in_flight);
@@ -754,7 +754,7 @@ mod tests {
                 "POST",
                 &url,
                 &std::collections::HashMap::new(),
-                "payload",
+                b"payload",
                 false,
                 false,
             )

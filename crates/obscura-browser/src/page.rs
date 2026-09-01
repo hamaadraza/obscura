@@ -271,6 +271,8 @@ pub struct Page {
     /// 50-second navigation is not silently cut off by the process default.
     /// Pages without an override retain the environment-configurable default.
     navigation_timeout: Option<std::time::Duration>,
+    /// Optional per-page cap. Pages without a value keep the default.
+    navigation_chain_limit: Option<usize>,
     /// Navigation history for Page.getNavigationHistory / navigateToHistoryEntry.
     /// Entries are URLs in visit order; `history_index` is the current position.
     /// Pushed on every successful navigation; truncated on goBack -> new nav.
@@ -289,6 +291,10 @@ pub struct Page {
     // contract. Includes `Runtime.addBinding` shims so puppeteer's
     // `exposeFunction` bindings exist before inline `<script>` tags execute.
     preload_scripts: Vec<String>,
+    /// Whether at least one attached CDP session enabled the Runtime domain.
+    /// Page-owned so the subscription survives replacement of the JS runtime
+    /// during navigation.
+    runtime_events_enabled: std::cell::Cell<bool>,
     /// Document-owned HTML script preparation flags saved while the V8 realm
     /// is suspended for CDP/MCP tab switching.  These are restored only when
     /// the same surviving DomTree is resumed; navigation clears them.
@@ -317,6 +323,10 @@ fn max_live_frames() -> usize {
         .unwrap_or(64)
 }
 
+/// The first navigation counts. The low default stops a page that resets
+/// `location` on every load.
+const DEFAULT_NAVIGATION_CHAIN_LIMIT: usize = 10;
+
 fn default_navigation_timeout() -> std::time::Duration {
     navigation_timeout_from_env_value(std::env::var("OBSCURA_NAV_TIMEOUT_MS").ok().as_deref())
 }
@@ -326,6 +336,19 @@ fn navigation_timeout_from_env_value(value: Option<&str>) -> std::time::Duration
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_NAVIGATION_TIMEOUT_MS);
     std::time::Duration::from_millis(milliseconds)
+}
+
+fn default_navigation_chain_limit() -> usize {
+    navigation_chain_limit_from_env_value(std::env::var("OBSCURA_NAV_CHAIN_LIMIT").ok().as_deref())
+}
+
+fn navigation_chain_limit_from_env_value(value: Option<&str>) -> usize {
+    // Only an unreadable value falls back to the default, so
+    // `OBSCURA_NAV_CHAIN_LIMIT=0` and `set_navigation_chain_limit(0)` agree.
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|limit| limit.max(1))
+        .unwrap_or(DEFAULT_NAVIGATION_CHAIN_LIMIT)
 }
 
 fn duration_millis_u64(duration: std::time::Duration) -> u64 {
@@ -534,6 +557,16 @@ fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
             index += length;
             continue;
         }
+        // A `@font-face` `src` list is a priority order, not a set of
+        // resources. Scanning it generically warms every entry of every
+        // descriptor; the renderer considers far fewer. `css_font_face_rule`
+        // collects the ones it will consider and reports the whole block as
+        // consumed, the same shape as the `@import` skip above.
+        if let Some((length, sources)) = css_font_face_rule(rest, base) {
+            urls.extend(sources);
+            index += length;
+            continue;
+        }
         let Some(first) = rest.chars().next() else {
             break;
         };
@@ -585,8 +618,172 @@ fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
             }
         }
         let Some(end) = end else { break };
-        let raw = rest[4..end].trim();
-        let value = if raw.len() >= 2
+        push_css_url(&rest[4..end], base, &mut urls);
+        index += end + 1;
+    }
+    urls
+}
+
+/// Record one `url(...)` value when it names a network resource.
+///
+/// Shared by the generic scan and the `@font-face` path so the two cannot
+/// disagree about quoting, fragments, `data:` or an unresolved `var()`.
+fn push_css_url(raw: &str, base: &url::Url, urls: &mut Vec<String>) {
+    let raw = raw.trim();
+    let value = if raw.len() >= 2
+        && ((raw.starts_with('"') && raw.ends_with('"'))
+            || (raw.starts_with('\'') && raw.ends_with('\'')))
+    {
+        &raw[1..raw.len() - 1]
+    } else {
+        raw
+    };
+    if value.is_empty()
+        || value.starts_with('#')
+        || value.starts_with("data:")
+        || value.contains("var(")
+    {
+        return;
+    }
+    if let Ok(mut url) = base.join(value) {
+        url.set_fragment(None);
+        if matches!(url.scheme(), "http" | "https") {
+            urls.push(url.to_string());
+        }
+    }
+}
+
+/// Return the byte length of a leading `@font-face` block, together with the
+/// sources the renderer will actually consider, in source order.
+///
+/// A `src` list is a priority order, not a set. Both rules here are taken from
+/// the layer this warms, `obscura-render`: `font_face_declaration` ends in
+/// `.last()`, so a rule carrying several `src` descriptors uses the final one,
+/// which is the cascade and what the `src: url(.eot); src: url(...)` idiom
+/// relies on; and `font_source_may_be_supported` drops `.eot` and `.svg` after
+/// stripping the query and fragment. Warming anything else fetches bytes the
+/// renderer has already ruled out.
+///
+/// A malformed block is left to the normal scanner, so this cannot swallow the
+/// rules that follow it.
+fn css_font_face_rule(css: &str, base: &url::Url) -> Option<(usize, Vec<String>)> {
+    if !css.get(..10)?.eq_ignore_ascii_case("@font-face") {
+        return None;
+    }
+    let open_relative = css[10..].find('{')?;
+    if !css[10..10 + open_relative].trim().is_empty() {
+        return None;
+    }
+    let open = 10 + open_relative;
+    let close = open + css_block_end(&css[open..])?;
+
+    let mut urls = Vec::new();
+    if let Some(src) = css_last_declaration(&css[open + 1..close], "src") {
+        for value in css_url_values(src) {
+            if font_source_is_decodable(value) {
+                push_css_url(value, base, &mut urls);
+            }
+        }
+    }
+    Some((close + 1, urls))
+}
+
+/// Byte offset of the brace closing the block that `css` opens, or `None` when
+/// the block is unterminated. Braces inside strings do not count.
+fn css_block_end(css: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (offset, ch) in css.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(open) = quote {
+            if ch == open {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Value of the last declaration named `name` in a declaration block. Last
+/// rather than first, because that is what the cascade resolves to and what
+/// `obscura-render` reads.
+fn css_last_declaration<'a>(block: &'a str, name: &str) -> Option<&'a str> {
+    let mut found = None;
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut boundaries: Vec<usize> = Vec::new();
+    for (offset, ch) in block.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(open) = quote {
+            if ch == open {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ';' if depth == 0 => boundaries.push(offset),
+            _ => {}
+        }
+    }
+    boundaries.push(block.len());
+    for end in boundaries {
+        let declaration = &block[start..end];
+        start = (end + 1).min(block.len());
+        let Some((property, value)) = declaration.split_once(':') else {
+            continue;
+        };
+        if property.trim().eq_ignore_ascii_case(name) {
+            found = Some(value.trim());
+        }
+    }
+    found
+}
+
+/// The `url(...)` values of one declaration, unquoted, in source order.
+fn css_url_values(value: &str) -> Vec<&str> {
+    let lower = value.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(relative) = lower[cursor..].find("url(") {
+        let start = cursor + relative + 4;
+        let Some(end_relative) = value[start..].find(')') else {
+            break;
+        };
+        let end = start + end_relative;
+        let raw = value[start..end].trim();
+        let unquoted = if raw.len() >= 2
             && ((raw.starts_with('"') && raw.ends_with('"'))
                 || (raw.starts_with('\'') && raw.ends_with('\'')))
         {
@@ -594,21 +791,23 @@ fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
         } else {
             raw
         };
-        if !value.is_empty()
-            && !value.starts_with('#')
-            && !value.starts_with("data:")
-            && !value.contains("var(")
-        {
-            if let Ok(mut url) = base.join(value) {
-                url.set_fragment(None);
-                if matches!(url.scheme(), "http" | "https") {
-                    urls.push(url.to_string());
-                }
-            }
+        if !unquoted.is_empty() {
+            out.push(unquoted);
         }
-        index += end + 1;
+        cursor = end + 1;
     }
-    urls
+    out
+}
+
+/// Whether the renderer can decode a font source, by the same extension rule
+/// `obscura-render` applies before it will even consider one.
+fn font_source_is_decodable(src: &str) -> bool {
+    let path = src
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(src)
+        .to_ascii_lowercase();
+    !path.ends_with(".eot") && !path.ends_with(".svg")
 }
 
 /// Return the byte length of a leading CSS `@import` rule, including its
@@ -929,6 +1128,7 @@ impl Page {
             encoding: "UTF-8".to_string(),
             document_timeline_origin: std::time::Instant::now(),
             navigation_timeout: None,
+            navigation_chain_limit: None,
             history: Vec::new(),
             history_index: 0,
             network_events: Vec::new(),
@@ -940,6 +1140,7 @@ impl Page {
             blocked_url_patterns: Vec::new(),
             intercept_tx: None,
             preload_scripts: Vec::new(),
+            runtime_events_enabled: std::cell::Cell::new(false),
             suspended_started_script_ids: Vec::new(),
             callbacks: Arc::new(CallbackRegistry::new()),
             #[cfg(feature = "stealth")]
@@ -958,6 +1159,18 @@ impl Page {
     pub fn navigation_timeout(&self) -> std::time::Duration {
         self.navigation_timeout
             .unwrap_or_else(default_navigation_timeout)
+    }
+
+    /// Takes precedence over `OBSCURA_NAV_CHAIN_LIMIT`. A limit of 0 is
+    /// raised to 1, which would otherwise report success having loaded
+    /// nothing.
+    pub fn set_navigation_chain_limit(&mut self, limit: usize) {
+        self.navigation_chain_limit = Some(limit.max(1));
+    }
+
+    pub fn navigation_chain_limit(&self) -> usize {
+        self.navigation_chain_limit
+            .unwrap_or_else(default_navigation_chain_limit)
     }
 
     fn should_block_url(&self, url: &str) -> bool {
@@ -1092,10 +1305,12 @@ impl Page {
         for message in pending {
             let escaped_data = serde_json::to_string(&message.data_json).unwrap_or_default();
             let escaped_origin = serde_json::to_string(&message.origin).unwrap_or_default();
+            let escaped_target_origin =
+                serde_json::to_string(&message.target_origin).unwrap_or_default();
             if message.target_frame_id == 0 {
                 let Some(js) = self.js.as_mut() else { continue };
                 let script = format!(
-                    "globalThis.__obscura_deliverMessage({escaped_data}, {escaped_origin}, {});",
+                    "globalThis.__obscura_deliverMessage({escaped_data}, {escaped_origin}, {}, {escaped_target_origin});",
                     message.source_frame_id,
                 );
                 if let Err(error) = js.execute_script("<frame-message>", &script) {
@@ -1119,6 +1334,7 @@ impl Page {
                 &message.data_json,
                 &message.origin,
                 message.source_frame_id,
+                &message.target_origin,
             ) {
                 tracing::debug!("message to frame {} failed: {error}", message.target_frame_id);
             }
@@ -1564,6 +1780,7 @@ impl Page {
         // runtime does not exist yet, so the new runtime would otherwise start
         // with interception disabled and op_fetch_url would never intercept.
         rt.set_intercept_enabled(self.intercept_enabled);
+        rt.set_runtime_events_enabled(self.runtime_events_enabled.get());
 
         if let Some(dom) = self.dom.take() {
             rt.set_dom(dom);
@@ -2836,8 +3053,8 @@ impl Page {
         let mut current_method = method.to_string();
         let mut current_body = body.to_string();
         let mut document_referrer = initial_referrer.to_string();
-        const REDIRECT_LIMIT: usize = 10;
-        for chain in 0..REDIRECT_LIMIT {
+        let chain_limit = self.navigation_chain_limit();
+        for chain in 0..chain_limit {
             self.navigate_single(
                 &current_url,
                 wait_until,
@@ -2879,12 +3096,12 @@ impl Page {
                 current_url = next_url;
                 current_method = next_method;
                 current_body = next_body;
-                if chain + 1 == REDIRECT_LIMIT {
+                if chain + 1 == chain_limit {
                     // Hit the cap and the page still wants to keep
                     // chaining. Surface that as an error instead of
                     // returning Ok(()) so callers can distinguish a
-                    // successful load from a redirect storm.
-                    return Err(PageError::TooManyRedirects(REDIRECT_LIMIT));
+                    // successful load from a navigation storm.
+                    return Err(PageError::TooManyClientNavigations(chain_limit));
                 }
                 continue;
             }
@@ -4120,6 +4337,21 @@ impl Page {
         }
     }
 
+    pub fn take_pending_runtime_events(&mut self) -> Vec<obscura_js::ops::RuntimeEvent> {
+        if let Some(js) = &mut self.js {
+            js.take_pending_runtime_events()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn set_runtime_events_enabled(&self, enabled: bool) {
+        self.runtime_events_enabled.set(enabled);
+        if let Some(js) = &self.js {
+            js.set_runtime_events_enabled(enabled);
+        }
+    }
+
     pub fn set_preload_scripts(&mut self, scripts: Vec<String>) {
         self.preload_scripts = scripts;
     }
@@ -4268,9 +4500,11 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
 mod tests {
     use super::{
         css_resource_urls, linked_stylesheet_requests, materialize_linked_stylesheet_script,
-        materialize_stylesheet_graph, navigation_referrer, navigation_timeout_from_env_value,
-        parse_import_url, rebase_css_urls, script_response_is_executable, split_css_imports,
-        truncate_on_char_boundary, url_matches_cdp_pattern, LoadedStylesheet, StylesheetImport,
+        materialize_stylesheet_graph, navigation_chain_limit_from_env_value, navigation_referrer,
+        navigation_timeout_from_env_value, parse_import_url, rebase_css_urls,
+        script_response_is_executable, split_css_imports, truncate_on_char_boundary,
+        url_matches_cdp_pattern, LoadedStylesheet, StylesheetImport,
+        DEFAULT_NAVIGATION_CHAIN_LIMIT,
     };
     #[cfg(feature = "render")]
     use super::remaining_settle_resource_warmup_ms;
@@ -4298,6 +4532,25 @@ mod tests {
     }
 
     #[test]
+    fn navigation_chain_limit_environment_default_remains_ten() {
+        assert_eq!(navigation_chain_limit_from_env_value(None), 10);
+        assert_eq!(
+            navigation_chain_limit_from_env_value(Some("not-a-limit")),
+            10
+        );
+    }
+
+    #[test]
+    fn navigation_chain_limit_environment_override_remains_available() {
+        assert_eq!(navigation_chain_limit_from_env_value(Some("25")), 25);
+    }
+
+    #[test]
+    fn navigation_chain_limit_raises_a_zero_that_would_load_nothing() {
+        assert_eq!(navigation_chain_limit_from_env_value(Some("0")), 1);
+    }
+
+    #[test]
     fn css_resource_discovery_ignores_strings_comments_data_and_fragments() {
         let base = url::Url::parse("https://example.test/css/app/main.css").unwrap();
         let css = r#"
@@ -4316,6 +4569,88 @@ mod tests {
                 "https://example.test/css/img/hero.png".to_string(),
                 "https://cdn.test/icon.svg".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn font_face_warmup_takes_the_last_src_descriptor_and_skips_undecodable_sources() {
+        // The IE8 idiom: a bare `.eot` in its own descriptor, then the real
+        // list. The renderer resolves the cascade to the second descriptor and
+        // then drops `.eot` and `.svg`, so three of the six are all it will
+        // ever consider. The warmup used to fetch all six.
+        let base = url::Url::parse("https://example.test/css/app.css").unwrap();
+        let css = r#"
+            @font-face {
+              font-family: 'Probe';
+              src: url('/font/probe.eot');
+              src: url('/font/probe.eot?#iefix') format('embedded-opentype'),
+                   url('/font/probe.woff2') format('woff2'),
+                   url('/font/probe.woff') format('woff'),
+                   url('/font/probe.ttf') format('truetype'),
+                   url('/font/probe.svg#probe') format('svg');
+            }
+        "#;
+        assert_eq!(
+            css_resource_urls(css, &base),
+            vec![
+                "https://example.test/font/probe.woff2".to_string(),
+                "https://example.test/font/probe.woff".to_string(),
+                "https://example.test/font/probe.ttf".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn font_face_warmup_ignores_local_sources_and_keeps_scanning_after_the_block() {
+        // `local()` names an installed face and is not a fetch, and the block
+        // has to be reported as consumed at exactly its closing brace, or the
+        // rule after it would be skipped with it.
+        let base = url::Url::parse("https://example.test/css/app.css").unwrap();
+        let css = r#"
+            @font-face {
+              font-family: 'Probe';
+              src: local('Probe'), url('probe.woff2') format('woff2');
+            }
+            .hero { background: url('../img/hero.png'); }
+        "#;
+        assert_eq!(
+            css_resource_urls(css, &base),
+            vec![
+                "https://example.test/css/probe.woff2".to_string(),
+                "https://example.test/img/hero.png".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn font_face_warmup_skips_data_sources_and_survives_a_brace_in_a_string() {
+        let base = url::Url::parse("https://example.test/css/app.css").unwrap();
+        let css = r#"
+            @font-face {
+              font-family: 'A }';
+              src: url(data:font/woff2;base64,d09GMg==) format('woff2'),
+                   url('fallback.woff') format('woff');
+            }
+            .after { background: url('after.png'); }
+        "#;
+        assert_eq!(
+            css_resource_urls(css, &base),
+            vec![
+                "https://example.test/css/fallback.woff".to_string(),
+                "https://example.test/css/after.png".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unterminated_font_face_block_falls_back_to_the_generic_scan() {
+        // Better to warm too much than to drop the rest of the stylesheet on
+        // the floor, which is the same policy `css_import_rule_len` follows.
+        let base = url::Url::parse("https://example.test/css/app.css").unwrap();
+        let css = "@font-face { src: url('probe.woff2') format('woff2');";
+        assert_eq!(
+            css_resource_urls(css, &base),
+            vec!["https://example.test/css/probe.woff2".to_string()]
         );
     }
 
@@ -4516,6 +4851,161 @@ mod tests {
             observed,
             serde_json::json!([format!("http://{address}/final"), source])
         );
+    }
+
+    /// `/hop/N` sets `location.href = "/hop/N-1"`, `/hop/0` is the target.
+    /// An unreadable path gets a 404, so a broken fixture fails the test.
+    fn client_navigation_chain_address(name: &str, connections: usize) -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let name = name.to_string();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..connections {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buffer = [0u8; 2048];
+                let length = stream.read(&mut buffer).unwrap_or(0);
+                let hop = String::from_utf8_lossy(&buffer[..length])
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .and_then(|path| path.strip_prefix("/hop/"))
+                    .and_then(|hop| hop.parse::<usize>().ok());
+                let response = match hop {
+                    Some(0) => {
+                        let body = format!("<!doctype html><title>{name}</title>");
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len(),
+                        )
+                    }
+                    Some(hop) => {
+                        let body = format!("<script>location.href='/hop/{}'</script>", hop - 1);
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len(),
+                        )
+                    }
+                    None => {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    }
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        address
+    }
+
+    /// Without a limit set the getter reaches its fallback to the environment.
+    fn page_without_chain_limit(name: &str) -> super::Page {
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            name.to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        super::Page::new(name.to_string(), context)
+    }
+
+    /// The only place where the name of the environment variable is checked
+    /// as a string, and the variable is the only way to raise the limit at
+    /// runtime. Without this test a typo in the name would stay green.
+    #[test]
+    fn navigation_chain_limit_reads_the_environment_variable_by_name() {
+        std::env::set_var("OBSCURA_NAV_CHAIN_LIMIT", "17");
+
+        let page = page_without_chain_limit("chain-from-environment");
+
+        assert_eq!(page.navigation_chain_limit(), 17);
+    }
+
+    #[test]
+    fn a_per_page_navigation_chain_limit_wins_over_the_environment() {
+        std::env::set_var("OBSCURA_NAV_CHAIN_LIMIT", "17");
+
+        let mut page = page_without_chain_limit("chain-per-page-wins");
+        page.set_navigation_chain_limit(4);
+
+        assert_eq!(page.navigation_chain_limit(), 4);
+    }
+
+    /// The limit is always set explicitly, never inherited. Otherwise anyone
+    /// running the suite with `OBSCURA_NAV_CHAIN_LIMIT` set would see these
+    /// tests fail through no fault of the code.
+    fn chain_page(name: &str, limit: usize) -> super::Page {
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            name.to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new(name.to_string(), context);
+        page.set_navigation_chain_limit(limit);
+        page
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_chain_default_allows_nine_client_navigations() {
+        let address = client_navigation_chain_address("arrived", 10);
+        let mut page = chain_page("chain-within-default", DEFAULT_NAVIGATION_CHAIN_LIMIT);
+
+        page.navigate(&format!("http://{address}/hop/9"))
+            .await
+            .unwrap();
+
+        assert_eq!(page.url_string(), format!("http://{address}/hop/0"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_chain_beyond_the_default_reports_client_navigations() {
+        let address = client_navigation_chain_address("arrived", 10);
+        let mut page = chain_page("chain-beyond-default", DEFAULT_NAVIGATION_CHAIN_LIMIT);
+
+        let error = page
+            .navigate(&format!("http://{address}/hop/10"))
+            .await
+            .expect_err("a chain past the limit must not report success");
+
+        assert!(
+            matches!(error, super::PageError::TooManyClientNavigations(10)),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "Too many client-initiated navigations, the chain reached its limit of 10 documents"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn raised_navigation_chain_limit_reaches_a_longer_chain() {
+        let address = client_navigation_chain_address("arrived", 12);
+        let mut page = chain_page("chain-raised", 12);
+
+        page.navigate(&format!("http://{address}/hop/11"))
+            .await
+            .unwrap();
+
+        assert_eq!(page.url_string(), format!("http://{address}/hop/0"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_zero_navigation_chain_limit_still_loads_the_initial_document() {
+        let address = client_navigation_chain_address("arrived", 1);
+        let mut page = chain_page("chain-zero", 0);
+
+        page.navigate(&format!("http://{address}/hop/0"))
+            .await
+            .unwrap();
+
+        assert_eq!(page.url_string(), format!("http://{address}/hop/0"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6846,8 +7336,11 @@ pub enum PageError {
     #[error("Parse error: {0}")]
     ParseError(String),
 
-    #[error("Too many redirects (limit {0})")]
-    TooManyRedirects(usize),
+    /// A page kept triggering its own navigations until the chain's limit
+    /// was exhausted. HTTP 3xx redirects are followed one layer down, in
+    /// obscura-net, and report `ObscuraNetError::TooManyRedirects`.
+    #[error("Too many client-initiated navigations, the chain reached its limit of {0} documents")]
+    TooManyClientNavigations(usize),
 }
 
 impl From<ObscuraNetError> for PageError {

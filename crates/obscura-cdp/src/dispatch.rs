@@ -65,6 +65,9 @@ pub struct CdpContext {
     // that registered the name rather than to whichever session of the page
     // happens to come first out of a HashMap.
     pub binding_sessions: HashMap<String, Vec<String>>, // binding name -> session ids
+    /// Sessions that called Runtime.enable. Console and exception events are
+    /// page-scoped but only delivered to these subscribers.
+    pub runtime_enabled_sessions: HashSet<String>,
     // World names registered via Page.createIsolatedWorld. After every
     // navigation Obscura clears execution contexts (via
     // Runtime.executionContextsCleared) and must re-emit a
@@ -177,6 +180,7 @@ impl CdpContext {
             target_session_counter: 0,
             preload_scripts: Vec::new(),
             binding_sessions: HashMap::new(),
+            runtime_enabled_sessions: HashSet::new(),
             preload_counter: 0,
             fetch_intercept: FetchInterceptState::new(),
             intercept_tx: None,
@@ -294,21 +298,35 @@ impl CdpContext {
         self.pages.iter_mut().find(|p| p.id == id)
     }
 
+    pub(crate) fn refresh_runtime_event_collection(&self, page_id: &str) {
+        let enabled = self.runtime_enabled_sessions.iter().any(|session_id| {
+            self.sessions
+                .get(session_id)
+                .is_some_and(|owner| owner == page_id)
+        });
+        if let Some(page) = self.get_page(page_id) {
+            page.set_runtime_events_enabled(enabled);
+        }
+    }
+
     pub fn remove_page(&mut self, id: &str) {
+        let removed_sessions: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, page_id)| page_id.as_str() == id)
+            .map(|(session_id, _)| session_id.clone())
+            .collect();
         self.pages.retain(|p| p.id != id);
         self.current_loader_ids.remove(id);
         self.announced_frames.remove(id);
         #[cfg(feature = "render")]
         {
-            let removed: Vec<String> = self
-                .sessions
-                .iter()
-                .filter(|(_, page_id)| page_id.as_str() == id)
-                .map(|(session_id, _)| session_id.clone())
-                .collect();
-            for session_id in removed {
-                self.screencasts.remove(&session_id);
+            for session_id in &removed_sessions {
+                self.screencasts.remove(session_id);
             }
+        }
+        for session_id in &removed_sessions {
+            self.runtime_enabled_sessions.remove(session_id);
         }
         self.sessions.retain(|_, v| v != id);
     }
@@ -547,6 +565,7 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         }
     }
 
+    drain_runtime_events(ctx);
     drain_binding_calls(ctx);
     drain_frame_events(ctx);
 
@@ -557,6 +576,84 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
             CdpResponse::error(req.id, -32601, msg, req.session_id.clone())
         }
     }
+}
+
+pub(crate) fn drain_runtime_events(ctx: &mut CdpContext) {
+    let mut page_to_sessions: HashMap<&str, Vec<&str>> = HashMap::new();
+    for session_id in &ctx.runtime_enabled_sessions {
+        if let Some(page_id) = ctx.sessions.get(session_id) {
+            page_to_sessions
+                .entry(page_id.as_str())
+                .or_default()
+                .push(session_id.as_str());
+        }
+    }
+    for sessions in page_to_sessions.values_mut() {
+        sessions.sort_unstable();
+    }
+
+    let mut events = Vec::new();
+    for page in &mut ctx.pages {
+        let runtime_events = page.take_pending_runtime_events();
+        if runtime_events.is_empty() {
+            continue;
+        }
+        let Some(sessions) = page_to_sessions.get(page.id.as_str()) else {
+            continue;
+        };
+        let execution_context_id = if ctx
+            .current_loader_ids
+            .get(&page.id)
+            .is_some_and(|loader_id| loader_id.starts_with("loader-blank-"))
+        {
+            1
+        } else {
+            2
+        };
+        for runtime_event in runtime_events {
+            for session_id in sessions {
+                let (method, params) = match &runtime_event {
+                    obscura_js::ops::RuntimeEvent::Console(event) => (
+                        "Runtime.consoleAPICalled",
+                        json!({
+                            "type": event.kind,
+                            "args": event.args,
+                            "executionContextId": execution_context_id,
+                            "timestamp": event.timestamp,
+                        }),
+                    ),
+                    obscura_js::ops::RuntimeEvent::Exception(event) => (
+                        "Runtime.exceptionThrown",
+                        json!({
+                            "timestamp": event.timestamp,
+                            "exceptionDetails": {
+                                "exceptionId": event.exception_id,
+                                "text": "Uncaught",
+                                "lineNumber": event.line_number,
+                                "columnNumber": event.column_number,
+                                "scriptId": "",
+                                "url": event.url,
+                                "stackTrace": { "callFrames": event.stack_trace },
+                                "executionContextId": execution_context_id,
+                                "exception": {
+                                    "type": "object",
+                                    "subtype": "error",
+                                    "className": event.name,
+                                    "description": event.description,
+                                },
+                            },
+                        }),
+                    ),
+                };
+                events.push(CdpEvent {
+                    method: method.to_string(),
+                    params,
+                    session_id: Some((*session_id).to_string()),
+                });
+            }
+        }
+    }
+    ctx.pending_events.extend(events);
 }
 
 // Drain every page's binding-call queue (filled by op_binding_called when

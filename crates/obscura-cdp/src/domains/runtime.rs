@@ -74,18 +74,25 @@ pub async fn handle(
             // silently — the next Target.attachToTarget will set things up.
             match ctx.get_session_page(session_id) {
                 Some(page) => {
+                    let origin = page.url_string();
+                    let page_id = page.id.clone();
+                    let frame_id = page.frame_id.clone();
+                    if let Some(session_id) = session_id {
+                        ctx.runtime_enabled_sessions.insert(session_id.clone());
+                    }
+                    ctx.refresh_runtime_event_collection(&page_id);
                     let event = crate::types::CdpEvent {
                         method: "Runtime.executionContextCreated".to_string(),
                         params: json!({
                             "context": {
                                 "id": 1,
-                                "origin": page.url_string(),
+                                "origin": origin,
                                 "name": "",
-                                "uniqueId": format!("ctx-{}", page.id),
+                                "uniqueId": format!("ctx-{}", page_id),
                                 "auxData": {
                                     "isDefault": true,
                                     "type": "default",
-                                    "frameId": page.frame_id,
+                                    "frameId": frame_id,
                                 }
                             }
                         }),
@@ -95,6 +102,16 @@ pub async fn handle(
                 }
                 None => {
                     // No session attached yet — that's fine. Just ack.
+                }
+            }
+            Ok(json!({}))
+        }
+        "disable" => {
+            if let Some(session_id) = session_id {
+                let page_id = ctx.sessions.get(session_id).cloned();
+                ctx.runtime_enabled_sessions.remove(session_id);
+                if let Some(page_id) = page_id {
+                    ctx.refresh_runtime_event_collection(&page_id);
                 }
             }
             Ok(json!({}))

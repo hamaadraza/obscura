@@ -483,7 +483,7 @@ async function __fetchDynClassicScript(task) {
     body = _decodeDataScriptUrl(task.url);
   } else {
     const raw = await Deno.core.ops.op_fetch_url(
-      task.url, "GET", "{}", "", task.pageOrigin, "no-cors", "same-origin"
+      task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, "no-cors", "same-origin"
     );
     const parsed = JSON.parse(raw);
     // The HTML script-fetch algorithm treats an unsuccessful HTTP response
@@ -709,7 +709,7 @@ async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
   if (depth > 4 || seen.has(url)) return "";
   seen.add(url);
   const raw = await Deno.core.ops.op_fetch_url(
-    url, "GET", "{}", "", pageOrigin, "no-cors", "same-origin"
+    url, "GET", "{}", new Uint8Array(0), pageOrigin, "no-cors", "same-origin"
   );
   const parsed = JSON.parse(raw);
   if (parsed.blocked || parsed.status >= 400 || parsed.status === 0) {
@@ -856,9 +856,11 @@ function _fp(key) { return _getFp()[key]; }
 globalThis._eventRegistry = globalThis._eventRegistry || {};
 globalThis._formValues = globalThis._formValues || {};
 globalThis._formChecked = globalThis._formChecked || {};
+globalThis._formIndeterminate = globalThis._formIndeterminate || {};
 const _eventRegistry = globalThis._eventRegistry;
 const _formValues = globalThis._formValues;
 const _formChecked = globalThis._formChecked;
+const _formIndeterminate = globalThis._formIndeterminate;
 const _domParse = (cmd, a1, a2) => { try { return JSON.parse(_dom(cmd, a1, a2)); } catch { return null; } };
 
 // HTML "ASCII whitespace": U+0009 TAB, U+000A LF, U+000C FF, U+000D CR, U+0020 SPACE.
@@ -895,31 +897,90 @@ function _getElementsByClassName(root, classNames) {
   }
   return HTMLCollection._from(matched);
 }
+let _consoleOid = 0;
+const _consoleObjectId = (value) => {
+  const objectId = "console-" + (globalThis.__obscura_frameId >>> 0) + "-" + (++_consoleOid);
+  const store = globalThis.__obscura_objects || (globalThis.__obscura_objects = {});
+  store[objectId] = value;
+  return objectId;
+};
+const _consoleRemoteObject = (value) => {
+  const type = typeof value;
+  if (value === null) return { type: "object", subtype: "null", value: null, description: "null" };
+  if (type === "undefined") return { type: "undefined" };
+  if (type === "string" || type === "boolean") return { type, value, description: String(value) };
+  if (type === "number") {
+    if (Number.isNaN(value)) return { type, unserializableValue: "NaN", description: "NaN" };
+    if (value === Infinity) return { type, unserializableValue: "Infinity", description: "Infinity" };
+    if (value === -Infinity) return { type, unserializableValue: "-Infinity", description: "-Infinity" };
+    if (Object.is(value, -0)) return { type, unserializableValue: "-0", description: "-0" };
+    return { type, value, description: String(value) };
+  }
+  if (type === "bigint") {
+    const description = String(value) + "n";
+    return { type, unserializableValue: description, description };
+  }
+  if (type === "symbol") return { type, description: String(value) };
+  if (value instanceof Error) {
+    const _pst = Error.prepareStackTrace;
+    if (_pst !== undefined) Error.prepareStackTrace = undefined;
+    const description = value.stack || value.message || String(value);
+    if (_pst !== undefined) Error.prepareStackTrace = _pst;
+    return {
+      type: "object", subtype: "error",
+      className: (value.constructor && value.constructor.name) || "Error",
+      description, objectId: _consoleObjectId(value)
+    };
+  }
+  const className = type === "function"
+    ? "Function"
+    : ((value.constructor && value.constructor.name) || "Object");
+  const remote = { type, className, description: type === "function" ? String(value) : className };
+  if (Array.isArray(value)) {
+    remote.subtype = "array";
+    remote.description = "Array(" + value.length + ")";
+  } else if (type === "object" && typeof value._nid === "number") {
+    remote.subtype = "node";
+    remote.description = value.tagName ? value.tagName.toLowerCase() : (value.nodeName || "node");
+  }
+  remote.objectId = _consoleObjectId(value);
+  return remote;
+};
 const _consoleFn = (level, args) => {
-  try { Deno.core.ops.op_console_msg(level, args.map(a => {
-    if (a === null) return "null";
-    if (a === undefined) return "undefined";
-    if (a instanceof Error) {
-      const _pst = Error.prepareStackTrace;
-      if (_pst !== undefined) Error.prepareStackTrace = undefined;
-      const _s = a.stack || a.message || String(a);
-      if (_pst !== undefined) Error.prepareStackTrace = _pst;
-      return _s;
-    }
-    if (typeof a === "object") {
-      try {
-        const s = JSON.stringify(a);
-        return s === "{}" && a.message ? a.message : s;
-      } catch { return String(a); }
-    }
-    return String(a);
-  }).join(" ")); } catch {}
+  try {
+    const text = args.map(a => {
+      if (a === null) return "null";
+      if (a === undefined) return "undefined";
+      if (a instanceof Error) {
+        const _pst = Error.prepareStackTrace;
+        if (_pst !== undefined) Error.prepareStackTrace = undefined;
+        const _s = a.stack || a.message || String(a);
+        if (_pst !== undefined) Error.prepareStackTrace = _pst;
+        return _s;
+      }
+      if (typeof a === "object") {
+        try {
+          const s = JSON.stringify(a);
+          return s === "{}" && a.message ? a.message : s;
+        } catch { return String(a); }
+      }
+      return String(a);
+    }).join(" ");
+    const eventArgs = Deno.core.ops.op_runtime_events_enabled()
+      ? JSON.stringify(args.map(a => {
+          try { return _consoleRemoteObject(a); }
+          catch { return { type: typeof a, description: "<unavailable>" }; }
+        }))
+      : "";
+    Deno.core.ops.op_console_msg(level, text, eventArgs);
+  } catch {}
 };
 
 globalThis.console = {
-  log: (...a) => _consoleFn("log", a), warn: (...a) => _consoleFn("warn", a),
-  error: (...a) => _consoleFn("error", a), info: (...a) => _consoleFn("log", a),
-  debug: () => {}, dir: () => {}, trace: () => {}, table: () => {}, group: () => {},
+  log: (...a) => _consoleFn("log", a), warn: (...a) => _consoleFn("warning", a),
+  error: (...a) => _consoleFn("error", a), info: (...a) => _consoleFn("info", a),
+  debug: (...a) => _consoleFn("debug", a), dir: (...a) => _consoleFn("dir", a),
+  trace: (...a) => _consoleFn("trace", a), table: (...a) => _consoleFn("table", a), group: () => {},
   groupEnd: () => {}, groupCollapsed: () => {}, time: () => {}, timeEnd: () => {},
   timeLog: () => {}, count: () => {}, countReset: () => {}, clear: () => {},
   assert: (c, ...a) => { if (!c) _consoleFn("error", ["Assertion failed:", ...a]); },
@@ -2086,20 +2147,7 @@ class Node {
   get ownerDocument() { return globalThis.document; }
   // https://dom.spec.whatwg.org/#dom-node-baseuri
   get baseURI() {
-    try {
-      const doc = globalThis.document;
-      const docUrl = (doc && doc.URL) || "";
-      const baseEl = (doc && doc.querySelector) ? doc.querySelector("base[href]") : null;
-      if (baseEl) {
-        const href = baseEl.getAttribute("href");
-        if (href) {
-          return docUrl ? new URL(href, docUrl).href : href;
-        }
-      }
-      return docUrl;
-    } catch (e) {
-      return "";
-    }
+    try { return _documentBase(); } catch (e) { return ""; }
   }
   get textContent() { return _domParse("text_content", this._nid) ?? ""; }
   set textContent(v) {
@@ -2658,10 +2706,25 @@ function _applyDocQueryEncoding(u) {
   return u;
 }
 
+// The base for relative URLs. <base href> overrides the document URL, so an app in a sub-path
+// requests "chunk-A.js" under its current route and gets 404.
+// https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url
+// Returns "" when there is no document, so each call site keeps its own fallback.
+function _documentBase() {
+  // history.pushState moves the document URL without reaching the Rust side. Then the base must
+  // be built here, or every relative URL resolves against the pre-routing address.
+  const virtual = globalThis.__virtualUrl;
+  if (virtual) {
+    const raw = _domParse("document_base_href");
+    if (!raw) return virtual;
+    try { return new URL(raw, virtual).href; } catch (e) { return virtual; }
+  }
+  return _domParse("document_base_url") || _domParse("document_url") || "";
+}
 // HTMLHyperlinkElementUtils helpers (the <a>/<area> URL-decomposition members).
 // The element's href attribute is parsed against the document base URL via the
 // WHATWG url op; component getters read it, setters rewrite the href attribute.
-function _anchorBase() { return _domParse("document_url") || "about:blank"; }
+function _anchorBase() { return _documentBase() || "about:blank"; }
 function _elemHrefURL(el) {
   const raw = el.getAttribute('href');
   if (raw === null || raw === undefined) return null;
@@ -3725,9 +3788,10 @@ class Element extends Node {
     if (_isActuallyDisabled(this) && _tag !== 'LABEL') {
       return;
     }
-    let _oldChecked = false, _radioStates = null;
+    let _oldChecked = false, _oldIndeterminate = false, _radioStates = null;
     if (_checkable) {
       _oldChecked = !!this.checked;
+      _oldIndeterminate = !!this.indeterminate;
       if (_type === 'radio') {
         const _name = this.getAttribute('name') || '';
         if (_name) {
@@ -3743,7 +3807,12 @@ class Element extends Node {
         }
         this.checked = true;
       } else {
+        // Legacy-pre-activation behaviour (HTML spec): a checkbox toggles its
+        // checkedness *and* drops indeterminateness. Clearing it here, not on
+        // `change`, is what lets the cancelled-activation path put the old
+        // flag back instead of leaving it stuck off.
         this.checked = !_oldChecked;
+        this.indeterminate = false;
       }
     }
     const _clickEvent = new MouseEvent("click", {bubbles: true, cancelable: true});
@@ -3751,7 +3820,7 @@ class Element extends Node {
     const cancelled = !this.dispatchEvent(_clickEvent);
     if (cancelled) {
       if (_radioStates) { for (let i = 0; i < _radioStates.length; i++) _radioStates[i][0].checked = _radioStates[i][1]; }
-      else if (_checkable) this.checked = _oldChecked;
+      else if (_checkable) { this.checked = _oldChecked; this.indeterminate = _oldIndeterminate; }
       return;
     }
     if (_checkable && this.checked !== _oldChecked) {
@@ -4098,6 +4167,13 @@ class Element extends Node {
     return this.hasAttribute("checked");
   }
   set checked(v) { _formChecked[this._nid] = !!v; }
+  // `indeterminate` is IDL-only: it has no content attribute to reflect, so
+  // the property itself must exist on the prototype for `'indeterminate' in
+  // el` to be true on a freshly created element. It is node-keyed like
+  // `checked` because element wrappers are rebuilt on each lookup, so a
+  // per-instance field would not survive getElementById returning a new one.
+  get indeterminate() { return _formIndeterminate[this._nid] === true; }
+  set indeterminate(v) { _formIndeterminate[this._nid] = !!v; }
   get selected() {
     if (this._selected !== undefined) return this._selected;
     return this.hasAttribute("selected");
@@ -4172,6 +4248,15 @@ class Element extends Node {
       const r = _urlResolveOp(raw, _anchorBase());
       return r !== null ? r : raw;
     }
+    if (ln === 'base') {
+      // https://html.spec.whatwg.org/multipage/semantics.html#dom-base-href
+      // Against the fallback base URL, not the document base URL: a base element is not affected
+      // by other base elements or itself. Applications read this to determine their own base.
+      const raw = this.getAttribute('href');
+      if (raw === null) return '';
+      const r = _urlResolveOp(raw, _domParse("document_url") || "about:blank");
+      return r !== null ? r : raw;
+    }
     return this.getAttribute("href") || "";
   }
   set href(v) { this.setAttribute("href", v); }
@@ -4219,7 +4304,7 @@ class Element extends Node {
     // value (issue #255). getAttribute("src") still returns the literal.
     const v = this.getAttribute("src");
     if (!v) return "";
-    try { return new URL(v, globalThis.location?.href || "about:blank").href; }
+    try { return new URL(v, _documentBase() || "about:blank").href; }
     catch (e) { return v; }
   }
   set src(v) {
@@ -4396,8 +4481,9 @@ class Element extends Node {
     return this._iframeWin;
   }
   get action() {
+    // A missing action falls back to the document URL, a present one resolves against the base.
     const action = this.getAttribute("action") || _domParse("document_url") || "";
-    try { return new URL(action, _domParse("document_url") || "about:blank").href; } catch(e) { return action; }
+    try { return new URL(action, _documentBase() || "about:blank").href; } catch(e) { return action; }
   }
   set action(v) { this.setAttribute("action", v); }
   get method() { return this.getAttribute("method") || "get"; }
@@ -6544,7 +6630,7 @@ function _resolveUrl(url) {
   url = String(url);
   if (!url) return url;
   if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('about:')) return url;
-  try { return new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) { return url; }
+  try { return new URL(url, _documentBase() || "about:blank").href; } catch(e) { return url; }
 }
 // `__virtualUrl` is set by `history.pushState`/`replaceState` (and cleared by
 // any real navigation). When set, `location.href` and friends read it instead
@@ -7328,77 +7414,92 @@ function _formDataToMultipart(fd) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   let bnd = '----WebKitFormBoundary';
   for (let i = 0; i < 16; i++) bnd += chars[Math.floor(Math.random() * chars.length)];
-  let out = '';
+  const encoder = new TextEncoder();
+  const chunks = [];
+  let length = 0;
+  const append = (chunk) => {
+    const bytes = typeof chunk === 'string' ? encoder.encode(chunk) : _bodyToUint8Array(chunk);
+    chunks.push(bytes);
+    length += bytes.byteLength;
+  };
   const entries = fd._d || [];
   for (let i = 0; i < entries.length; i++) {
     const k = entries[i][0], v = entries[i][1];
-    out += '--' + bnd + '\r\n';
+    append('--' + bnd + '\r\n');
     if (v != null && typeof v === 'object' && v._bytes != null) {
-      out += 'Content-Disposition: form-data; name="' + k + '"; filename="' + (v.name || 'blob') + '"\r\n';
-      out += 'Content-Type: ' + (v.type || 'application/octet-stream') + '\r\n\r\n';
-      try { out += new TextDecoder().decode(v._bytes); } catch (e) {}
-      out += '\r\n';
+      append('Content-Disposition: form-data; name="' + k + '"; filename="' + (v.name || 'blob') + '"\r\n');
+      append('Content-Type: ' + (v.type || 'application/octet-stream') + '\r\n\r\n');
+      append(v._bytes);
+      append('\r\n');
     } else {
-      out += 'Content-Disposition: form-data; name="' + k + '"\r\n\r\n' + String(v) + '\r\n';
+      append('Content-Disposition: form-data; name="' + k + '"\r\n\r\n' + String(v) + '\r\n');
     }
   }
-  out += '--' + bnd + '--\r\n';
+  append('--' + bnd + '--\r\n');
+  const out = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
   return { boundary: bnd, body: out };
 }
 
-// Coerce a fetch()/XHR body into the string op_fetch_url expects, attaching a
+// Coerce a fetch()/XHR body into the bytes op_fetch_url expects, attaching a
 // Content-Type header for body types that need one (FormData, URLSearchParams).
-function _serializeBody(initBody, headers) {
-  if (initBody == null || initBody === '') return '';
+function _serializeBody(initBody, headers, synthesizeContentType = true) {
+  if (initBody == null || initBody === '') return new Uint8Array(0);
   if (initBody instanceof FormData) {
     const mp = _formDataToMultipart(initBody);
-    headers['Content-Type'] = 'multipart/form-data; boundary=' + mp.boundary;
+    if (synthesizeContentType) headers['Content-Type'] = 'multipart/form-data; boundary=' + mp.boundary;
     return mp.body;
   }
   if (initBody instanceof URLSearchParams) {
-    if (!Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
+    if (synthesizeContentType && !Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
       headers['Content-Type'] = 'application/x-www-form-urlencoded;charset=UTF-8';
     }
-    return initBody.toString();
+    return new TextEncoder().encode(initBody.toString());
   }
   if (typeof Blob !== 'undefined' && initBody instanceof Blob) {
-    if (initBody.type && !Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
+    if (synthesizeContentType && initBody.type && !Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
       headers['Content-Type'] = initBody.type;
     }
-    return _bytesToBinaryString(_bodyToUint8Array(initBody));
+    return _bodyToUint8Array(initBody);
   }
   if (typeof ArrayBuffer !== 'undefined' && initBody instanceof ArrayBuffer) {
-    const bytes = new Uint8Array(initBody);
-    let s = ''; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-    return s;
+    return new Uint8Array(initBody);
   }
   if (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(initBody) && initBody.buffer instanceof ArrayBuffer) {
-    const bytes = new Uint8Array(initBody.buffer, initBody.byteOffset, initBody.byteLength);
-    let s = ''; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-    return s;
+    return new Uint8Array(initBody.buffer, initBody.byteOffset, initBody.byteLength);
   }
-  return typeof initBody === 'string' ? initBody : String(initBody);
+  return new TextEncoder().encode(typeof initBody === 'string' ? initBody : String(initBody));
 }
 
 globalThis.fetch = async (input, init = {}) => {
   init = init || {};
+  const request = input instanceof Request ? input : null;
   let url = typeof input === "string"
     ? input
-    : (input instanceof Request
-      ? input.url
+    : (request
+      ? request.url
       : ((typeof URL === 'function' && input instanceof URL) ? input.href : (input?.url || input?.href || String(input || ""))));
   // Always resolve: the URL parser, not a "://" substring search, decides
   // whether the input is absolute. _resolveUrl leaves absolute URLs
   // unchanged and keeps unparseable input as-is.
   url = _resolveUrl(url);
-  const method = init.method || (input instanceof Request ? input.method : "GET");
-  let _h = init.headers instanceof Headers ? Object.fromEntries(init.headers.entries()) : (init.headers || {});
-  const body = _serializeBody(init.body, _h);
+  const method = init.method || (request ? request.method : "GET");
+  const headers = init.headers !== undefined ? init.headers : (request ? request.headers : undefined);
+  let _h = headers instanceof Headers ? Object.fromEntries(headers.entries()) : (headers || {});
+  const inheritsRequestBody = init.body === undefined && request !== null;
+  const initBody = init.body !== undefined
+    ? init.body
+    : (request ? request.body : undefined);
+  const body = _serializeBody(initBody, _h, !(inheritsRequestBody && init.headers !== undefined));
   const hdrs = JSON.stringify(_h);
-  const fetchMode = init.mode || (input instanceof Request ? input.mode : "cors");
+  const fetchMode = init.mode || (request ? request.mode : "cors");
   const fetchCredentials = init.credentials !== undefined
     ? String(init.credentials)
-    : (input instanceof Request ? input.credentials : "same-origin");
+    : (request ? request.credentials : "same-origin");
   if (fetchCredentials !== "omit" && fetchCredentials !== "same-origin" && fetchCredentials !== "include") {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
@@ -12799,7 +12900,23 @@ function _realmOrigin() {
   try { return new URL(_domParse('document_url')).origin; } catch (_) { return 'null'; }
 }
 
-function _sendRealmMessage(targetFrameId, data) {
+// Whether a postMessage restricted to `targetOrigin` may be delivered to a
+// realm whose current origin is `receiverOrigin`, given the sender's origin.
+// Mirrors the browser check done at delivery time: '*' (or an unspecified '')
+// allows any origin; '/' requires the receiver to be same-origin as the sender;
+// anything else must equal the receiver's own origin.
+function _targetOriginAllows(targetOrigin, receiverOrigin, senderOrigin) {
+  if (!targetOrigin || targetOrigin === '*') return true;
+  let expected;
+  if (targetOrigin === '/') {
+    expected = senderOrigin;
+  } else {
+    try { expected = new URL(targetOrigin).origin; } catch (_) { expected = targetOrigin; }
+  }
+  return receiverOrigin === expected;
+}
+
+function _sendRealmMessage(targetFrameId, data, targetOrigin) {
   let json;
   // Structured clone cannot cross realms here. JSON carries what postMessage is
   // actually used for; anything else throws the same DataCloneError a browser
@@ -12810,8 +12927,11 @@ function _sendRealmMessage(targetFrameId, data) {
     throw new DOMException('The object could not be cloned.', 'DataCloneError');
   }
   if (json === undefined) json = '{"v":null}';
+  // An unspecified targetOrigin stays permissive (empty string); the receiver
+  // enforces a specified one against its own origin in __obscura_deliverMessage.
+  const to = (targetOrigin === undefined || targetOrigin === null) ? '' : String(targetOrigin);
   Deno.core.ops.op_post_frame_message(
-    targetFrameId >>> 0, globalThis.__obscura_frameId >>> 0, _realmOrigin(), json);
+    targetFrameId >>> 0, globalThis.__obscura_frameId >>> 0, _realmOrigin(), to, json);
 }
 
 // The frame's own window and document, when this page is allowed to touch
@@ -12878,8 +12998,8 @@ function _frameWindowFor(frameId) {
   if (!real) return existing || null;
   if (existing && existing.__obscura_wrapsRealm) return existing;
 
-  const post = _markNative(function (data, _targetOrigin, _transfer) {
-    _sendRealmMessage(frameId, data);
+  const post = _markNative(function (data, targetOrigin, _transfer) {
+    _sendRealmMessage(frameId, data, targetOrigin);
   });
   const win = new Proxy(real, {
     get(target, prop) {
@@ -12898,7 +13018,11 @@ function _frameWindowFor(frameId) {
 }
 
 // The host calls this inside the target realm.
-globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId) {
+globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId, targetOrigin) {
+  // Enforce postMessage's targetOrigin against THIS (the receiving) realm's
+  // origin, the same check a real browser does at delivery time. A mismatch
+  // drops the message silently.
+  if (!_targetOriginAllows(targetOrigin, _realmOrigin(), origin)) return;
   let data = null;
   try { data = JSON.parse(dataJson).v; } catch (_) {}
   // Who to reply to: the frame above, or one of the frames below.
@@ -12928,7 +13052,7 @@ class _RemoteWindow {
   constructor(frameId) {
     Object.defineProperty(this, '_frameId', { value: frameId, enumerable: false });
   }
-  postMessage(data, _targetOrigin, _transfer) { _sendRealmMessage(this._frameId, data); }
+  postMessage(data, targetOrigin, _transfer) { _sendRealmMessage(this._frameId, data, targetOrigin); }
   get self() { return this; }
   get window() { return this; }
   get frames() { return this; }
@@ -13017,13 +13141,13 @@ class _IframeWindow {
     return proxy;
   }
 
-  postMessage(data, _targetOrigin, _transfer) {
+  postMessage(data, targetOrigin, _transfer) {
     // Into the frame's own realm, through the host. This used to dispatch the
     // event on the *parent's* window, so a page could never actually talk to
     // the document inside its iframe. A frame that has not loaded yet has no
     // browsing context to receive anything.
     if (!this._frameId) return;
-    _sendRealmMessage(this._frameId, data);
+    _sendRealmMessage(this._frameId, data, targetOrigin);
   }
 
   setTimeout(fn, ms) { return globalThis.setTimeout(fn, ms); }
@@ -14464,7 +14588,7 @@ globalThis.stop = function() {}; _markNative(globalThis.stop);
 // that posted to itself and waited for the `message` event waited forever.
 // Same realm, so this needs no host round trip; it is queued as a task because
 // postMessage never delivers synchronously.
-globalThis.postMessage = function(data, _targetOrigin, _transfer) {
+globalThis.postMessage = function(data, targetOrigin, _transfer) {
   let clone = data;
   // Match the cross-realm path: a value postMessage cannot carry is rejected
   // at the call, not delivered as something else.
@@ -14474,6 +14598,9 @@ globalThis.postMessage = function(data, _targetOrigin, _transfer) {
     throw new DOMException('The object could not be cloned.', 'DataCloneError');
   }
   const origin = _realmOrigin();
+  // A self-post honours targetOrigin too: sender and receiver are this realm,
+  // so a targetOrigin naming a different origin drops the message.
+  if (!_targetOriginAllows(targetOrigin, origin, origin)) return;
   setTimeout(() => {
     try {
       globalThis.dispatchEvent(globalThis.__obscura_markTrusted(

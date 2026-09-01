@@ -19,6 +19,63 @@ fn child_frame_id(page_frame_id: &str, frame_id: u32) -> String {
     format!("{page_frame_id}-frame-{frame_id}")
 }
 
+fn is_localhost(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(host)) => {
+            host.eq_ignore_ascii_case("localhost")
+                || host.to_ascii_lowercase().ends_with(".localhost")
+        }
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
+}
+
+fn secure_context_type(url: &url::Url) -> &'static str {
+    match url.scheme() {
+        "https" | "wss" | "file" | "about" => "Secure",
+        "http" | "ws" if is_localhost(url) => "SecureLocalhost",
+        _ => "InsecureScheme",
+    }
+}
+
+/// Build the required `Page.Frame` fields in one place. Generated CDP clients
+/// deserialize this object before their frame managers see it, so every path
+/// that returns or emits a frame must use the same protocol-complete shape.
+pub(crate) fn frame_value(
+    id: &str,
+    parent_id: Option<&str>,
+    loader_id: &str,
+    url: &str,
+    mime_type: &str,
+) -> Value {
+    let parsed_url = url::Url::parse(url).ok();
+    let security_origin = parsed_url
+        .as_ref()
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|| "null".to_string());
+    let secure_context = parsed_url
+        .as_ref()
+        .map(secure_context_type)
+        .unwrap_or("InsecureScheme");
+    let mut frame = json!({
+        "id": id,
+        "loaderId": loader_id,
+        "url": url,
+        "domainAndRegistry": "",
+        "securityOrigin": security_origin,
+        "mimeType": mime_type,
+        "adFrameStatus": { "adFrameType": "none" },
+        "secureContextType": secure_context,
+        "crossOriginIsolatedContextType": "NotIsolated",
+        "gatedAPIFeatures": [],
+    });
+    if let Some(parent_id) = parent_id {
+        frame["parentId"] = json!(parent_id);
+    }
+    frame
+}
+
 fn child_frame_value(page_frame_id: &str, frame: &obscura_js::frame::FrameRealm) -> Value {
     let id = child_frame_id(page_frame_id, frame.frame_id());
     let parent_id = if frame.parent_frame_id() == 0 {
@@ -26,16 +83,13 @@ fn child_frame_value(page_frame_id: &str, frame: &obscura_js::frame::FrameRealm)
     } else {
         child_frame_id(page_frame_id, frame.parent_frame_id())
     };
-    json!({
-        "id": id,
-        "parentId": parent_id,
-        "loaderId": format!("{id}-loader"),
-        "url": frame.url(),
-        "domainAndRegistry": "",
-        "securityOrigin": frame.origin(),
-        "mimeType": "text/html",
-        "adFrameStatus": { "adFrameType": "none" },
-    })
+    frame_value(
+        &id,
+        Some(&parent_id),
+        &format!("{id}-loader"),
+        frame.url(),
+        "text/html",
+    )
 }
 
 /// The page's child frames, flattened with each parent ahead of its children
@@ -59,7 +113,7 @@ pub fn child_frame_values(page: &obscura_browser::Page) -> Vec<Value> {
 
 /// The page's live frame hierarchy. `childFrames` used to be hardcoded empty,
 /// so a client was told the page had no frames however many it had built.
-fn frame_tree(page: &obscura_browser::Page) -> Value {
+fn frame_tree(page: &obscura_browser::Page, loader_id: &str) -> Value {
     fn children(page: &obscura_browser::Page, parent_frame_id: u32) -> Vec<Value> {
         page.frames
             .iter()
@@ -74,15 +128,13 @@ fn frame_tree(page: &obscura_browser::Page) -> Value {
     }
 
     json!({
-        "frame": {
-            "id": page.frame_id,
-            "loaderId": "initial-loader",
-            "url": page.url_string(),
-            "domainAndRegistry": "",
-            "securityOrigin": page.url_string(),
-            "mimeType": "text/html",
-            "adFrameStatus": { "adFrameType": "none" },
-        },
+        "frame": frame_value(
+            &page.frame_id,
+            None,
+            loader_id,
+            &page.url_string(),
+            "text/html",
+        ),
         "childFrames": children(page, 0),
     })
 }
@@ -874,7 +926,7 @@ pub fn emit_navigation_events(
         },
         CdpEvent {
             method: "Page.frameNavigated".into(),
-            params: json!({"frame": {"id": frame_id, "loaderId": loader_id, "url": page_url, "domainAndRegistry": "", "securityOrigin": page_url, "mimeType": nav_mime, "adFrameStatus": {"adFrameType": "none"}}, "type": "Navigation"}),
+            params: json!({"frame": frame_value(frame_id, None, loader_id, page_url, &nav_mime), "type": "Navigation"}),
             session_id: es.clone(),
         },
         CdpEvent {
@@ -1229,7 +1281,12 @@ pub async fn handle(
             let page = ctx
                 .get_session_page(session_id)
                 .ok_or("No page for session")?;
-            Ok(json!({ "frameTree": frame_tree(page) }))
+            let loader_id = ctx
+                .current_loader_ids
+                .get(&page.id)
+                .cloned()
+                .unwrap_or_else(|| format!("loader-blank-{}", page.id));
+            Ok(json!({ "frameTree": frame_tree(page, &loader_id) }))
         }
         "createIsolatedWorld" => {
             let (frame_id_param, world_name, page_url, page_id) = {
