@@ -1,0 +1,15 @@
+# Test runner limits.
+#
+# Without a timeout a single stuck test hangs the whole run for as long as the
+# machine is left alone: nextest waits on it forever, with no output to say
+# which test it is. That happened with a network-dependent test and cost hours,
+# so a hang is now bounded and reported as a failure naming the test.
+#
+# The whole suite finishes in well under a minute, and the slowest individual
+# tests are a few seconds, so a test still running after 60s is not slow, it is
+# stuck. The warning comes first and the kill only after four of those periods,
+# which leaves room for a genuinely slow network fixture on a bad connection
+# rather than failing it.
+
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 4 }
