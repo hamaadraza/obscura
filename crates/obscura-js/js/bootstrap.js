@@ -6763,9 +6763,39 @@ try {
 } catch (_e) { globalThis.Navigator = Navigator; }
 
 // PluginArray must exist before navigator is built so the plugins getter can use it.
+// PluginArray and MimeTypeArray are named-property interfaces: alongside the
+// numeric entries, each item is reachable by its own name, and `length` lives
+// on the interface rather than the instance. Scripts take the own property
+// names of these collections as the set of plugins and types the browser
+// actually has, so an instance carrying only indices reports a browser whose
+// plugins serve nothing.
+var _namedCollectionState = new WeakMap();
+function _initNamedCollection(collection, items, nameOf) {
+  _namedCollectionState.set(collection, { length: items.length });
+  for (var _i = 0; _i < items.length; _i++) {
+    collection[_i] = items[_i];
+    var name = items[_i] && nameOf(items[_i]);
+    if (name && !Object.prototype.hasOwnProperty.call(collection, name)) {
+      Object.defineProperty(collection, name, {
+        value: items[_i], writable: false, enumerable: true, configurable: true,
+      });
+    }
+  }
+}
+function _defineCollectionLength(ctor) {
+  var getter = { ['get length']() {
+    var state = _namedCollectionState.get(this);
+    if (!state) throw new TypeError('Illegal invocation');
+    return state.length;
+  } }['get length'];
+  _markNativeAs(getter, 'function get length() { [native code] }');
+  Object.defineProperty(ctor.prototype, 'length', {
+    get: getter, enumerable: true, configurable: true,
+  });
+}
+
 function PluginArray(items) {
-  for (var _pi = 0; _pi < items.length; _pi++) this[_pi] = items[_pi];
-  this.length = items.length;
+  _initNamedCollection(this, items, function (plugin) { return plugin.name; });
 }
 PluginArray.prototype = Object.create(Array.prototype);
 PluginArray.prototype.constructor = PluginArray;
@@ -6793,14 +6823,42 @@ try {
 // window constructors (issue #305). Bootstrap runs inside an IIFE, so a bare
 // function declaration is not a global; assign them onto globalThis the same
 // way NetworkInformation is installed.
+// A plugin's own enumerable properties are its mime types and nothing else:
+// name, filename, description and length are accessors on the interface. That
+// is not cosmetic -- `Object.values(plugin)` is how a script collects the mime
+// types, so carrying the descriptive fields as own values puts strings where
+// mime types are expected and the collection reads as tampered with.
+var _pluginState = new WeakMap();
 function Plugin(name, filename, description, mimeTypes) {
-  this.name = name;
-  this.filename = filename;
-  this.description = description;
   var mt = mimeTypes || [];
+  _pluginState.set(this, {
+    name: name, filename: filename, description: description, length: mt.length,
+  });
   for (var _i = 0; _i < mt.length; _i++) this[_i] = mt[_i];
-  this.length = mt.length;
 }
+// Adds the mime types after construction, which is what lets a mime type name
+// the plugin it belongs to: the two refer to each other.
+function _attachPluginMimeTypes(plugin, mimeTypes) {
+  var state = _pluginState.get(plugin);
+  for (var _i = 0; _i < mimeTypes.length; _i++) plugin[_i] = mimeTypes[_i];
+  if (state) state.length = mimeTypes.length;
+}
+(function () {
+  var read = function (key) {
+    return function () {
+      var state = _pluginState.get(this);
+      if (!state) throw new TypeError('Illegal invocation');
+      return state[key];
+    };
+  };
+  ['name', 'filename', 'description', 'length'].forEach(function (key) {
+    var getter = { ['get ' + key]: read(key) }['get ' + key];
+    _markNativeAs(getter, 'function get ' + key + '() { [native code] }');
+    Object.defineProperty(Plugin.prototype, key, {
+      get: getter, enumerable: true, configurable: true,
+    });
+  });
+})();
 Plugin.prototype.item = function(i) { return this[i] || null; };
 Plugin.prototype.namedItem = function(name) {
   for (var _i = 0; _i < this.length; _i++) if (this[_i] && this[_i].type === name) return this[_i];
@@ -6817,12 +6875,33 @@ try {
   });
 } catch (_e) { globalThis.Plugin = Plugin; }
 
+var _mimeTypeState = new WeakMap();
 function MimeType(type, description, suffixes, plugin) {
-  this.type = type;
-  this.description = description;
-  this.suffixes = suffixes;
-  this.enabledPlugin = plugin || null;
+  _mimeTypeState.set(this, {
+    type: type, description: description, suffixes: suffixes,
+    enabledPlugin: plugin || null,
+  });
 }
+function _setMimeTypePlugin(mimeType, plugin) {
+  var state = _mimeTypeState.get(mimeType);
+  if (state) state.enabledPlugin = plugin;
+}
+(function () {
+  var read = function (key) {
+    return function () {
+      var state = _mimeTypeState.get(this);
+      if (!state) throw new TypeError('Illegal invocation');
+      return state[key];
+    };
+  };
+  ['type', 'description', 'suffixes', 'enabledPlugin'].forEach(function (key) {
+    var getter = { ['get ' + key]: read(key) }['get ' + key];
+    _markNativeAs(getter, 'function get ' + key + '() { [native code] }');
+    Object.defineProperty(MimeType.prototype, key, {
+      get: getter, enumerable: true, configurable: true,
+    });
+  });
+})();
 Object.defineProperty(MimeType.prototype, Symbol.toStringTag, {value: 'MimeType', configurable: true});
 _markNative(MimeType);
 try {
@@ -6832,8 +6911,7 @@ try {
 } catch (_e) { globalThis.MimeType = MimeType; }
 
 function MimeTypeArray(items) {
-  for (var _i = 0; _i < items.length; _i++) this[_i] = items[_i];
-  this.length = items.length;
+  _initNamedCollection(this, items, function (mimeType) { return mimeType.type; });
 }
 MimeTypeArray.prototype.item = function(i) { return this[i] || null; };
 MimeTypeArray.prototype.namedItem = function(name) {
@@ -6842,6 +6920,8 @@ MimeTypeArray.prototype.namedItem = function(name) {
 };
 MimeTypeArray.prototype[Symbol.iterator] = Array.prototype[Symbol.iterator];
 Object.defineProperty(MimeTypeArray.prototype, Symbol.toStringTag, {value: 'MimeTypeArray', configurable: true});
+_defineCollectionLength(PluginArray);
+_defineCollectionLength(MimeTypeArray);
 _markNative(MimeTypeArray);
 _markNative(MimeTypeArray.prototype.item);
 _markNative(MimeTypeArray.prototype.namedItem);
@@ -7048,16 +7128,25 @@ globalThis.navigator = {
   defGetter('languages', function() { return ["en-US", "en"]; });
 
   // Cache plugins/mimeTypes so navigator.plugins === navigator.plugins.
-  var _plugins = new PluginArray([
-    new Plugin("PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("Chrome PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("Chromium PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("Microsoft Edge PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("WebKit built-in PDF", "internal-pdf-viewer", "Portable Document Format", []),
-  ]);
+  // Each of the five PDF viewers serves the same two types, and each type names
+  // the plugin serving it. A plugin with no mime types is the shape a script
+  // checks for first, because it is what an empty stand-in looks like.
+  var _pluginList = [
+    "PDF Viewer", "Chrome PDF Viewer", "Chromium PDF Viewer",
+    "Microsoft Edge PDF Viewer", "WebKit built-in PDF",
+  ].map(function (name) {
+    var plugin = new Plugin(name, "internal-pdf-viewer", "Portable Document Format", []);
+    _attachPluginMimeTypes(plugin, [
+      new MimeType("application/pdf", "Portable Document Format", "pdf", plugin),
+      new MimeType("text/pdf", "Portable Document Format", "pdf", plugin),
+    ]);
+    return plugin;
+  });
+  var _plugins = new PluginArray(_pluginList);
+  // navigator.mimeTypes lists each type once, enabled by the first viewer.
   var _mimeTypes = new MimeTypeArray([
-    new MimeType("application/pdf", "Portable Document Format", "pdf", null),
-    new MimeType("text/pdf", "Portable Document Format", "pdf", null),
+    new MimeType("application/pdf", "Portable Document Format", "pdf", _pluginList[0]),
+    new MimeType("text/pdf", "Portable Document Format", "pdf", _pluginList[0]),
   ]);
   defGetter('plugins', function() { return _plugins; });
   defGetter('mimeTypes', function() { return _mimeTypes; });
@@ -8274,6 +8363,36 @@ function _mediaViewportDimension(name) {
   return name === 'width' ? 1440 : 900;
 }
 
+// `device-width`/`device-height` describe the output device, not the viewport,
+// so they read the screen. A page that asks whether the device is as wide as
+// `screen.width` says has to be told yes: the two come from one machine, and a
+// disagreement between them is a contradiction no real display can produce.
+function _mediaDeviceDimension(name) {
+  const screen = globalThis.screen;
+  const value = screen && Number(name === 'width' ? screen.width : screen.height);
+  if (Number.isFinite(value) && value > 0) return value;
+  return _mediaViewportDimension(name);
+}
+
+// Resolution in dots per px unit. `dppx` is devicePixelRatio directly; `dpi`
+// and `dpcm` are the same quantity against the CSS reference of 96dpi.
+function _parseMediaResolution(value) {
+  const match = String(value).trim()
+    .match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))(dppx|x|dpi|dpcm)$/i);
+  if (!match) return null;
+  const amount = Number(match[1]);
+  if (!Number.isFinite(amount)) return null;
+  const unit = match[2].toLowerCase();
+  if (unit === 'dppx' || unit === 'x') return amount;
+  if (unit === 'dpi') return amount / 96;
+  return amount / (96 / 2.54);
+}
+
+function _mediaResolution() {
+  const value = Number(globalThis.devicePixelRatio);
+  return Number.isFinite(value) && value > 0 ? value : 1;
+}
+
 function _parseMediaPx(value) {
   const match = String(value).trim().match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))(px)?$/i);
   if (!match || (!match[2] && Number(match[1]) !== 0)) return null;
@@ -8290,7 +8409,35 @@ function _compareMediaValues(left, operator, right) {
 }
 
 function _evaluateMediaDimension(feature) {
-  let match = feature.match(/^(min|max)-(width|height)\s*:\s*(.+)$/);
+  let match = feature.match(/^(min|max)-device-(width|height)\s*:\s*(.+)$/);
+  if (match) {
+    const expected = _parseMediaPx(match[3]);
+    if (expected === null) return false;
+    const actual = _mediaDeviceDimension(match[2]);
+    return match[1] === 'min' ? actual >= expected : actual <= expected;
+  }
+
+  match = feature.match(/^device-(width|height)\s*:\s*(.+)$/);
+  if (match) {
+    const expected = _parseMediaPx(match[2]);
+    return expected !== null && _mediaDeviceDimension(match[1]) === expected;
+  }
+
+  match = feature.match(/^(min|max)-resolution\s*:\s*(.+)$/);
+  if (match) {
+    const expected = _parseMediaResolution(match[2]);
+    if (expected === null) return false;
+    const actual = _mediaResolution();
+    return match[1] === 'min' ? actual >= expected : actual <= expected;
+  }
+
+  match = feature.match(/^resolution\s*:\s*(.+)$/);
+  if (match) {
+    const expected = _parseMediaResolution(match[1]);
+    return expected !== null && _mediaResolution() === expected;
+  }
+
+  match = feature.match(/^(min|max)-(width|height)\s*:\s*(.+)$/);
   if (match) {
     const expected = _parseMediaPx(match[3]);
     if (expected === null) return false;
