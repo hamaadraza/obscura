@@ -57,20 +57,132 @@ impl wreq::dns::Resolve for SsrfGuardResolver {
     }
 }
 
+/// One stealth identity, held together as a unit.
+///
+/// The wreq emulation sends the user agent and sec-ch-ua-platform on the wire,
+/// and `navigator` has to report the same thing: if the TLS/HTTP layer and the
+/// JS layer disagree, a site cross-checks the mismatch as a bot signal. So the
+/// browser version and platform are not chosen separately per layer -- one
+/// entry supplies both, which is what makes rotating safe.
 #[cfg(feature = "stealth")]
-pub const STEALTH_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+pub struct StealthProfile {
+    pub user_agent: &'static str,
+    /// `navigator.platform`.
+    pub navigator_platform: &'static str,
+    /// `navigator.userAgentData.platform`, and sec-ch-ua-platform on the wire.
+    pub ua_platform: &'static str,
+    pub ua_platform_version: &'static str,
+    emulation: wreq_util::Profile,
+    emulation_platform: wreq_util::Platform,
+}
 
-// The wreq emulation (Profile::Chrome145, Platform::Windows) sends this exact
-// UA and sec-ch-ua-platform "Windows" on the wire. navigator has to report the
-// same identity, otherwise the TLS/HTTP layer and the JS layer disagree and a
-// site cross-checks the mismatch as a bot signal.
+/// Parallel to `obscura-browser`'s `PROFILES`, in the same order, so the same
+/// index means the same browser whether or not the stealth transport is built.
 #[cfg(feature = "stealth")]
-pub const STEALTH_NAVIGATOR_PLATFORM: &str = "Win32";
+pub static STEALTH_PROFILES: &[StealthProfile] = &[
+    StealthProfile {
+        user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+        navigator_platform: "Win32",
+        ua_platform: "Windows",
+        ua_platform_version: "10.0.0",
+        emulation: wreq_util::Profile::Chrome143,
+        emulation_platform: wreq_util::Platform::Windows,
+    },
+    StealthProfile {
+        user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+        navigator_platform: "Win32",
+        ua_platform: "Windows",
+        ua_platform_version: "10.0.0",
+        emulation: wreq_util::Profile::Chrome144,
+        emulation_platform: wreq_util::Platform::Windows,
+    },
+    StealthProfile {
+        user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+        navigator_platform: "Win32",
+        ua_platform: "Windows",
+        ua_platform_version: "15.0.0",
+        emulation: wreq_util::Profile::Chrome145,
+        emulation_platform: wreq_util::Platform::Windows,
+    },
+    StealthProfile {
+        user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        navigator_platform: "Win32",
+        ua_platform: "Windows",
+        ua_platform_version: "15.0.0",
+        emulation: wreq_util::Profile::Chrome146,
+        emulation_platform: wreq_util::Platform::Windows,
+    },
+    StealthProfile {
+        user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+        navigator_platform: "MacIntel",
+        ua_platform: "macOS",
+        ua_platform_version: "13.6.7",
+        emulation: wreq_util::Profile::Chrome143,
+        emulation_platform: wreq_util::Platform::MacOS,
+    },
+    StealthProfile {
+        user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+        navigator_platform: "MacIntel",
+        ua_platform: "macOS",
+        ua_platform_version: "14.4.1",
+        emulation: wreq_util::Profile::Chrome144,
+        emulation_platform: wreq_util::Platform::MacOS,
+    },
+    StealthProfile {
+        user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+        navigator_platform: "MacIntel",
+        ua_platform: "macOS",
+        ua_platform_version: "14.5.0",
+        emulation: wreq_util::Profile::Chrome145,
+        emulation_platform: wreq_util::Platform::MacOS,
+    },
+    StealthProfile {
+        user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        navigator_platform: "MacIntel",
+        ua_platform: "macOS",
+        ua_platform_version: "14.6.0",
+        emulation: wreq_util::Profile::Chrome146,
+        emulation_platform: wreq_util::Platform::MacOS,
+    },
+];
+
+/// Chooses the stealth identity, under the same controls as the ordinary
+/// profile rotation so both layers land on the same browser:
+///   OBSCURA_PROFILE=<index>   pin a specific profile
+///   OBSCURA_ROTATE_PROFILE=1  pick a random profile per client
+/// The default stays a single stable identity: cycling browser identities from
+/// one address is itself a bot signal.
 #[cfg(feature = "stealth")]
-pub const STEALTH_UA_PLATFORM: &str = "Windows";
-#[cfg(feature = "stealth")]
-pub const STEALTH_UA_PLATFORM_VERSION: &str = "15.0.0";
+pub fn select_stealth_profile() -> &'static StealthProfile {
+    if let Some(idx) = std::env::var("OBSCURA_PROFILE")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        if idx < STEALTH_PROFILES.len() {
+            return &STEALTH_PROFILES[idx];
+        }
+    }
+    let rotate = matches!(
+        std::env::var("OBSCURA_ROTATE_PROFILE")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    );
+    if rotate {
+        let idx = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as usize)
+            % STEALTH_PROFILES.len();
+        return &STEALTH_PROFILES[idx];
+    }
+    &STEALTH_PROFILES[0]
+}
 
 #[cfg(feature = "stealth")]
 fn wreq_response_header_value<'a>(
@@ -173,6 +285,8 @@ async fn send_get_with_connection_reset_retry(
 #[cfg(feature = "stealth")]
 pub struct StealthHttpClient {
     client: wreq::Client,
+    /// The identity this client impersonates, on the wire and in `navigator`.
+    identity: &'static StealthProfile,
     pub cookie_jar: Arc<CookieJar>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
@@ -184,10 +298,17 @@ impl StealthHttpClient {
         Self::with_proxy(cookie_jar, None)
     }
 
+    /// The identity this client impersonates. The page hands the same one to
+    /// the JS layer, which is what keeps the two surfaces telling one story.
+    pub fn identity(&self) -> &'static StealthProfile {
+        self.identity
+    }
+
     pub fn with_proxy(cookie_jar: Arc<CookieJar>, proxy_url: Option<&str>) -> Self {
+        let identity = select_stealth_profile();
         let emulation_opts = wreq_util::Emulation::builder()
-            .profile(wreq_util::Profile::Chrome145)
-            .platform(wreq_util::Platform::Windows)
+            .profile(identity.emulation)
+            .platform(identity.emulation_platform)
             .build();
 
         let mut builder = wreq::Client::builder()
@@ -243,6 +364,7 @@ impl StealthHttpClient {
 
         StealthHttpClient {
             client,
+            identity,
             cookie_jar,
             extra_headers: RwLock::new(HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -621,6 +743,7 @@ mod tests {
         let (port, server) = reset_fixture(false);
         let client = StealthHttpClient {
             client: wreq::Client::builder().no_proxy().build().unwrap(),
+            identity: super::select_stealth_profile(),
             cookie_jar: Arc::new(CookieJar::new()),
             extra_headers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -670,6 +793,12 @@ mod tests {
     // decoder the raw gzip bytes reach the HTML parser as document text.
     #[tokio::test]
     async fn stealth_client_decodes_gzip_response() {
+        // This client carries the SSRF resolver, unlike the fixtures that build
+        // a bare wreq client, so reaching the loopback fixture needs the same
+        // opt-in a caller would give. Set here rather than inherited from the
+        // environment: nextest runs each test in its own process, so this
+        // cannot reach the tests that assert the guard blocks loopback.
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
         let port = gzip_fixture().await;
         let client = StealthHttpClient::new(Arc::new(CookieJar::new()));
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();

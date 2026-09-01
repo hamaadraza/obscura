@@ -6,8 +6,10 @@ use std::time::Duration;
 
 use obscura::Browser;
 
+// OBSCURA_PROFILE below pins index 0, and the stealth identity is indexed
+// in step with the ordinary profiles, so both layers land on one browser.
 const STEALTH_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
-AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
 const ORDINARY_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
 
@@ -72,4 +74,27 @@ async fn stealth_transport_requires_compile_time_and_runtime_opt_in() {
 
     assert_eq!(navigate_user_agent(true).await, STEALTH_USER_AGENT);
     assert_eq!(navigate_user_agent(false).await, ORDINARY_USER_AGENT);
+}
+
+/// The stealth identity is one unit: the user agent the page reports has to
+/// be the one belonging to the profile the transport impersonates. Reading
+/// them from separate places is what would let a site catch the mismatch, so
+/// every entry is checked rather than the default alone.
+#[tokio::test(flavor = "current_thread")]
+async fn stealth_identity_agrees_across_every_profile() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    for (index, profile) in obscura_net::STEALTH_PROFILES.iter().enumerate() {
+        std::env::set_var("OBSCURA_PROFILE", index.to_string());
+        assert_eq!(
+            obscura_net::select_stealth_profile().user_agent,
+            profile.user_agent,
+            "profile {index} did not select itself"
+        );
+        assert_eq!(
+            navigate_user_agent(true).await,
+            profile.user_agent,
+            "profile {index}: page and transport named different browsers"
+        );
+    }
+    std::env::set_var("OBSCURA_PROFILE", "0");
 }

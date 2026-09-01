@@ -1504,13 +1504,17 @@ impl Page {
         rt.set_referrer(&self.referrer);
 
         #[cfg(feature = "stealth")]
-        if self.stealth_client.is_some() {
+        if let Some(stealth) = self.stealth_client.as_ref() {
+            // Taken from the client rather than from a constant, so the browser
+            // the JS layer describes is the one the transport is impersonating.
+            // Reading them from two places is how they drift apart.
+            let identity = stealth.identity();
             rt.set_stealth(true);
-            rt.set_user_agent(obscura_net::STEALTH_USER_AGENT);
+            rt.set_user_agent(identity.user_agent);
             rt.set_platform(
-                obscura_net::STEALTH_NAVIGATOR_PLATFORM,
-                obscura_net::STEALTH_UA_PLATFORM,
-                obscura_net::STEALTH_UA_PLATFORM_VERSION,
+                identity.navigator_platform,
+                identity.ua_platform,
+                identity.ua_platform_version,
             );
         } else {
             if let Ok(ua) = self.http_client.user_agent.try_read() {

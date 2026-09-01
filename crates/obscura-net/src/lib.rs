@@ -21,6 +21,5 @@ pub use robots::RobotsCache;
 pub use blocklist::is_blocked as is_tracker_blocked;
 #[cfg(feature = "stealth")]
 pub use wreq_client::{
-    StealthHttpClient, STEALTH_NAVIGATOR_PLATFORM, STEALTH_UA_PLATFORM,
-    STEALTH_UA_PLATFORM_VERSION, STEALTH_USER_AGENT,
+    select_stealth_profile, StealthHttpClient, StealthProfile, STEALTH_PROFILES,
 };
