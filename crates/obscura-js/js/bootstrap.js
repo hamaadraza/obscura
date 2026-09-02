@@ -3307,6 +3307,86 @@ function _animationsForTarget(target) {
 // and the realm the host builds for it start from the same markup.
 const _BLANK_FRAME_HTML = '<!DOCTYPE html><html><head></head><body></body></html>';
 
+// `innerText` is the *rendered* text, not the source text: elements that
+// generate no boxes contribute nothing, block boundaries introduce line breaks,
+// and whitespace collapses the way layout collapses it. Returning textContent
+// instead leaked <style> and <script> source into the value and made
+// `innerText === textContent`, which a rendered page never produces.
+const _INNER_TEXT_SKIP = new Set([
+  'SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'HEAD', 'TITLE', 'META', 'LINK',
+  'BASE', 'PARAM', 'SOURCE', 'TRACK', 'DATALIST', 'RP',
+]);
+// Tags whose default `display` is block-level, so text on either side of them
+// is separated by a line break. <p> also carries margins, which the rendered
+// text reflects as a blank line.
+const _INNER_TEXT_BLOCK = new Set([
+  'ADDRESS', 'ARTICLE', 'ASIDE', 'BLOCKQUOTE', 'BODY', 'CAPTION', 'CENTER',
+  'COLGROUP', 'DD', 'DETAILS', 'DIALOG', 'DIR', 'DIV', 'DL', 'DT', 'FIELDSET',
+  'FIGCAPTION', 'FIGURE', 'FOOTER', 'FORM', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+  'HEADER', 'HGROUP', 'HR', 'HTML', 'LEGEND', 'LI', 'LISTING', 'MAIN', 'MENU',
+  'NAV', 'OL', 'OPTGROUP', 'OPTION', 'P', 'PRE', 'SEARCH', 'SECTION', 'SUMMARY',
+  'TABLE', 'TBODY', 'TD', 'TFOOT', 'TH', 'THEAD', 'TR', 'UL',
+]);
+
+function _innerTextOf(root) {
+  const out = [];
+  let pending = 0;          // line breaks owed before the next run of text
+  let lastPreserve = false; // whether the last chunk kept its own whitespace
+  // Spaces sitting against a line break are absorbed by it, but only where
+  // whitespace is collapsible: text inside <pre> keeps its own indentation.
+  const trimTail = () => {
+    if (out.length && !lastPreserve) {
+      out[out.length - 1] = out[out.length - 1].replace(/[ \t]+$/, '');
+    }
+  };
+  const emit = (text, preserve) => {
+    if (!text) return;
+    if (out.length && pending) {
+      trimTail();
+      out.push(pending > 1 ? '\n\n' : '\n');
+      if (!preserve) text = text.replace(/^[ \t]+/, '');
+      if (!text) { pending = 0; return; }
+    }
+    pending = 0;
+    out.push(text);
+    lastPreserve = preserve;
+  };
+  const breakHere = (count) => { if (out.length && count > pending) pending = count; };
+  const walk = (node, preserve) => {
+    const children = node.childNodes;
+    for (let i = 0; i < children.length; i++) {
+      const child = children[i];
+      const type = child.nodeType;
+      if (type === 3) {
+        let text = child.data || '';
+        if (!preserve) {
+          text = text.replace(/[ \t\r\n\f]+/g, ' ');
+          // Whitespace that only separates blocks is absorbed by the break.
+          if (!text.trim() && (pending || !out.length)) continue;
+        }
+        emit(text, preserve);
+        continue;
+      }
+      if (type !== 1) continue;
+      const tag = child.tagName ? child.tagName.toUpperCase() : '';
+      if (_INNER_TEXT_SKIP.has(tag)) continue;
+      // Only the inline `display` is consulted. Resolving the full cascade
+      // would cost a computed-style call for every descendant on every read,
+      // and extraction code reads innerText in loops.
+      const inline = child.getAttribute ? child.getAttribute('style') : null;
+      if (inline && /(^|;)\s*display\s*:\s*none\s*(;|$)/i.test(inline)) continue;
+      if (tag === 'BR') { trimTail(); out.push('\n'); lastPreserve = false; pending = 0; continue; }
+      const block = _INNER_TEXT_BLOCK.has(tag);
+      const breaks = tag === 'P' ? 2 : 1;
+      if (block) breakHere(breaks);
+      walk(child, preserve || tag === 'PRE' || tag === 'TEXTAREA' || tag === 'LISTING');
+      if (block) breakHere(breaks);
+    }
+  };
+  walk(root, false);
+  return out.join('').replace(/^\s+|\s+$/g, '');
+}
+
 class Element extends Node {
   constructor(nid) {
     const entry = _customElementConstructionStack[_customElementConstructionStack.length - 1];
@@ -3415,8 +3495,18 @@ class Element extends Node {
     }
   }
   get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
-  get innerText() { return this.textContent; }
-  set innerText(v) { this.textContent = v; }
+  get innerText() { return _innerTextOf(this); }
+  set innerText(v) {
+    const text = String(v ?? '');
+    if (!/[\r\n]/.test(text)) { this.textContent = text; return; }
+    // Newlines become <br>, so the value round-trips back through the getter.
+    this.textContent = '';
+    const parts = text.split(/\r\n|\r|\n/);
+    for (let i = 0; i < parts.length; i++) {
+      if (i) this.appendChild(document.createElement('br'));
+      if (parts[i]) this.appendChild(document.createTextNode(parts[i]));
+    }
+  }
   get children() {
     const ids = _domParse("element_children", this._nid) || [];
     return HTMLCollection._from(ids.map(_wrapEl).filter(Boolean));

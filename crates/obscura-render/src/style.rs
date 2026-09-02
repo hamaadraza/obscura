@@ -2070,6 +2070,7 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             | "font-variation-settings"
             | "text-align"
             | "text-indent"
+            | "text-justify"
             | "text-transform"
             | "text-decoration"
             | "text-decoration-line"
@@ -3089,6 +3090,10 @@ fn supports_conservative_known_value(name: &str, value: &str) -> bool {
         "text-align" => matches!(
             lower.as_str(),
             "left" | "right" | "start" | "end" | "center" | "justify"
+        ),
+        "text-justify" => matches!(
+            lower.as_str(),
+            "auto" | "none" | "inter-word" | "inter-character"
         ),
         "text-transform" => matches!(
             lower.as_str(),
