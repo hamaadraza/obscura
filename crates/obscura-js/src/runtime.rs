@@ -693,11 +693,12 @@ impl ObscuraJsRuntime {
     ) {
         use deno_core::v8;
 
-        const IDENTITY_GLOBALS: [&str; 12] = [
+        const IDENTITY_GLOBALS: [&str; 13] = [
             "__obscura_ua",
             "__obscura_platform",
             "__obscura_ua_platform",
             "__obscura_ua_platform_version",
+            "__obscura_color_scheme",
             "__obscura_stealth",
             "__obscura_geo_lat",
             "__obscura_geo_lon",
@@ -1266,6 +1267,22 @@ impl ObscuraJsRuntime {
         let _ = self.execute_runtime_script(
             "<set-stealth>",
             format!("globalThis.__obscura_stealth = {};", enabled),
+        );
+    }
+
+    /// The operating-system colour scheme the page sees, through
+    /// `prefers-color-scheme` in both `matchMedia` and stylesheet `@media`
+    /// blocks. Part of the stealth identity; a page never told stays light.
+    pub fn set_color_scheme(&mut self, scheme: &str) {
+        let dark = scheme == "dark";
+        #[cfg(feature = "render")]
+        obscura_render::set_prefers_dark_color_scheme(dark);
+        let _ = self.execute_runtime_script(
+            "<set-color-scheme>",
+            format!(
+                "globalThis.__obscura_color_scheme = '{}';",
+                if dark { "dark" } else { "light" }
+            ),
         );
     }
 
@@ -5305,6 +5322,22 @@ mod tests {
             result,
             serde_json::json!([true, true, true, true, true, true, true])
         );
+    }
+
+    #[test]
+    fn prefers_color_scheme_follows_the_identity() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let probe = r#"
+            return [
+                matchMedia("(prefers-color-scheme: dark)").matches,
+                matchMedia("(prefers-color-scheme: light)").matches,
+            ];
+        "#;
+        assert_eq!(rt.evaluate(probe).unwrap(), serde_json::json!([false, true]));
+        rt.set_color_scheme("dark");
+        assert_eq!(rt.evaluate(probe).unwrap(), serde_json::json!([true, false]));
+        rt.set_color_scheme("light");
+        assert_eq!(rt.evaluate(probe).unwrap(), serde_json::json!([false, true]));
     }
 
     #[test]

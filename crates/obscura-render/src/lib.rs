@@ -14,7 +14,7 @@
 use taffy::prelude::*;
 
 pub mod css;
-pub use css::{CssMediaType, Stylesheet, StylesheetCache};
+pub use css::{CssMediaType, Stylesheet, StylesheetCache, set_prefers_dark_color_scheme};
 
 pub mod style;
 pub use style::compute_style;

@@ -72,6 +72,12 @@ pub struct StealthProfile {
     /// `navigator.userAgentData.platform`, and sec-ch-ua-platform on the wire.
     pub ua_platform: &'static str,
     pub ua_platform_version: &'static str,
+    /// The colour scheme the operating system is set to, answered through
+    /// `prefers-color-scheme`. Part of the identity so it rotates with the
+    /// rest of it: one fixed answer is one more constant across every
+    /// session, and light on every visit is what a headless default looks
+    /// like.
+    pub color_scheme: &'static str,
     emulation: wreq_util::Profile,
     emulation_platform: wreq_util::Platform,
 }
@@ -85,6 +91,7 @@ pub static STEALTH_PROFILES: &[StealthProfile] = &[
         navigator_platform: "Win32",
         ua_platform: "Windows",
         ua_platform_version: "10.0.0",
+        color_scheme: "light",
         emulation: wreq_util::Profile::Chrome143,
         emulation_platform: wreq_util::Platform::Windows,
     },
@@ -93,6 +100,7 @@ pub static STEALTH_PROFILES: &[StealthProfile] = &[
         navigator_platform: "Win32",
         ua_platform: "Windows",
         ua_platform_version: "10.0.0",
+        color_scheme: "light",
         emulation: wreq_util::Profile::Chrome144,
         emulation_platform: wreq_util::Platform::Windows,
     },
@@ -101,6 +109,7 @@ pub static STEALTH_PROFILES: &[StealthProfile] = &[
         navigator_platform: "Win32",
         ua_platform: "Windows",
         ua_platform_version: "15.0.0",
+        color_scheme: "dark",
         emulation: wreq_util::Profile::Chrome145,
         emulation_platform: wreq_util::Platform::Windows,
     },
@@ -109,6 +118,7 @@ pub static STEALTH_PROFILES: &[StealthProfile] = &[
         navigator_platform: "Win32",
         ua_platform: "Windows",
         ua_platform_version: "15.0.0",
+        color_scheme: "light",
         emulation: wreq_util::Profile::Chrome146,
         emulation_platform: wreq_util::Platform::Windows,
     },
@@ -117,6 +127,7 @@ pub static STEALTH_PROFILES: &[StealthProfile] = &[
         navigator_platform: "MacIntel",
         ua_platform: "macOS",
         ua_platform_version: "13.6.7",
+        color_scheme: "light",
         emulation: wreq_util::Profile::Chrome143,
         emulation_platform: wreq_util::Platform::MacOS,
     },
@@ -125,6 +136,7 @@ pub static STEALTH_PROFILES: &[StealthProfile] = &[
         navigator_platform: "MacIntel",
         ua_platform: "macOS",
         ua_platform_version: "14.4.1",
+        color_scheme: "dark",
         emulation: wreq_util::Profile::Chrome144,
         emulation_platform: wreq_util::Platform::MacOS,
     },
@@ -133,6 +145,7 @@ pub static STEALTH_PROFILES: &[StealthProfile] = &[
         navigator_platform: "MacIntel",
         ua_platform: "macOS",
         ua_platform_version: "14.5.0",
+        color_scheme: "light",
         emulation: wreq_util::Profile::Chrome145,
         emulation_platform: wreq_util::Platform::MacOS,
     },
@@ -141,6 +154,7 @@ pub static STEALTH_PROFILES: &[StealthProfile] = &[
         navigator_platform: "MacIntel",
         ua_platform: "macOS",
         ua_platform_version: "14.6.0",
+        color_scheme: "light",
         emulation: wreq_util::Profile::Chrome146,
         emulation_platform: wreq_util::Platform::MacOS,
     },
@@ -649,6 +663,25 @@ mod tests {
     use crate::client::{ObscuraNetError, SsrfGuardResolver};
     use crate::cookies::CookieJar;
     use wreq::dns::{Name, Resolve};
+
+    /// The colour scheme is part of the identity: it must be a value the page
+    /// can answer, and it must actually vary across the table, or it is one
+    /// more constant a site can pin across sessions.
+    #[test]
+    fn every_stealth_profile_carries_a_rotating_color_scheme() {
+        let schemes: Vec<&str> = super::STEALTH_PROFILES
+            .iter()
+            .map(|profile| profile.color_scheme)
+            .collect();
+        assert!(
+            schemes.iter().all(|s| *s == "light" || *s == "dark"),
+            "unexpected scheme in {schemes:?}"
+        );
+        assert!(
+            schemes.contains(&"light") && schemes.contains(&"dark"),
+            "the scheme never rotates: {schemes:?}"
+        );
+    }
 
     // Mirrors client::ssrf_tests::resolver_blocks_hostname_that_resolves_to_loopback.
     // Both transports must agree: a host-string check alone cannot see that a

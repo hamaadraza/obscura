@@ -26,6 +26,7 @@
     '__obscura_hasPendingLoadDelayingScripts',
     '__obscura_nextPendingTimeoutDelay',
     '__obscura_hw', '__obscura_mem', '__obscura_fpSeed', '__obscura_nativeRegs',
+    '__obscura_color_scheme',
     '__documentReadyState__', '__currentUrl',
     // internal helpers (var-declared throughout the file)
     '__processDynScriptQueue', '_decodeDataScriptUrl', '_markNative', '_fpRand', '_fpNoise',
@@ -691,10 +692,17 @@ function _rebaseCssUrls(css, baseUrl) {
   return out;
 }
 
+// The colour scheme the page sees through `prefers-color-scheme`. It comes
+// from the stealth identity, so it rotates with the user agent and platform
+// rather than answering "light" in every session. Without an identity it
+// stays light, which is what the most common desktop setup reports.
+function _prefersColorScheme() {
+  return globalThis.__obscura_color_scheme === 'dark' ? 'dark' : 'light';
+}
+
 function _cssImportApplies(media) {
   const compact = media.replace(/\s+/g, "").toLowerCase();
   if (!compact) return true;
-  if (compact.includes("prefers-color-scheme:dark")) return false;
   if (compact.includes("print")
     && !compact.includes("screen")
     && !compact.includes("all")) return false;
@@ -8691,7 +8699,7 @@ function _evaluateMediaFeature(raw) {
   }
 
   match = feature.match(/^prefers-color-scheme\s*:\s*(dark|light|no-preference)$/);
-  if (match) return match[1] === 'light';
+  if (match) return match[1] === _prefersColorScheme();
   match = feature.match(/^prefers-reduced-motion\s*:\s*(reduce|no-preference)$/);
   if (match) return match[1] === 'no-preference';
   match = feature.match(/^color-gamut\s*:\s*(srgb|p3|rec2020)$/);

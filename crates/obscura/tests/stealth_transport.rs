@@ -67,6 +67,21 @@ async fn navigate_user_agent(stealth: bool) -> String {
         .expect("request should include a user-agent header")
 }
 
+/// The colour scheme the page reports through `prefers-color-scheme`.
+async fn navigate_color_scheme() -> String {
+    let (url, request_rx) = spawn_server();
+
+    let browser = Browser::builder().stealth(true).build().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+    page.goto(&url).await.unwrap();
+    let _ = request_rx.recv_timeout(Duration::from_secs(5));
+
+    page.evaluate("matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'")
+        .as_str()
+        .expect("the colour scheme probe should return a string")
+        .to_string()
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn stealth_transport_requires_compile_time_and_runtime_opt_in() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
@@ -94,6 +109,11 @@ async fn stealth_identity_agrees_across_every_profile() {
             navigate_user_agent(true).await,
             profile.user_agent,
             "profile {index}: page and transport named different browsers"
+        );
+        assert_eq!(
+            navigate_color_scheme().await,
+            profile.color_scheme,
+            "profile {index}: page and identity disagree on the colour scheme"
         );
     }
     std::env::set_var("OBSCURA_PROFILE", "0");

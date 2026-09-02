@@ -1732,6 +1732,7 @@ impl Page {
                 identity.ua_platform,
                 identity.ua_platform_version,
             );
+            rt.set_color_scheme(identity.color_scheme);
         } else {
             if let Ok(ua) = self.http_client.user_agent.try_read() {
                 rt.set_user_agent(&ua);

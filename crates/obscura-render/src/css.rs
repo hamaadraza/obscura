@@ -6806,6 +6806,22 @@ fn split_supports_operator<'a>(condition: &'a str, operator: &str) -> Option<Vec
 /// strips whitespace before scanning: CSS gives no semantic meaning to spaces
 /// inside `(feature: value)`, so it's safe to discard them wholesale rather
 /// than special-case every formatting variant a site might use.
+/// Which colour scheme the environment prefers, as `@media
+/// (prefers-color-scheme: ...)` blocks see it. The page's `matchMedia` answers
+/// from the same identity, so a stylesheet block and the script that asks
+/// about it agree; light until told otherwise, which is the default a page
+/// rendered without an identity should see.
+static PREFERS_DARK_COLOR_SCHEME: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_prefers_dark_color_scheme(dark: bool) {
+    PREFERS_DARK_COLOR_SCHEME.store(dark, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn prefers_dark_color_scheme() -> bool {
+    PREFERS_DARK_COLOR_SCHEME.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) fn media_query_applies_for_viewport(query: &str, viewport: (f32, f32)) -> bool {
     media_query_applies_for_viewport_and_type(query, viewport, CssMediaType::Screen)
 }
@@ -6861,11 +6877,16 @@ fn single_media_query_applies_for_viewport(
         return false;
     }
 
-    // Color-scheme: we render the light (default) context. A site's
-    // `@media (prefers-color-scheme: dark)` block must NOT apply on top of its
-    // light defaults (that is what was leaking dark backgrounds, e.g. near
-    // black inline <code>); a `:light` block should apply.
-    if compact.contains("prefers-color-scheme:dark") {
+    // Colour scheme follows the environment the page is told it runs in. A
+    // block for the other scheme must not apply on top of a site's defaults
+    // (that is what leaked dark backgrounds, e.g. near-black inline <code>,
+    // when every dark block applied); a block for the current scheme falls
+    // through to the rest of the query.
+    let prefers_dark = prefers_dark_color_scheme();
+    if compact.contains("prefers-color-scheme:dark") && !prefers_dark {
+        return false;
+    }
+    if compact.contains("prefers-color-scheme:light") && prefers_dark {
         return false;
     }
     // Reduced-motion / high-contrast / inverted: default (no preference).
@@ -10312,6 +10333,24 @@ mod tests {
         assert!(desktop
             .iter()
             .any(|(selector, _)| selector == r".xl\:inline"));
+    }
+
+    #[test]
+    fn color_scheme_media_follows_the_environment() {
+        let viewport = (1280.0, 800.0);
+        set_prefers_dark_color_scheme(false);
+        assert!(!media_query_applies_for_viewport("(prefers-color-scheme: dark)", viewport));
+        assert!(media_query_applies_for_viewport("(prefers-color-scheme: light)", viewport));
+        set_prefers_dark_color_scheme(true);
+        assert!(media_query_applies_for_viewport("(prefers-color-scheme: dark)", viewport));
+        assert!(!media_query_applies_for_viewport("(prefers-color-scheme: light)", viewport));
+        // The scheme is one condition among the rest of the query, not a
+        // short-circuit past them.
+        assert!(!media_query_applies_for_viewport(
+            "(prefers-color-scheme: dark) and (min-width: 2000px)",
+            viewport
+        ));
+        set_prefers_dark_color_scheme(false);
     }
 
     #[test]
