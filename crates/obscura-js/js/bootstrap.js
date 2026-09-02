@@ -8059,34 +8059,38 @@ if (typeof Response === 'undefined') {
   };
 }
 
+// ChildNode methods are WebIDL operations: not constructible, no `prototype`
+// property, and a wrong receiver is an Illegal invocation. A plain `function`
+// assigned to the prototype gets all three wrong, and lie detectors probe each.
+function _childNodeReceiver(node) {
+  if (!node || typeof node._nid !== 'number') throw new TypeError('Illegal invocation');
+  return node;
+}
 if (!Element.prototype.replaceWith) {
-  // _convertNodes turns any non-node argument (numbers, booleans, null, …) into
+  // _convertNodes turns any non-node argument (numbers, booleans, null, ...) into
   // a Text node via String(n), matching the spec and append()/prepend(); the
   // old `typeof n === 'string'` check corrupted insert_before for other types.
-  Element.prototype.replaceWith = function(...nodes) {
-    const parent = this.parentNode;
+  Element.prototype.replaceWith = _asNativeMethod('replaceWith', function (...nodes) {
+    const parent = _childNodeReceiver(this).parentNode;
     if (!parent) return;
     for (const n of _convertNodes(nodes)) parent.insertBefore(n, this);
     parent.removeChild(this);
-  };
-  _markNative(Element.prototype.replaceWith);
+  });
 }
 if (!Element.prototype.before) {
-  Element.prototype.before = function(...nodes) {
-    const parent = this.parentNode;
+  Element.prototype.before = _asNativeMethod('before', function (...nodes) {
+    const parent = _childNodeReceiver(this).parentNode;
     if (!parent) return;
     for (const n of _convertNodes(nodes)) parent.insertBefore(n, this);
-  };
-  _markNative(Element.prototype.before);
+  });
 }
 if (!Element.prototype.after) {
-  Element.prototype.after = function(...nodes) {
-    const parent = this.parentNode;
+  Element.prototype.after = _asNativeMethod('after', function (...nodes) {
+    const parent = _childNodeReceiver(this).parentNode;
     if (!parent) return;
     const ref = this.nextSibling;
     for (const n of _convertNodes(nodes)) parent.insertBefore(n, ref);
-  };
-  _markNative(Element.prototype.after);
+  });
 }
 
 // ChildNode mixin: also mix before/after/replaceWith/remove into
@@ -12353,14 +12357,50 @@ function _windowNamedValue(name) {
     : element;
 }
 
+// Named elements are reachable through the Window's prototype chain, not as
+// own properties: Chrome keeps them on a WindowProperties object below
+// Window.prototype. That placement is what lets a script's own declarations
+// win. `var out = []` on a page with `<div id="out">` creates an own property
+// on the global, and an own property always beats the chain; as own
+// accessors the var found an existing property and the assignment fell into
+// an accessor with no setter, leaving `out` as the element. It also keeps ids
+// out of Object.getOwnPropertyNames(window), where Chrome never lists them.
+let _windowNamedHostObject = null;
+function _windowNamedHost() {
+  if (_windowNamedHostObject) return _windowNamedHostObject;
+  const parent = Object.getPrototypeOf(globalThis);
+  const host = Object.create(parent);
+  Object.defineProperty(host, Symbol.toStringTag, {
+    value: "WindowProperties", configurable: true,
+  });
+  try {
+    Object.setPrototypeOf(globalThis, host);
+    _windowNamedHostObject = host;
+  } catch (_error) {
+    // A global whose prototype is immutable falls back to the global itself;
+    // the setter below still lets a plain assignment replace the accessor.
+    _windowNamedHostObject = globalThis;
+  }
+  return _windowNamedHostObject;
+}
+
 function _ensureWindowNamedProperty(name) {
   name = String(name || "");
   if (!name || _windowNamedPropertyNames.has(name)) return;
-  // Existing own Window properties win over named elements.
-  if (Object.prototype.hasOwnProperty.call(globalThis, name)) return;
+  // A name already reachable on the Window, own or inherited, is not shadowed
+  // by an element: `window.alert` stays the function under `<div id="alert">`,
+  // and so does anything from Object.prototype.
+  if (name in globalThis) return;
   try {
-    Object.defineProperty(globalThis, name, {
+    Object.defineProperty(_windowNamedHost(), name, {
       get() { return _windowNamedValue(name); },
+      // Assignment through the chain creates an own data property on the
+      // receiver, the way [[Set]] on a WindowProperties object does.
+      set(value) {
+        Object.defineProperty(this, name, {
+          value, writable: true, enumerable: true, configurable: true,
+        });
+      },
       configurable: true,
       enumerable: true,
     });
@@ -12371,7 +12411,7 @@ function _ensureWindowNamedProperty(name) {
 function _reconcileWindowNamedProperty(name) {
   if (!_windowNamedPropertyNames.has(name)) return;
   if (_windowNamedCandidates(name).length !== 0) return;
-  try { delete globalThis[name]; } catch (_error) {}
+  try { delete _windowNamedHost()[name]; } catch (_error) {}
   _windowNamedPropertyNames.delete(name);
 }
 
@@ -12417,7 +12457,7 @@ function _reconcileWindowNamedProperties(names) {
   }
   for (const name of names) {
     if (_windowNamedPropertyNames.has(name) && !present.has(name)) {
-      try { delete globalThis[name]; } catch (_error) {}
+      try { delete _windowNamedHost()[name]; } catch (_error) {}
       _windowNamedPropertyNames.delete(name);
     }
   }
@@ -13483,27 +13523,54 @@ class CanvasRenderingContext2D {
       if (hex.length === 6) return [parseInt(hex.slice(0,2),16),parseInt(hex.slice(2,4),16),parseInt(hex.slice(4,6),16),255];
       if (hex.length === 8) return [parseInt(hex.slice(0,2),16),parseInt(hex.slice(2,4),16),parseInt(hex.slice(4,6),16),parseInt(hex.slice(6,8),16)];
     }
-    const m = css.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
-    if (m) return [+m[1],+m[2],+m[3],m[4]!==undefined?Math.round(+m[4]*255):255];
+    // rgb()/rgba() in both the comma and the slash syntax. Channels may be
+    // fractional or percentages, and every value is clamped the way CSS
+    // clamps it: alpha to [0, 1], so `rgba(r, g, b, 255)` is fully opaque
+    // rather than an alpha of 65025 that corrupts the blend.
+    const m = css.match(/rgba?\(\s*([\d.]+%?)\s*[,\s]\s*([\d.]+%?)\s*[,\s]\s*([\d.]+%?)\s*(?:[,/]\s*([\d.]+%?)\s*)?\)/);
+    if (m) {
+      const channel = (v) => Math.round(Math.min(255, Math.max(0,
+        v.endsWith('%') ? parseFloat(v) * 2.55 : parseFloat(v))));
+      const alpha = m[4] === undefined ? 1 : Math.min(1, Math.max(0,
+        m[4].endsWith('%') ? parseFloat(m[4]) / 100 : parseFloat(m[4])));
+      return [channel(m[1]), channel(m[2]), channel(m[3]), Math.round(alpha * 255)];
+    }
     const named = {red:[255,0,0,255],green:[0,128,0,255],blue:[0,0,255,255],white:[255,255,255,255],black:[0,0,0,255],yellow:[255,255,0,255],orange:[255,165,0,255],gray:[128,128,128,255],transparent:[0,0,0,0]};
     return named[css] || [0,0,0,255];
   }
+  // Compositing happens in premultiplied 8-bit space, as Chrome's backing
+  // store does, while the buffer keeps un-premultiplied bytes, as getImageData
+  // reports them. Reproducing both steps, quantization included, is what makes
+  // a readback of `rgba(10, 20, 30, 0.25)` come out as 12,20,32,64 the way
+  // Chrome's does; exact float math would give 10,20,30,64. The previous
+  // version blended the colour toward the backdrop by the source alpha and
+  // then applied that alpha a second time to the alpha channel, so a half
+  // transparent red on a clear canvas read back as 128,0,0,64.
   _setPixel(x, y, r, g, b, a) {
     x = Math.round(x); y = Math.round(y);
     if (x < 0 || x >= this._w || y < 0 || y >= this._h) return;
     const idx = (y * this._w + x) * 4;
-    const alpha = (a / 255) * this.globalAlpha;
-    if (this.globalCompositeOperation === 'multiply') {
-      this._buf[idx+0] = Math.round((r/255) * (this._buf[idx+0]/255) * 255);
-      this._buf[idx+1] = Math.round((g/255) * (this._buf[idx+1]/255) * 255);
-      this._buf[idx+2] = Math.round((b/255) * (this._buf[idx+2]/255) * 255);
-      this._buf[idx+3] = Math.min(255, this._buf[idx+3] + Math.round(a * alpha));
-    } else {
-      this._buf[idx+0] = Math.round(r * alpha + this._buf[idx+0] * (1 - alpha));
-      this._buf[idx+1] = Math.round(g * alpha + this._buf[idx+1] * (1 - alpha));
-      this._buf[idx+2] = Math.round(b * alpha + this._buf[idx+2] * (1 - alpha));
-      this._buf[idx+3] = Math.min(255, Math.round(a * alpha + this._buf[idx+3] * (1 - alpha)));
+    const buf = this._buf;
+    const sa = Math.round(a * this.globalAlpha);
+    if (sa <= 0) return;
+    const da = buf[idx + 3];
+    const src = [r, g, b];
+    if (this.globalCompositeOperation === 'multiply' && da > 0) {
+      // Blend against the backdrop before compositing (CSS Compositing 1):
+      // Cs' = (1 - ab) * Cs + ab * B(Cb, Cs), with B(Cb, Cs) = Cb * Cs.
+      const ab = da / 255;
+      for (let c = 0; c < 3; c++) {
+        src[c] = (1 - ab) * src[c] + ab * (src[c] * buf[idx + c] / 255);
+      }
     }
+    const oa = Math.round(sa + da * (255 - sa) / 255);
+    for (let c = 0; c < 3; c++) {
+      const sp = Math.round(src[c] * sa / 255);
+      const dp = Math.round(buf[idx + c] * da / 255);
+      const op = Math.round(sp + dp * (255 - sa) / 255);
+      buf[idx + c] = oa > 0 ? Math.min(255, Math.round(op * 255 / oa)) : 0;
+    }
+    buf[idx + 3] = oa;
   }
   fillRect(x, y, w, h) {
     const [r,g,b,a] = this._parseColor(this.fillStyle);
@@ -13590,7 +13657,7 @@ class CanvasRenderingContext2D {
         }
       }
     }
-    return { data, width: w, height: h };
+    return new ImageData(data, w);
   }
   putImageData(imageData, dx, dy) {
     dx=Math.round(dx); dy=Math.round(dy);
@@ -14171,28 +14238,152 @@ globalThis.AudioBuffer = class AudioBuffer {
   copyFromChannel(dst, ch, start) { var s=this._chs[ch]||this._chs[0]; start=start||0; for(var i=0;i<dst.length;i++) dst[i]=(s&&s[start+i])||0; }
   copyToChannel(src, ch, start) { var d=this._chs[ch]||this._chs[0]; start=start||0; if(d) for(var i=0;i<src.length;i++) d[start+i]=src[i]; }
 };
+// Audio nodes keep their wiring in a side table so an offline render can tell
+// what actually reaches the destination: an oscillator that was never started
+// or connected renders silence, exactly like the real graph. Detectors render
+// a known graph and compare the samples, so the output has to be deterministic
+// and shaped like Chrome's: the compressor's look-ahead leaves the first 265
+// frames at zero, and the level of the standard 10 kHz triangle probe matches
+// what Chrome produces for it.
+const _audioGraph = new WeakMap();
+const _AUDIO_COMPRESSOR_LOOKAHEAD = 265;
+const _AUDIO_PROBE_SAMPLE_SUM = 124.04347527516074;   // Chrome, frames 4500..5000
+const _AUDIO_PROBE_REDUCTION = -20.538288116455078;
+function _audioNodeState(node) {
+  let state = _audioGraph.get(node);
+  if (!state) {
+    state = { kind: 'node', outputs: new Set(), started: false, timeData: null };
+    _audioGraph.set(node, state);
+  }
+  return state;
+}
+function _audioReaches(node, target, seen) {
+  if (node === target) return true;
+  seen = seen || new Set();
+  if (seen.has(node)) return false;
+  seen.add(node);
+  for (const next of _audioNodeState(node).outputs) {
+    if (_audioReaches(next, target, seen)) return true;
+  }
+  return false;
+}
+// In-place radix-2 FFT over interleaved real/imaginary arrays.
+function _audioFft(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      let t = re[i]; re[i] = re[j]; re[j] = t;
+      t = im[i]; im[i] = im[j]; im[j] = t;
+    }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = -2 * Math.PI / len;
+    const wr = Math.cos(ang), wi = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let cr = 1, ci = 0;
+      for (let k = 0; k < len / 2; k++) {
+        const a = i + k, b = a + len / 2;
+        const tr = re[b] * cr - im[b] * ci;
+        const ti = re[b] * ci + im[b] * cr;
+        re[b] = re[a] - tr; im[b] = im[a] - ti;
+        re[a] += tr; im[a] += ti;
+        const ncr = cr * wr - ci * wi;
+        ci = cr * wi + ci * wr; cr = ncr;
+      }
+    }
+  }
+}
+// The analyser's spectrum: a Blackman window over the last fftSize frames,
+// magnitudes scaled by 1/fftSize, then the 0.8 smoothing applied to an empty
+// history, as a single analysis pass in Chrome does.
+function _audioSpectrum(analyser) {
+  const state = _audioNodeState(analyser);
+  const n = analyser.fftSize;
+  const bins = n >> 1;
+  const out = new Float32Array(bins);
+  if (!state.timeData) return out.fill(-Infinity);
+  const re = new Float64Array(n), im = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const w = 0.42 - 0.5 * Math.cos(2 * Math.PI * i / n) + 0.08 * Math.cos(4 * Math.PI * i / n);
+    re[i] = (state.timeData[i] || 0) * w;
+  }
+  _audioFft(re, im);
+  const k = analyser.smoothingTimeConstant;
+  for (let i = 0; i < bins; i++) {
+    const magnitude = (1 - k) * Math.sqrt(re[i] * re[i] + im[i] * im[i]) / n;
+    out[i] = magnitude > 0 ? 20 * Math.log10(magnitude) : -Infinity;
+  }
+  return out;
+}
 globalThis.AudioContext = class AudioContext {
   constructor() { this.sampleRate=_fp('audioSampleRate'); this.state='running'; this.currentTime=0; this.baseLatency=_fp('audioBaseLatency'); this.destination={maxChannelCount:2,numberOfInputs:1,numberOfOutputs:0,channelCount:2}; this._listeners={}; }
   addEventListener(type, fn) { if (!this._listeners[type]) this._listeners[type]=[]; this._listeners[type].push(fn); }
   removeEventListener(type, fn) { if (this._listeners[type]) this._listeners[type]=this._listeners[type].filter(h=>h!==fn); }
   _ap(v, min=-3.4028235e38, max=3.4028235e38) { return { value: v, defaultValue: v, minValue: min, maxValue: max, setValueAtTime(){} }; }
-  createOscillator() { return {context:this,type:'sine',frequency:this._ap(440, -22050, 22050),detune:this._ap(0, -153600, 153600),connect(){},start(){},stop(){},disconnect(){},addEventListener(){},removeEventListener(){}}; }
-  createDynamicsCompressor() { return {context:this,threshold:this._ap(_fp('compThreshold'), -100, 0),knee:this._ap(_fp('compKnee'), 0, 40),ratio:this._ap(_fp('compRatio'), 1, 20),attack:this._ap(0.003, 0, 1),release:this._ap(0.25, 0, 1),reduction:0,connect(){},disconnect(){}}; }
+  _node(kind, fields) {
+    const node = Object.assign({
+      context: this,
+      connect(dst) { if (dst && typeof dst === 'object') _audioNodeState(this).outputs.add(dst); return dst; },
+      disconnect(dst) {
+        const outputs = _audioNodeState(this).outputs;
+        if (dst && typeof dst === 'object') outputs.delete(dst); else outputs.clear();
+      },
+      addEventListener() {}, removeEventListener() {},
+    }, fields);
+    _audioNodeState(node).kind = kind;
+    (this._created || (this._created = [])).push(node);
+    return node;
+  }
+  createOscillator() {
+    return this._node('oscillator', {
+      type: 'sine', frequency: this._ap(440, -22050, 22050), detune: this._ap(0, -153600, 153600),
+      start() { _audioNodeState(this).started = true; }, stop() {},
+    });
+  }
+  createDynamicsCompressor() {
+    return this._node('compressor', {
+      threshold: this._ap(_fp('compThreshold'), -100, 0), knee: this._ap(_fp('compKnee'), 0, 40),
+      ratio: this._ap(_fp('compRatio'), 1, 20), attack: this._ap(0.003, 0, 1), release: this._ap(0.25, 0, 1),
+      reduction: 0,
+    });
+  }
   createAnalyser() {
-    return {context:this,fftSize:2048,frequencyBinCount:1024,channelCount:2,channelCountMode:'max',channelInterpretation:'speakers',maxDecibels:-30,minDecibels:-100,numberOfInputs:1,numberOfOutputs:1,smoothingTimeConstant:0.8,connect(){},disconnect(){},
-      // An analyser with nothing connected to it observes silence, which is
-      // -Infinity in the float scale and 0 in the byte scale. Reporting a
-      // dithered -100 instead was itself the tell: CreepJS asks an unconnected
-      // analyser for its spectrum and expects silence back.
-      getByteFrequencyData:_markNative(function getByteFrequencyData(a){for(let i=0;i<a.length;i++)a[i]=0;}),
-      getFloatFrequencyData:_markNative(function getFloatFrequencyData(a){for(let i=0;i<a.length;i++)a[i]=-Infinity;}),
-      // Time-domain readers: their absence made CreepJS report the audio "time"
-      // probe as unsupported while the frequency probe worked, an inconsistency
-      // a real AnalyserNode never has. Byte data centres on 128 (silence);
-      // float data on 0, both with a small deterministic dither.
-      getByteTimeDomainData:_markNative(function getByteTimeDomainData(a){for(let i=0;i<a.length;i++)a[i]=128+Math.round((_fpRand(800+i)-0.5)*2);}),
-      getFloatTimeDomainData:_markNative(function getFloatTimeDomainData(a){for(let i=0;i<a.length;i++)a[i]=(_fpRand(900+i)-0.5)*0.0009;})
-    };
+    // An analyser reports the last fftSize frames that flowed through it. One
+    // that nothing rendered into observes silence: -Infinity on the float
+    // scale, 0 (frequency) and 128 (time) on the byte scale, with no dither,
+    // because that is what Chrome returns for it.
+    return this._node('analyser', {
+      fftSize: 2048, frequencyBinCount: 1024, channelCount: 2, channelCountMode: 'max',
+      channelInterpretation: 'speakers', maxDecibels: -30, minDecibels: -100,
+      numberOfInputs: 1, numberOfOutputs: 1, smoothingTimeConstant: 0.8,
+      getFloatFrequencyData: _markNative(function getFloatFrequencyData(a) {
+        const spectrum = _audioSpectrum(this);
+        for (let i = 0; i < a.length; i++) a[i] = i < spectrum.length ? spectrum[i] : -Infinity;
+      }),
+      getByteFrequencyData: _markNative(function getByteFrequencyData(a) {
+        const spectrum = _audioSpectrum(this);
+        const range = this.maxDecibels - this.minDecibels;
+        for (let i = 0; i < a.length; i++) {
+          const db = i < spectrum.length ? spectrum[i] : -Infinity;
+          const scaled = range > 0 ? 255 * (db - this.minDecibels) / range : 0;
+          a[i] = scaled > 0 ? (scaled < 255 ? scaled : 255) : 0;
+        }
+      }),
+      getFloatTimeDomainData: _markNative(function getFloatTimeDomainData(a) {
+        const data = _audioNodeState(this).timeData;
+        for (let i = 0; i < a.length; i++) a[i] = data && i < data.length ? data[i] : 0;
+      }),
+      getByteTimeDomainData: _markNative(function getByteTimeDomainData(a) {
+        const data = _audioNodeState(this).timeData;
+        for (let i = 0; i < a.length; i++) {
+          const scaled = ((data && i < data.length ? data[i] : 0) + 1) * 128;
+          a[i] = scaled > 0 ? (scaled < 255 ? scaled : 255) : 0;
+        }
+      }),
+    });
   }
   createGain() { return {context:this,gain:this._ap(1),connect(){},disconnect(){}}; }
   createBiquadFilter() { return {context:this,type:'lowpass',frequency:this._ap(350, 0, 22050),Q:this._ap(1, 0.0001, 1000),gain:this._ap(0, -40, 40),connect(){},disconnect(){}}; }
@@ -14217,31 +14408,76 @@ globalThis.OfflineAudioContext = class OfflineAudioContext extends AudioContext 
     this.oncomplete = null;
   }
   startRendering() {
-    var self = this;
-    var buf = this.createBuffer(1, self.length, 44100);
-    var data = buf.getChannelData(0);
-    // Simulate compressed triangle wave at 10kHz.
-    // Target: sum(|data[4500..5000]|) matches Chrome Linux (~124.04347527516074).
-    var target = 124.04347527516074 + (_fpRand(9991) - 0.5) * 0.002;
-    var freq = 10000, sr = 44100;
-    for (var i = 0; i < self.length; i++) {
-      var phase = ((i * freq / sr) % 1 + 1) % 1;
-      data[i] = phase < 0.5 ? 4*phase - 1 : 3 - 4*phase;
+    const self = this;
+    const sampleRate = self.sampleRate || 44100;
+    const buf = this.createBuffer(1, self.length, sampleRate);
+    const data = buf.getChannelData(0);
+    const nodes = [];
+    const visit = (node) => {
+      if (!node || nodes.includes(node)) return;
+      nodes.push(node);
+      for (const next of _audioNodeState(node).outputs) visit(next);
+    };
+    // Only what the started oscillators feed into the destination is heard.
+    for (const node of self._created || []) visit(node);
+    const sources = nodes.filter((node) => {
+      const state = _audioNodeState(node);
+      return state.kind === 'oscillator' && state.started && _audioReaches(node, self.destination);
+    });
+    let compressed = false;
+    for (const osc of sources) {
+      const freq = osc.frequency.value * Math.pow(2, (osc.detune.value || 0) / 1200);
+      if (!freq) continue;
+      const compressor = nodes.find((node) => _audioNodeState(node).kind === 'compressor'
+        && _audioReaches(osc, node) && _audioReaches(node, self.destination));
+      const lead = compressor ? _AUDIO_COMPRESSOR_LOOKAHEAD : 0;
+      if (compressor) { compressed = true; compressor.reduction = _AUDIO_PROBE_REDUCTION; }
+      for (let i = lead; i < self.length; i++) {
+        const t = (i - lead) * freq / sampleRate;
+        const phase = t - Math.floor(t);
+        let v;
+        switch (osc.type) {
+          case 'square': v = phase < 0.5 ? 1 : -1; break;
+          case 'sawtooth': v = 2 * phase - 1; break;
+          case 'triangle': v = phase < 0.5 ? 4 * phase - 1 : 3 - 4 * phase; break;
+          default: v = Math.sin(2 * Math.PI * phase);
+        }
+        data[i] += v;
+      }
     }
-    var s = 0;
-    for (var i = 4500; i < 5000; i++) s += Math.abs(data[i]);
-    var scale = s > 0 ? target / s : 0;
-    for (var i = 0; i < self.length; i++) data[i] *= scale;
+    if (compressed) {
+      // Chrome's compressor lands the standard probe on a known level; scale
+      // to it over the window fingerprinting code sums (frames 4500..5000),
+      // and use that same gain for any other render length.
+      let sum = 0, scale = 0.4962;
+      if (self.length >= 5000) {
+        for (let i = 4500; i < 5000; i++) sum += Math.abs(data[i]);
+        if (sum > 0) scale = _AUDIO_PROBE_SAMPLE_SUM / sum;
+      }
+      for (let i = 0; i < self.length; i++) data[i] *= scale;
+    }
+    for (const node of nodes) {
+      const state = _audioNodeState(node);
+      if (state.kind !== 'analyser') continue;
+      const fed = sources.some((osc) => _audioReaches(osc, node));
+      if (!fed) continue;
+      const frames = new Float32Array(node.fftSize);
+      const start = Math.max(0, self.length - node.fftSize);
+      for (let i = start; i < self.length; i++) frames[i - start] = data[i];
+      state.timeData = frames;
+    }
+    self.state = 'closed';
+    self.currentTime = self.length / sampleRate;
     // Fire oncomplete + 'complete' listeners on next microtask so callers
     // can register handlers synchronously after startRendering().
-    var p = Promise.resolve().then(function() {
-      var evt = {renderedBuffer: buf, target: self, type: 'complete'};
+    const p = Promise.resolve().then(function () {
+      const evt = { renderedBuffer: buf, target: self, type: 'complete' };
       if (typeof self.oncomplete === 'function') {
-        try { self.oncomplete(evt); } catch(e) {}
+        try { self.oncomplete(evt); } catch (e) {}
       }
-      var listeners = (self._listeners && self._listeners['complete']) || [];
-      for (var i = 0; i < listeners.length; i++) {
-        try { listeners[i](evt); } catch(e) {}
+      const listeners = (self._listeners && self._listeners['complete']) || [];
+      for (let i = 0; i < listeners.length; i++) {
+        try { listeners[i](evt); } catch (e) {}
       }
       return buf;
     });
@@ -14250,13 +14486,71 @@ globalThis.OfflineAudioContext = class OfflineAudioContext extends AudioContext 
 };
 globalThis.webkitAudioContext = globalThis.AudioContext;
 
-globalThis.speechSynthesis = {
-  speaking: false, pending: false, paused: false,
-  getVoices() { return [{ name:'Google US English', lang:'en-US', default:true, localService:true, voiceURI:'Google US English' }]; },
-  speak() {}, cancel() {}, pause() {}, resume() {},
-  addEventListener() {}, removeEventListener() {},
-  onvoiceschanged: null,
-};
+// speechSynthesis is a SpeechSynthesis instance: the operations live on the
+// prototype as native methods, state is read through prototype getters, and
+// the constructor is not callable from script. A plain object literal reports
+// its methods as `Object.getVoices` with their source visible.
+const _speechSynthesisKey = Symbol('speechSynthesis');
+const _speechSynthesisState = new WeakMap();
+function _speechSynthesisOf(target) {
+  const state = _speechSynthesisState.get(target);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
+}
+class SpeechSynthesisVoice {
+  constructor(key, voice) {
+    if (key !== _speechSynthesisKey) throw new TypeError('Illegal constructor');
+    _speechSynthesisState.set(this, voice);
+  }
+  get voiceURI() { return _speechSynthesisOf(this).voiceURI; }
+  get name() { return _speechSynthesisOf(this).name; }
+  get lang() { return _speechSynthesisOf(this).lang; }
+  get localService() { return _speechSynthesisOf(this).localService; }
+  get default() { return _speechSynthesisOf(this).default; }
+}
+class SpeechSynthesis extends EventTarget {
+  constructor(key) {
+    if (key !== _speechSynthesisKey) throw new TypeError('Illegal constructor');
+    super();
+    _speechSynthesisState.set(this, {
+      speaking: false, pending: false, paused: false, onvoiceschanged: null,
+      voices: [new SpeechSynthesisVoice(_speechSynthesisKey, {
+        voiceURI: 'Google US English', name: 'Google US English', lang: 'en-US',
+        localService: true, default: true,
+      })],
+    });
+  }
+  get speaking() { return _speechSynthesisOf(this).speaking; }
+  get pending() { return _speechSynthesisOf(this).pending; }
+  get paused() { return _speechSynthesisOf(this).paused; }
+  get onvoiceschanged() { return _speechSynthesisOf(this).onvoiceschanged; }
+  set onvoiceschanged(handler) {
+    _speechSynthesisOf(this).onvoiceschanged = typeof handler === 'function' ? handler : null;
+  }
+  getVoices() { return _speechSynthesisOf(this).voices.slice(); }
+  speak(utterance) { _speechSynthesisOf(this); }
+  cancel() { _speechSynthesisOf(this); }
+  pause() { _speechSynthesisOf(this); }
+  resume() { _speechSynthesisOf(this); }
+}
+for (const [ctor, tag] of [[SpeechSynthesis, 'SpeechSynthesis'], [SpeechSynthesisVoice, 'SpeechSynthesisVoice']]) {
+  _markNative(ctor);
+  Object.defineProperty(ctor.prototype, Symbol.toStringTag, { value: tag, configurable: true });
+  for (const name of Object.getOwnPropertyNames(ctor.prototype)) {
+    if (name === 'constructor') continue;
+    const desc = Object.getOwnPropertyDescriptor(ctor.prototype, name);
+    if (typeof desc.value === 'function') _markNative(desc.value);
+    if (desc.get) _markNativeAs(desc.get, 'function get ' + name + '() { [native code] }');
+    if (desc.set) _markNativeAs(desc.set, 'function set ' + name + '() { [native code] }');
+  }
+  Object.defineProperty(globalThis, tag, { value: ctor, writable: true, enumerable: false, configurable: true });
+}
+{
+  const instance = new SpeechSynthesis(_speechSynthesisKey);
+  const getter = { ['get speechSynthesis']() { return instance; } }['get speechSynthesis'];
+  _markNativeAs(getter, 'function get speechSynthesis() { [native code] }');
+  Object.defineProperty(globalThis, 'speechSynthesis', { get: getter, enumerable: true, configurable: true });
+}
 globalThis.SpeechSynthesisUtterance = class SpeechSynthesisUtterance { constructor(t){this.text=t;this.lang='en-US';this.rate=1;this.pitch=1;this.volume=1;} };
 
 globalThis.MediaStream = class MediaStream { constructor(){this.id='';this.active=true;} getTracks(){return [];} getAudioTracks(){return [];} getVideoTracks(){return [];} addTrack(){} removeTrack(){} clone(){return new MediaStream();} };
@@ -17019,48 +17313,28 @@ _markNative(Node.prototype.isDefaultNamespace);
 
 
 // ---- getElementsByTagNameNS on Element and Document ----
-// getElementsByTagNameNS on Element and Document
+function _getElementsByTagNameNS(root, namespaceURI, localName) {
+  if (!root || typeof root._nid !== 'number') throw new TypeError('Illegal invocation');
+  const all = root.querySelectorAll('*');
+  const filtered = [];
+  const nsMatch = namespaceURI === '*';
+  const tagMatch = localName === '*';
+  for (let i = 0; i < all.length; i++) {
+    const el = all[i];
+    if (!el) continue;
+    const nsOk = nsMatch || (el.namespaceURI === (namespaceURI || null));
+    const tagOk = tagMatch || (el.localName === localName);
+    if (nsOk && tagOk) filtered.push(el);
+  }
+  return HTMLCollection._from(filtered);
+}
 if (!Element.prototype.getElementsByTagNameNS) {
-  Element.prototype.getElementsByTagNameNS = function(namespaceURI, localName) {
-    const all = this.querySelectorAll('*');
-    const filtered = [];
-    const nsMatch = namespaceURI === '*';
-    const tagMatch = localName === '*';
-    for (let i = 0; i < all.length; i++) {
-      const el = all[i];
-      if (!el) continue;
-      const elNs = el.namespaceURI;
-      const elTag = el.localName;
-      const nsOk = nsMatch || (elNs === (namespaceURI || null));
-      const tagOk = tagMatch || (elTag === localName);
-      if (nsOk && tagOk) filtered.push(el);
-    }
-    const result = new HTMLCollection(...filtered);
-    result.item = (i) => result[i] != null ? result[i] : null;
-    return result;
-  };
-  _markNative(Element.prototype.getElementsByTagNameNS);
+  Element.prototype.getElementsByTagNameNS = _asNativeMethod('getElementsByTagNameNS',
+    function (namespaceURI, localName) { return _getElementsByTagNameNS(this, namespaceURI, localName); });
 }
 if (!Document.prototype.getElementsByTagNameNS) {
-  Document.prototype.getElementsByTagNameNS = function(namespaceURI, localName) {
-    const all = this.querySelectorAll('*');
-    const filtered = [];
-    const nsMatch = namespaceURI === '*';
-    const tagMatch = localName === '*';
-    for (let i = 0; i < all.length; i++) {
-      const el = all[i];
-      if (!el) continue;
-      const elNs = el.namespaceURI;
-      const elTag = el.localName;
-      const nsOk = nsMatch || (elNs === (namespaceURI || null));
-      const tagOk = tagMatch || (elTag === localName);
-      if (nsOk && tagOk) filtered.push(el);
-    }
-    const result = new HTMLCollection(...filtered);
-    result.item = (i) => result[i] != null ? result[i] : null;
-    return result;
-  };
-  _markNative(Document.prototype.getElementsByTagNameNS);
+  Document.prototype.getElementsByTagNameNS = _asNativeMethod('getElementsByTagNameNS',
+    function (namespaceURI, localName) { return _getElementsByTagNameNS(this, namespaceURI, localName); });
 }
 
 // ---- Attr nodes and createAttribute ----

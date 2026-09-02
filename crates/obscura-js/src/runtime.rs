@@ -82,6 +82,88 @@ fn pinned_time_zone() -> String {
     "Europe/Berlin".to_string()
 }
 
+/// Format `Error.stack` the way Chrome does. deno_core installs its own
+/// formatter, which rebuilds every line from CallSite fields and prefixes a
+/// method call with the receiver's name, so `Math.sin instanceof Math.sin`
+/// reports `at sin.[Symbol.hasInstance]` where Chrome reports
+/// `at [Symbol.hasInstance]`. Fingerprinting code compares that exact line.
+/// Each frame here is the CallSite's own `toString`, so the text is V8's.
+/// Frames inside the runtime's bootstrap scripts are left out: a native has
+/// no frame of its own in Chrome, and the script name would identify the
+/// engine.
+fn chrome_shaped_stack_trace<'s>(
+    scope: &mut deno_core::v8::HandleScope<'s>,
+    error: deno_core::v8::Local<'s, deno_core::v8::Value>,
+    callsites: deno_core::v8::Local<'s, deno_core::v8::Array>,
+) -> deno_core::v8::Local<'s, deno_core::v8::Value> {
+    use deno_core::v8;
+
+    fn string_prop<'a>(
+        scope: &mut v8::HandleScope<'a>,
+        obj: v8::Local<'a, v8::Object>,
+        key: &str,
+    ) -> Option<String> {
+        let key = v8::String::new(scope, key)?;
+        let value = obj.get(scope, key.into())?;
+        if value.is_undefined() {
+            return None;
+        }
+        Some(value.to_rust_string_lossy(scope))
+    }
+
+    fn call_string_method<'a>(
+        scope: &mut v8::HandleScope<'a>,
+        obj: v8::Local<'a, v8::Object>,
+        name: &str,
+    ) -> Option<String> {
+        let key = v8::String::new(scope, name)?;
+        let method = obj.get(scope, key.into())?;
+        let method = method.try_cast::<v8::Function>().ok()?;
+        let value = method.call(scope, obj.into(), &[])?;
+        if value.is_null_or_undefined() {
+            return None;
+        }
+        Some(value.to_rust_string_lossy(scope))
+    }
+
+    // The header follows Error.prototype.toString: a missing name reads as
+    // "Error", and the separator appears only when both halves are present.
+    let mut out = String::new();
+    if let Ok(obj) = error.try_cast::<v8::Object>() {
+        let name = string_prop(scope, obj, "name").unwrap_or_else(|| "Error".to_string());
+        let message = string_prop(scope, obj, "message").unwrap_or_default();
+        match (name.is_empty(), message.is_empty()) {
+            (false, false) => {
+                out.push_str(&name);
+                out.push_str(": ");
+                out.push_str(&message);
+            }
+            (false, true) => out.push_str(&name),
+            (true, false) => out.push_str(&message),
+            (true, true) => {}
+        }
+    }
+
+    for index in 0..callsites.length() {
+        let Some(site) = callsites.get_index(scope, index) else { continue };
+        let Ok(site_obj) = site.try_cast::<v8::Object>() else { continue };
+        let internal = call_string_method(scope, site_obj, "getFileName")
+            .map(|file| file.starts_with("<obscura:") || file.starts_with("ext:"))
+            .unwrap_or(false);
+        if internal {
+            continue;
+        }
+        let Some(text) = site.to_string(scope) else { continue };
+        out.push_str("\n    at ");
+        out.push_str(&text.to_rust_string_lossy(scope));
+    }
+
+    match v8::String::new(scope, &out) {
+        Some(text) => text.into(),
+        None => v8::undefined(scope).into(),
+    }
+}
+
 /// Pin ICU's process-wide default time zone. Must run after deno_core's V8
 /// init has loaded the ICU data bundle (ucal resolves the zone id against it),
 /// i.e. only once the first `JsRuntime` exists.
@@ -390,6 +472,10 @@ impl ObscuraJsRuntime {
                 .date_time_configuration_change_notification(
                     deno_core::v8::TimeZoneDetection::Skip,
                 );
+            // Replace deno_core's stack formatter: see chrome_shaped_stack_trace.
+            runtime
+                .v8_isolate()
+                .set_prepare_stack_trace_callback(chrome_shaped_stack_trace);
 
             {
                 let op_state = runtime.op_state();
@@ -5150,6 +5236,69 @@ mod tests {
                          window instanceof Window, self.document === document,\
                          self.location === location, self.history === history,\
                          self.navigator === navigator];",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, true, true, true, true, true, true])
+        );
+    }
+
+    #[test]
+    fn window_named_access_yields_to_script_declarations() {
+        // Named elements live on the Window's prototype chain, so a script's
+        // own declarations and assignments shadow them, as they do in Chrome.
+        // Each script runs at global scope, the way page.rs runs inline ones.
+        let mut rt = setup_runtime(
+            r#"<html><body>
+                <div id="declared"></div>
+                <div id="assigned"></div>
+                <div id="strictAssigned"></div>
+                <div id="toString"></div>
+                <div id="untouched"></div>
+            </body></html>"#,
+        );
+        rt.execute_script(
+            "sloppy",
+            r#"
+            var declared = [1, 2];
+            assigned = "plain";
+            const declaredDesc = Object.getOwnPropertyDescriptor(window, "declared");
+            window.__results = {
+                declaredIsArray: Array.isArray(declared),
+                assignedIsString: assigned === "plain",
+                declaredOwnData: !!declaredDesc && declaredDesc.value === declared,
+                toStringIntact: window.toString === Object.prototype.toString,
+            };
+            "#,
+        )
+        .unwrap();
+        rt.execute_script(
+            "strict",
+            r#"
+            "use strict";
+            var strictOk = true;
+            try { strictAssigned = 7; } catch (error) { strictOk = false; }
+            window.__results.strictAssignment = strictOk && strictAssigned === 7;
+            "#,
+        )
+        .unwrap();
+        let result = rt
+            .evaluate(
+                r#"
+                const r = window.__results;
+                const untouched = document.getElementById("untouched");
+                const before = window.untouched === untouched
+                    && ("untouched" in window)
+                    && Object.getOwnPropertyDescriptor(window, "untouched") === undefined
+                    && !Object.getOwnPropertyNames(window).includes("untouched");
+                untouched.remove();
+                const removed = !("untouched" in window);
+                return [
+                    r.declaredIsArray, r.assignedIsString, r.declaredOwnData,
+                    r.toStringIntact, r.strictAssignment, before, removed,
+                ];
+                "#,
             )
             .unwrap();
         assert_eq!(
