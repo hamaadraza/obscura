@@ -5340,6 +5340,295 @@ mod tests {
         assert_eq!(rt.evaluate(probe).unwrap(), serde_json::json!([false, true]));
     }
 
+    /// V8 137 ships a pre-standard draft of Temporal, so presenting a version
+    /// that shipped the final API must not expose it: the draft's shape is a
+    /// signature no real browser has, where absence is merely a missing feature.
+    #[test]
+    fn draft_temporal_is_withheld_even_when_the_version_shipped_it() {
+        let dom = parse_html("<html><body></body></html>");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url("http://example.com/test");
+        rt.set_user_agent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        );
+        rt.run_page_init();
+        let result = rt
+            .evaluate(
+                r#"
+                return [
+                    /Chrome\/146/.test(navigator.userAgent),
+                    typeof Temporal,
+                    typeof Date.prototype.toTemporalInstant,
+                    typeof Blob.prototype.bytes,
+                ];
+                "#,
+            )
+            .unwrap();
+        // Blob.bytes stays: it is a 144 feature the engine implements as shipped.
+        assert_eq!(
+            result,
+            serde_json::json!([true, "undefined", "undefined", "function"])
+        );
+    }
+
+    /// The chain above a window is Chrome's: Window.prototype, WindowProperties,
+    /// EventTarget.prototype. EventTarget is a base of its own, not an alias of
+    /// Node, so the listener methods are inherited rather than owned by Node.
+    #[test]
+    fn window_prototype_chain_matches_chrome() {
+        let mut rt = setup_runtime(r#"<html><body><div id="named"></div></body></html>"#);
+        rt.execute_script("shadow", "var named = 'script wins';").unwrap();
+        let result = rt
+            .evaluate(
+                r#"
+                const proto = Object.getPrototypeOf(window);
+                const props = Object.getPrototypeOf(Window.prototype);
+                return [
+                    proto === Window.prototype,
+                    Object.prototype.toString.call(props),
+                    Object.getPrototypeOf(props) === EventTarget.prototype,
+                    window instanceof EventTarget,
+                    window instanceof Node,
+                    EventTarget === Node,
+                    new EventTarget() instanceof Node,
+                    document.body instanceof EventTarget,
+                    Object.prototype.hasOwnProperty.call(Node.prototype, "addEventListener"),
+                    Object.prototype.hasOwnProperty.call(EventTarget.prototype, "addEventListener"),
+                    typeof document.body.addEventListener,
+                    named,
+                    window.constructor === Window,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                true, "[object WindowProperties]", true, true, false, false, false, true,
+                false, true, "function", "script wins", true
+            ])
+        );
+    }
+
+    /// HTMLCollection is an array-like: indexable, iterable, with item() and
+    /// named access, but not an Array and without Array's methods.
+    #[test]
+    fn html_collections_are_array_likes_not_arrays() {
+        let mut rt = setup_runtime(
+            r#"<html><body><div id="first"></div><div name="second"></div><p></p></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const children = document.body.children;
+                const divs = document.getElementsByTagName("div");
+                return [
+                    Array.isArray(children),
+                    Object.prototype.toString.call(children),
+                    children instanceof HTMLCollection,
+                    children.length,
+                    children.item(0) === document.getElementById("first"),
+                    children[2].tagName,
+                    Array.from(children).length,
+                    [...divs].length,
+                    children.namedItem("first") === document.getElementById("first"),
+                    children.first === document.getElementById("first"),
+                    typeof children.forEach,
+                    typeof children.map,
+                    String(HTMLCollection.prototype.item).includes("[native code]"),
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                false, "[object HTMLCollection]", true, 3, true, "P", 3, 2, true, true,
+                "undefined", "undefined", true
+            ])
+        );
+    }
+
+    /// A property the presented version predates is unsupported in every CSSOM
+    /// path, not only in CSS.supports: setProperty and cssText drop it, and a
+    /// plain assignment leaves an expando that never reaches the declaration
+    /// block. `text-justify` shipped in Chrome 145; the page presents 143. The
+    /// gate keys on the user agent, so the runtime is built with one set: the
+    /// plain test harness has none, and without one nothing is withheld.
+    #[test]
+    fn version_gated_css_properties_are_unsupported_in_the_cssom_too() {
+        let dom = parse_html("<html><body><div id=\"box\"></div></body></html>");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url("http://example.com/test");
+        rt.set_user_agent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+        );
+        rt.run_page_init();
+        let result = rt
+            .evaluate(
+                r#"
+                const style = document.getElementById("box").style;
+                style.setProperty("text-justify", "inter-word");
+                const viaSetProperty = [style.cssText, style.getPropertyValue("text-justify")];
+                style.textJustify = "inter-word";
+                const viaAssignment = [style.cssText, style.textJustify];
+                style.cssText = "text-justify: inter-word; color: red";
+                const viaCssText = style.cssText;
+                style.setProperty("text-indent", "4px");
+                return [
+                    CSS.supports("text-justify", "inter-word"),
+                    viaSetProperty, viaAssignment, viaCssText,
+                    style.getPropertyValue("text-indent"),
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                false, ["", ""], ["", "inter-word"], "color: red;", "4px"
+            ])
+        );
+
+        // The same property is a normal declaration once the version has it.
+        let dom = parse_html("<html><body><div id=\"box\"></div></body></html>");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url("http://example.com/test");
+        rt.set_user_agent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        );
+        rt.run_page_init();
+        let result = rt
+            .evaluate(
+                r#"
+                const style = document.getElementById("box").style;
+                style.setProperty("text-justify", "inter-word");
+                return [CSS.supports("text-justify", "inter-word"), style.cssText];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, "text-justify: inter-word;"]));
+    }
+
+    #[test]
+    fn image_data_reports_its_class() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const ctx = document.createElement("canvas").getContext("2d");
+                const data = ctx.getImageData(0, 0, 2, 2);
+                return [
+                    Object.prototype.toString.call(data),
+                    data instanceof ImageData,
+                    Object.prototype.toString.call(new ImageData(2, 2)),
+                    String(ImageData).includes("[native code]"),
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["[object ImageData]", true, "[object ImageData]", true])
+        );
+    }
+
+    /// Every interface with listener methods is an EventTarget, as in Chrome.
+    #[test]
+    fn listener_bearing_interfaces_are_event_targets() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const targets = {
+                    abortSignal: new AbortController().signal,
+                    xhr: new XMLHttpRequest(),
+                    messagePort: new MessageChannel().port1,
+                    mediaQueryList: matchMedia("(min-width: 1px)"),
+                    audioContext: new AudioContext(),
+                    animation: document.body.animate([{ opacity: 0 }, { opacity: 1 }], 100),
+                    broadcast: new BroadcastChannel("t"),
+                    element: document.body,
+                    window: window,
+                };
+                return Object.fromEntries(
+                    Object.entries(targets).map(([k, v]) => [k, v instanceof EventTarget])
+                );
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "abortSignal": true, "xhr": true, "messagePort": true, "mediaQueryList": true,
+                "audioContext": true, "animation": true, "broadcast": true, "element": true,
+                "window": true
+            })
+        );
+    }
+
+    /// The standard audio probe yields Chrome 148's own numbers: the sums a
+    /// fingerprint computes over the rendered samples and the analyser data,
+    /// and the compressor's reduction, all bit-exact. Any other graph goes
+    /// through the synthesiser, and the compressor defaults are Chrome's.
+    #[tokio::test(flavor = "current_thread")]
+    async fn audio_probe_graph_renders_chromes_reference() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate(
+            r#"
+            const sum = (arr) => [...arr].reduce((acc, v) => acc + Math.abs(v), 0);
+            const render = (type, freq) => new Promise((resolve) => {
+                const ctx = new OfflineAudioContext(1, 5000, 44100);
+                const analyser = ctx.createAnalyser();
+                const osc = ctx.createOscillator();
+                const comp = ctx.createDynamicsCompressor();
+                osc.type = type; osc.frequency.value = freq;
+                comp.threshold.value = -50; comp.knee.value = 40; comp.attack.value = 0;
+                osc.connect(comp); comp.connect(analyser); comp.connect(ctx.destination);
+                osc.start(0);
+                ctx.startRendering().then((buffer) => {
+                    const freqData = new Float32Array(analyser.frequencyBinCount);
+                    analyser.getFloatFrequencyData(freqData);
+                    const timeData = new Float32Array(analyser.fftSize);
+                    analyser.getFloatTimeDomainData(timeData);
+                    const samples = buffer.getChannelData(0);
+                    resolve([
+                        sum(samples.slice(4500, 5000)), comp.reduction === -20.538288116455078,
+                        sum(freqData), sum(timeData),
+                    ]);
+                });
+            });
+            const defaults = new AudioContext().createDynamicsCompressor();
+            globalThis.__audioProbe = null;
+            Promise.all([render("triangle", 10000), render("sine", 440)]).then(([probe, other]) => {
+                globalThis.__audioProbe = {
+                    probe,
+                    otherDiffers: other[0] !== probe[0],
+                    defaults: [defaults.threshold.value, defaults.knee.value, defaults.ratio.value,
+                               defaults.attack.value, defaults.release.value],
+                };
+            });
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        let result = rt.evaluate("globalThis.__audioProbe").unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "probe": [124.04347527516074, true, 164537.64795303345, 502.5999283068122],
+                "otherDiffers": true,
+                "defaults": [-24, 30, 12, 0.003, 0.25],
+            })
+        );
+    }
+
     #[test]
     fn window_named_access_exposes_ids_and_eligible_names() {
         let mut rt = setup_runtime(
