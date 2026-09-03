@@ -1362,6 +1362,86 @@ fn op_shadow_root_info(state: &OpState, host_nid: u32) -> String {
         .unwrap_or_default()
 }
 
+/// Per-command tally of DOM bridge traffic, printed at exit when
+/// `OBSCURA_PROFILE_DOM` is set. Every DOM read a page makes crosses this
+/// boundary, so when a page is slow the first question is which command is
+/// being called, how often, and at what cost -- guessing at that from the
+/// outside is how `innerText` stayed thousands of round trips per call.
+pub mod dom_profile {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    pub struct Entry {
+        pub calls: u64,
+        pub nanos: u128,
+    }
+
+    static STATS: OnceLock<Mutex<HashMap<String, Entry>>> = OnceLock::new();
+
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("OBSCURA_PROFILE_DOM").is_some())
+    }
+
+    pub fn record(cmd: &str, nanos: u128) {
+        let stats = STATS.get_or_init(|| Mutex::new(HashMap::new()));
+        let Ok(mut stats) = stats.lock() else { return };
+        let entry = stats.entry(cmd.to_string()).or_insert(Entry { calls: 0, nanos: 0 });
+        entry.calls += 1;
+        entry.nanos += nanos;
+    }
+
+    /// Times a scope and records it on drop, for async paths with several
+    /// return points.
+    pub struct Timer {
+        cmd: &'static str,
+        started: std::time::Instant,
+    }
+
+    impl Timer {
+        pub fn new(cmd: &'static str) -> Option<Self> {
+            enabled().then(|| Timer {
+                cmd,
+                started: std::time::Instant::now(),
+            })
+        }
+    }
+
+    impl Drop for Timer {
+        fn drop(&mut self) {
+            record(self.cmd, self.started.elapsed().as_nanos());
+        }
+    }
+
+    /// Write the tally to stderr, busiest first.
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let Some(stats) = STATS.get() else { return };
+        let Ok(stats) = stats.lock() else { return };
+        let mut rows: Vec<(&String, &Entry)> = stats.iter().collect();
+        rows.sort_by_key(|(_, entry)| std::cmp::Reverse(entry.nanos));
+        let calls: u64 = rows.iter().map(|(_, e)| e.calls).sum();
+        let nanos: u128 = rows.iter().map(|(_, e)| e.nanos).sum();
+        eprintln!(
+            "dom profile: {} calls, {:.1}ms total",
+            calls,
+            nanos as f64 / 1e6
+        );
+        for (cmd, entry) in rows.into_iter().take(25) {
+            eprintln!(
+                "  {:>9} calls  {:>9.1}ms  {:>8.1}us/call  {}",
+                entry.calls,
+                entry.nanos as f64 / 1e6,
+                entry.nanos as f64 / 1e3 / entry.calls as f64,
+                cmd
+            );
+        }
+    }
+}
+
 #[op2]
 #[string]
 fn op_dom(
@@ -1378,9 +1458,16 @@ fn op_dom(
     // inconsistent tree node degrades to a null result for that single call.
     // No per-call clone: on the happy path this is just a landing pad, so the
     // hot DOM path (querySelector/getAttribute/...) pays nothing measurable.
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+    let profiling = dom_profile::enabled();
+    let started = profiling.then(std::time::Instant::now);
+    let profiled_cmd = profiling.then(|| cmd.clone());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         op_dom_inner(shared, cmd, arg1, arg2)
-    }))
+    }));
+    if let (Some(started), Some(cmd)) = (started, profiled_cmd) {
+        dom_profile::record(&cmd, started.elapsed().as_nanos());
+    }
+    result
     .unwrap_or_else(|_| {
         tracing::error!("op_dom panicked; returning null");
         "null".to_string()
@@ -2502,6 +2589,9 @@ async fn op_fetch_url(
     #[string] mode: String,
     #[string] credentials: String,
 ) -> Result<String, deno_error::JsErrorBox> {
+    // Counted alongside the DOM commands so a page's network phase and its DOM
+    // traffic can be compared directly.
+    let _fetch_timer = dom_profile::Timer::new("net:fetch");
     let body = body.to_vec();
     tracing::debug!(
         "op_fetch_url called: {} {} (intercept check pending)",

@@ -250,6 +250,9 @@ impl ModuleLoader for ObscuraModuleLoader {
         };
 
         ModuleLoadResponse::Async(Pin::from(Box::new(async move {
+            // Counted with the other bridge traffic: module graph loading is the
+            // phase that dominates a slow page, so its share needs a number.
+            let _module_timer = crate::ops::dom_profile::Timer::new("net:module");
             // deno_core propagates `is_dyn_import` to every dependency edge in
             // the recursive graph, so this excludes parser-discovered/static
             // graphs without losing descendant fetches of a lazy graph.

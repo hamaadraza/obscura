@@ -301,8 +301,22 @@ fn effective_v8_flags(user: Option<&str>) -> String {
     }
 }
 
+/// Prints the DOM bridge profile when the process finishes, if enabled.
+struct DomProfileDump;
+impl Drop for DomProfileDump {
+    fn drop(&mut self) {
+        obscura_js::ops::dom_profile::dump();
+    }
+}
+fn scopeguard_dom_profile() -> DomProfileDump {
+    DomProfileDump
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
+    // Set OBSCURA_PROFILE_DOM to get the DOM bridge tally on exit.
+    let _dom_profile = scopeguard_dom_profile();
+
     let args = Args::parse();
 
     // Pin the process timezone before V8/ICU reads it. On POSIX hosts ICU
