@@ -24,19 +24,6 @@ jobs:
             # Native build on GitHub's ARM runner.
             os: ubuntu-22.04-arm
             name: obscura-aarch64-linux
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            name: obscura-aarch64-macos
-          - target: x86_64-apple-darwin
-            # Must run on a native Intel runner. obscura-js bakes a V8 startup
-            # snapshot at build time, and that snapshot is architecture specific.
-            # macos-latest is Apple Silicon, so building x86_64 there embeds an
-            # arm64 snapshot into the Intel binary and V8 crashes deserializing
-            # it at isolate init (issue #290). macos-15-intel is the last x86_64
-            # image (available until Aug 2027); there is no cross-build that
-            # produces a correct snapshot.
-            os: macos-15-intel
-            name: obscura-x86_64-macos
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             name: obscura-x86_64-windows
@@ -57,18 +44,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake clang libclang-dev llvm-dev
-
-      - name: Configure libclang (macOS)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          # Use one coherent SDK. A hard-coded CommandLineTools include path can
-          # mix libc++ headers with the selected Xcode SDK and break BoringSSL.
-          XCODE_PATH="$(xcode-select -p)"
-          SDK_PATH="$(xcrun --show-sdk-path)"
-          echo "SDKROOT=$SDK_PATH" >> "$GITHUB_ENV"
-          echo "CXXFLAGS=-isystem $SDK_PATH/usr/include/c++/v1" >> "$GITHUB_ENV"
-          echo "LIBCLANG_PATH=$XCODE_PATH/Toolchains/XcodeDefault.xctoolchain/usr/lib" >> "$GITHUB_ENV"
 
       - name: Configure libclang (Windows)
         if: runner.os == 'Windows'
