@@ -12231,67 +12231,6 @@ const _SVG_INTERFACE_BY_TAG = {
   tspan: 'SVGTSpanElement', use: 'SVGUseElement', view: 'SVGViewElement',
 };
 
-const _INTERFACE_MEMBERS = {
-  HTMLInputElement: ['value', 'defaultValue', 'checked', 'defaultChecked', 'indeterminate',
-    'files', 'valueAsNumber', 'valueAsDate', 'selectionStart', 'selectionEnd',
-    'selectionDirection', 'type', 'disabled', 'readOnly', 'required', 'placeholder',
-    'name', 'form', 'labels', 'list', 'min', 'max', 'step', 'pattern', 'multiple',
-    'accept', 'autocomplete', 'maxLength', 'minLength', 'size', 'select',
-    'setSelectionRange', 'setRangeText', 'stepUp', 'stepDown', 'checkValidity',
-    'reportValidity', 'setCustomValidity', 'validity', 'validationMessage', 'willValidate'],
-  HTMLTextAreaElement: ['value', 'defaultValue', 'rows', 'cols', 'select', 'selectionStart',
-    'selectionEnd', 'setSelectionRange', 'setRangeText', 'form', 'labels', 'placeholder',
-    'disabled', 'readOnly', 'required', 'maxLength', 'minLength', 'name', 'wrap',
-    'checkValidity', 'reportValidity', 'setCustomValidity', 'validity', 'willValidate'],
-  HTMLSelectElement: ['value', 'selectedIndex', 'options', 'selectedOptions', 'add', 'remove',
-    'form', 'labels', 'multiple', 'size', 'disabled', 'required', 'name', 'type',
-    'checkValidity', 'reportValidity', 'setCustomValidity', 'validity', 'willValidate'],
-  HTMLOptionElement: ['value', 'text', 'selected', 'defaultSelected', 'index', 'label', 'form', 'disabled'],
-  HTMLOptGroupElement: ['label', 'disabled'],
-  HTMLButtonElement: ['value', 'type', 'disabled', 'form', 'labels', 'name',
-    'checkValidity', 'reportValidity', 'setCustomValidity', 'validity', 'willValidate'],
-  HTMLAnchorElement: ['href', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search',
-    'hash', 'origin', 'target', 'rel', 'relList', 'download', 'text', 'referrerPolicy'],
-  HTMLAreaElement: ['href', 'alt', 'coords', 'shape', 'target', 'rel', 'relList'],
-  HTMLIFrameElement: ['src', 'srcdoc', 'contentWindow', 'contentDocument', 'name', 'sandbox',
-    'allow', 'referrerPolicy', 'loading', 'width', 'height'],
-  HTMLScriptElement: ['src', 'text', 'type', 'async', 'defer', 'noModule', 'crossOrigin',
-    'referrerPolicy', 'integrity'],
-  HTMLLinkElement: ['href', 'rel', 'relList', 'type', 'as', 'media', 'crossOrigin', 'disabled', 'sheet'],
-  HTMLStyleElement: ['sheet', 'disabled', 'media', 'type'],
-  HTMLMetaElement: ['name', 'content', 'httpEquiv', 'charset'],
-  HTMLBaseElement: ['href', 'target'],
-  HTMLTitleElement: ['text'],
-  HTMLLabelElement: ['control', 'htmlFor', 'form'],
-  HTMLFieldSetElement: ['elements', 'disabled', 'name', 'form', 'type'],
-  HTMLLegendElement: ['form'],
-  HTMLOutputElement: ['value', 'defaultValue', 'htmlFor', 'form', 'labels', 'name'],
-  HTMLProgressElement: ['value', 'max', 'position', 'labels'],
-  HTMLMeterElement: ['value', 'min', 'max', 'low', 'high', 'optimum', 'labels'],
-  HTMLTemplateElement: ['content'],
-  HTMLSlotElement: ['name', 'assignedNodes', 'assignedElements', 'assign'],
-  HTMLDialogElement: ['open', 'returnValue', 'show', 'showModal', 'close'],
-  HTMLDetailsElement: ['open'],
-  HTMLTableElement: ['rows', 'tBodies', 'caption', 'tHead', 'tFoot', 'createTHead',
-    'createTFoot', 'createCaption', 'insertRow', 'deleteRow'],
-  HTMLTableSectionElement: ['rows', 'insertRow', 'deleteRow'],
-  HTMLTableRowElement: ['cells', 'rowIndex', 'sectionRowIndex', 'insertCell', 'deleteCell'],
-  HTMLTableCellElement: ['cellIndex', 'colSpan', 'rowSpan', 'headers', 'abbr', 'scope'],
-  HTMLTableColElement: ['span'],
-  HTMLOListElement: ['start', 'reversed', 'type'],
-  HTMLLIElement: ['value'],
-  HTMLObjectElement: ['data', 'type', 'name', 'form', 'width', 'height', 'contentDocument', 'contentWindow'],
-  HTMLEmbedElement: ['src', 'type', 'width', 'height'],
-  HTMLSourceElement: ['src', 'srcset', 'sizes', 'type', 'media'],
-  HTMLMapElement: ['name', 'areas'],
-  HTMLDataElement: ['value'],
-  HTMLTimeElement: ['dateTime'],
-  HTMLModElement: ['cite', 'dateTime'],
-  HTMLQuoteElement: ['cite'],
-  HTMLCanvasElement: ['width', 'height', 'getContext', 'toDataURL', 'toBlob', 'captureStream'],
-  HTMLFormElement: ['action', 'method', 'target', 'enctype', 'name', 'noValidate',
-    'acceptCharset', 'submit', 'requestSubmit', 'reset', 'checkValidity', 'reportValidity'],
-};
 
 // The constructor for an interface name, once the hierarchy above exists.
 function _elementInterfaceCtor(name) {
@@ -18200,16 +18139,87 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
 // its tag here. The engine's globals are left alone, as are factories whose
 // prototype belongs to another interface (Image, Audio, Option, and the
 // webkit aliases), which take that interface's name.
-for (const [name, names] of Object.entries(_INTERFACE_MEMBERS)) {
-  const ctor = globalThis[name];
-  if (typeof ctor !== 'function' || !ctor.prototype || ctor.prototype === Element.prototype) continue;
-  for (const member of names) {
-    if (Object.prototype.hasOwnProperty.call(ctor.prototype, member)) continue;
+
+// Where each member of the element surface lives, taken from Chrome's own
+// prototypes. Everything is implemented once on Element.prototype, which meant
+// Element.prototype carried the whole surface -- `value`, `href`, `style`,
+// `click`, every event handler -- while HTMLElement.prototype was empty. Chrome
+// splits them: Element holds what every element has, HTMLElement and SVGElement
+// hold what their kind has, and a member like `value` sits only on the
+// interfaces that define it. One `getOwnPropertyDescriptor(Element.prototype,
+// 'value')` told the two apart, and a page that reads
+// `node.constructor.prototype` (React's input value tracking does) found
+// nothing where it looked.
+//
+// The descriptors are moved, not copied: each lands on the prototypes that own
+// it and is removed from Element.prototype, so both the lookup and the surface
+// match. A member Chrome does not have stays where it is rather than being
+// dropped.
+const _CHROME_ELEMENT_MEMBERS = new Set(['activeViewTransition', 'after', 'animate', 'append', 'ariaActiveDescendantElement', 'ariaAtomic', 'ariaAutoComplete', 'ariaBrailleLabel', 'ariaBrailleRoleDescription', 'ariaBusy', 'ariaChecked', 'ariaColCount', 'ariaColIndex', 'ariaColIndexText', 'ariaColSpan', 'ariaControlsElements', 'ariaCurrent', 'ariaDescribedByElements', 'ariaDescription', 'ariaDetailsElements', 'ariaDisabled', 'ariaErrorMessageElements', 'ariaExpanded', 'ariaFlowToElements', 'ariaHasPopup', 'ariaHidden', 'ariaInvalid', 'ariaKeyShortcuts', 'ariaLabel', 'ariaLabelledByElements', 'ariaLevel', 'ariaLive', 'ariaModal', 'ariaMultiLine', 'ariaMultiSelectable', 'ariaNotify', 'ariaOrientation', 'ariaPlaceholder', 'ariaPosInSet', 'ariaPressed', 'ariaReadOnly', 'ariaRelevant', 'ariaRequired', 'ariaRoleDescription', 'ariaRowCount', 'ariaRowIndex', 'ariaRowIndexText', 'ariaRowSpan', 'ariaSelected', 'ariaSetSize', 'ariaSort', 'ariaValueMax', 'ariaValueMin', 'ariaValueNow', 'ariaValueText', 'assignedSlot', 'attachShadow', 'attributes', 'before', 'checkVisibility', 'childElementCount', 'children', 'classList', 'className', 'clientHeight', 'clientLeft', 'clientTop', 'clientWidth', 'closest', 'computedStyleMap', 'currentCSSZoom', 'customElementRegistry', 'elementTiming', 'firstElementChild', 'getAnimations', 'getAttribute', 'getAttributeNS', 'getAttributeNames', 'getAttributeNode', 'getAttributeNodeNS', 'getBoundingClientRect', 'getClientRects', 'getElementsByClassName', 'getElementsByTagName', 'getElementsByTagNameNS', 'getHTML', 'hasAttribute', 'hasAttributeNS', 'hasAttributes', 'hasPointerCapture', 'id', 'innerHTML', 'insertAdjacentElement', 'insertAdjacentHTML', 'insertAdjacentText', 'lastElementChild', 'localName', 'matches', 'moveBefore', 'namespaceURI', 'nextElementSibling', 'onbeforecopy', 'onbeforecut', 'onbeforepaste', 'onfullscreenchange', 'onfullscreenerror', 'onsearch', 'onwebkitfullscreenchange', 'onwebkitfullscreenerror', 'outerHTML', 'part', 'prefix', 'prepend', 'previousElementSibling', 'querySelector', 'querySelectorAll', 'releasePointerCapture', 'remove', 'removeAttribute', 'removeAttributeNS', 'removeAttributeNode', 'replaceChildren', 'replaceWith', 'requestFullscreen', 'requestPointerLock', 'role', 'scroll', 'scrollBy', 'scrollHeight', 'scrollIntoView', 'scrollIntoViewIfNeeded', 'scrollLeft', 'scrollTo', 'scrollTop', 'scrollWidth', 'setAttribute', 'setAttributeNS', 'setAttributeNode', 'setAttributeNodeNS', 'setHTML', 'setHTMLUnsafe', 'setPointerCapture', 'shadowRoot', 'slot', 'startViewTransition', 'tagName', 'toggleAttribute', 'webkitMatchesSelector', 'webkitRequestFullScreen', 'webkitRequestFullscreen']);
+const _CHROME_HTML_ELEMENT_MEMBERS = new Set(['accessKey', 'attachInternals', 'attributeStyleMap', 'autocapitalize', 'autofocus', 'blur', 'click', 'contentEditable', 'dataset', 'dir', 'draggable', 'editContext', 'enterKeyHint', 'focus', 'hidden', 'hidePopover', 'inert', 'innerText', 'inputMode', 'isContentEditable', 'lang', 'nonce', 'offsetHeight', 'offsetLeft', 'offsetParent', 'offsetTop', 'offsetWidth', 'onabort', 'onanimationcancel', 'onanimationend', 'onanimationiteration', 'onanimationstart', 'onauxclick', 'onbeforeinput', 'onbeforematch', 'onbeforetoggle', 'onbeforexrselect', 'onblur', 'oncancel', 'oncanplay', 'oncanplaythrough', 'onchange', 'onclick', 'onclose', 'oncommand', 'oncontentvisibilityautostatechange', 'oncontextlost', 'oncontextmenu', 'oncontextrestored', 'oncopy', 'oncuechange', 'oncut', 'ondblclick', 'ondrag', 'ondragend', 'ondragenter', 'ondragleave', 'ondragover', 'ondragstart', 'ondrop', 'ondurationchange', 'onemptied', 'onended', 'onerror', 'onfocus', 'onformdata', 'ongotpointercapture', 'oninput', 'oninvalid', 'onkeydown', 'onkeypress', 'onkeyup', 'onload', 'onloadeddata', 'onloadedmetadata', 'onloadstart', 'onlostpointercapture', 'onmousedown', 'onmouseenter', 'onmouseleave', 'onmousemove', 'onmouseout', 'onmouseover', 'onmouseup', 'onmousewheel', 'onpaste', 'onpause', 'onplay', 'onplaying', 'onpointercancel', 'onpointerdown', 'onpointerenter', 'onpointerleave', 'onpointermove', 'onpointerout', 'onpointerover', 'onpointerrawupdate', 'onpointerup', 'onprogress', 'onratechange', 'onreset', 'onresize', 'onscroll', 'onscrollend', 'onscrollsnapchange', 'onscrollsnapchanging', 'onsecuritypolicyviolation', 'onseeked', 'onseeking', 'onselect', 'onselectionchange', 'onselectstart', 'onslotchange', 'onstalled', 'onsubmit', 'onsuspend', 'ontimeupdate', 'ontoggle', 'ontransitioncancel', 'ontransitionend', 'ontransitionrun', 'ontransitionstart', 'onvolumechange', 'onwaiting', 'onwebkitanimationend', 'onwebkitanimationiteration', 'onwebkitanimationstart', 'onwebkittransitionend', 'onwheel', 'outerText', 'popover', 'showPopover', 'spellcheck', 'style', 'tabIndex', 'title', 'togglePopover', 'translate', 'virtualKeyboardPolicy', 'writingSuggestions']);
+const _CHROME_SVG_ELEMENT_MEMBERS = new Set(['attributeStyleMap', 'autofocus', 'blur', 'className', 'dataset', 'focus', 'nonce', 'onabort', 'onanimationcancel', 'onanimationend', 'onanimationiteration', 'onanimationstart', 'onauxclick', 'onbeforeinput', 'onbeforematch', 'onbeforetoggle', 'onbeforexrselect', 'onblur', 'oncancel', 'oncanplay', 'oncanplaythrough', 'onchange', 'onclick', 'onclose', 'oncommand', 'oncontentvisibilityautostatechange', 'oncontextlost', 'oncontextmenu', 'oncontextrestored', 'oncopy', 'oncuechange', 'oncut', 'ondblclick', 'ondrag', 'ondragend', 'ondragenter', 'ondragleave', 'ondragover', 'ondragstart', 'ondrop', 'ondurationchange', 'onemptied', 'onended', 'onerror', 'onfocus', 'onformdata', 'ongotpointercapture', 'oninput', 'oninvalid', 'onkeydown', 'onkeypress', 'onkeyup', 'onload', 'onloadeddata', 'onloadedmetadata', 'onloadstart', 'onlostpointercapture', 'onmousedown', 'onmouseenter', 'onmouseleave', 'onmousemove', 'onmouseout', 'onmouseover', 'onmouseup', 'onmousewheel', 'onpaste', 'onpause', 'onplay', 'onplaying', 'onpointercancel', 'onpointerdown', 'onpointerenter', 'onpointerleave', 'onpointermove', 'onpointerout', 'onpointerover', 'onpointerrawupdate', 'onpointerup', 'onprogress', 'onratechange', 'onreset', 'onresize', 'onscroll', 'onscrollend', 'onscrollsnapchange', 'onscrollsnapchanging', 'onsecuritypolicyviolation', 'onseeked', 'onseeking', 'onselect', 'onselectionchange', 'onselectstart', 'onslotchange', 'onstalled', 'onsubmit', 'onsuspend', 'ontimeupdate', 'ontoggle', 'ontransitioncancel', 'ontransitionend', 'ontransitionrun', 'ontransitionstart', 'onvolumechange', 'onwaiting', 'onwebkitanimationend', 'onwebkitanimationiteration', 'onwebkitanimationstart', 'onwebkittransitionend', 'onwheel', 'ownerSVGElement', 'style', 'tabIndex', 'viewportElement']);
+const _CHROME_SVG_GRAPHICS_MEMBERS = new Set(['farthestViewportElement', 'getBBox', 'getCTM', 'getScreenCTM', 'nearestViewportElement', 'requiredExtensions', 'systemLanguage', 'transform']);
+const _CHROME_INTERFACE_OWNERS = {"abbr":["HTMLTableCellElement"],"accept":["HTMLInputElement"],"acceptCharset":["HTMLFormElement"],"action":["HTMLFormElement"],"add":["HTMLSelectElement"],"allow":["HTMLIFrameElement"],"alt":["HTMLInputElement","HTMLImageElement","HTMLAreaElement"],"areas":["HTMLMapElement"],"as":["HTMLLinkElement"],"assign":["HTMLSlotElement"],"assignedElements":["HTMLSlotElement"],"assignedNodes":["HTMLSlotElement"],"async":["SVGScriptElement","HTMLScriptElement"],"autocomplete":["HTMLTextAreaElement","HTMLSelectElement","HTMLInputElement","HTMLFormElement"],"caption":["HTMLTableElement"],"captureStream":["HTMLMediaElement","HTMLCanvasElement"],"cellIndex":["HTMLTableCellElement"],"cells":["HTMLTableRowElement"],"charset":["HTMLScriptElement","HTMLLinkElement","HTMLAnchorElement"],"checkValidity":["HTMLTextAreaElement","HTMLSelectElement","HTMLOutputElement","HTMLObjectElement","HTMLInputElement","HTMLFormElement","HTMLFieldSetElement","HTMLButtonElement"],"checked":["HTMLInputElement"],"cite":["HTMLQuoteElement","HTMLModElement"],"close":["HTMLDialogElement"],"colSpan":["HTMLTableCellElement"],"cols":["HTMLTextAreaElement","HTMLFrameSetElement"],"content":["HTMLTemplateElement","HTMLMetaElement"],"contentDocument":["HTMLObjectElement","HTMLIFrameElement","HTMLFrameElement"],"contentWindow":["HTMLObjectElement","HTMLIFrameElement","HTMLFrameElement"],"control":["HTMLLabelElement"],"coords":["HTMLAreaElement","HTMLAnchorElement"],"createCaption":["HTMLTableElement"],"createTFoot":["HTMLTableElement"],"createTHead":["HTMLTableElement"],"crossOrigin":["SVGImageElement","HTMLScriptElement","HTMLMediaElement","HTMLLinkElement","HTMLImageElement"],"currentTime":["HTMLMediaElement"],"data":["HTMLObjectElement"],"dateTime":["HTMLTimeElement","HTMLModElement"],"default":["HTMLTrackElement"],"defaultChecked":["HTMLInputElement"],"defaultSelected":["HTMLOptionElement"],"defaultValue":["HTMLTextAreaElement","HTMLOutputElement","HTMLInputElement"],"defer":["HTMLScriptElement"],"deleteCell":["HTMLTableRowElement"],"deleteRow":["HTMLTableSectionElement","HTMLTableElement"],"disabled":["SVGStyleElement","HTMLTextAreaElement","HTMLStyleElement","HTMLSelectElement","HTMLOptionElement","HTMLOptGroupElement","HTMLLinkElement","HTMLInputElement","HTMLFieldSetElement","HTMLButtonElement"],"download":["SVGAElement","HTMLAreaElement","HTMLAnchorElement"],"duration":["HTMLMediaElement"],"elements":["HTMLFormElement","HTMLFieldSetElement"],"enctype":["HTMLFormElement"],"files":["HTMLInputElement"],"form":["HTMLTextAreaElement","HTMLSelectElement","HTMLOutputElement","HTMLOptionElement","HTMLObjectElement","HTMLLegendElement","HTMLLabelElement","HTMLInputElement","HTMLFieldSetElement","HTMLButtonElement"],"getContext":["HTMLCanvasElement"],"hash":["HTMLAreaElement","HTMLAnchorElement"],"headers":["HTMLTableCellElement"],"height":["SVGUseElement","SVGSVGElement","SVGRectElement","SVGPatternElement","SVGMaskElement","SVGImageElement","SVGForeignObjectElement","HTMLVideoElement","HTMLTableCellElement","HTMLSourceElement","HTMLObjectElement","HTMLMarqueeElement","HTMLInputElement","HTMLImageElement","HTMLIFrameElement","HTMLEmbedElement","HTMLCanvasElement"],"high":["HTMLMeterElement"],"host":["HTMLAreaElement","HTMLAnchorElement"],"hostname":["HTMLAreaElement","HTMLAnchorElement"],"href":["SVGUseElement","SVGTextPathElement","SVGScriptElement","SVGPatternElement","SVGImageElement","SVGGradientElement","SVGAElement","HTMLLinkElement","HTMLBaseElement","HTMLAreaElement","HTMLAnchorElement"],"htmlFor":["HTMLScriptElement","HTMLOutputElement","HTMLLabelElement"],"httpEquiv":["HTMLMetaElement"],"indeterminate":["HTMLInputElement"],"index":["HTMLOptionElement"],"insertCell":["HTMLTableRowElement"],"insertRow":["HTMLTableSectionElement","HTMLTableElement"],"integrity":["HTMLScriptElement","HTMLLinkElement"],"kind":["HTMLTrackElement"],"label":["HTMLTrackElement","HTMLOptionElement","HTMLOptGroupElement"],"labels":["HTMLTextAreaElement","HTMLSelectElement","HTMLProgressElement","HTMLOutputElement","HTMLMeterElement","HTMLInputElement","HTMLButtonElement"],"list":["HTMLInputElement"],"loading":["HTMLMediaElement","HTMLImageElement","HTMLIFrameElement"],"low":["HTMLMeterElement"],"max":["HTMLProgressElement","HTMLMeterElement","HTMLInputElement"],"maxLength":["HTMLTextAreaElement","HTMLInputElement"],"media":["SVGStyleElement","HTMLStyleElement","HTMLSourceElement","HTMLMetaElement","HTMLLinkElement"],"method":["SVGTextPathElement","HTMLFormElement"],"min":["HTMLMeterElement","HTMLInputElement"],"minLength":["HTMLTextAreaElement","HTMLInputElement"],"multiple":["HTMLSelectElement","HTMLInputElement"],"muted":["HTMLMediaElement"],"name":["HTMLTextAreaElement","HTMLSlotElement","HTMLSelectElement","HTMLParamElement","HTMLOutputElement","HTMLObjectElement","HTMLMetaElement","HTMLMapElement","HTMLInputElement","HTMLImageElement","HTMLIFrameElement","HTMLFrameElement","HTMLFormElement","HTMLFieldSetElement","HTMLEmbedElement","HTMLDetailsElement","HTMLButtonElement","HTMLAnchorElement"],"noModule":["HTMLScriptElement"],"noValidate":["HTMLFormElement"],"open":["HTMLDialogElement","HTMLDetailsElement"],"optimum":["HTMLMeterElement"],"options":["HTMLSelectElement","HTMLDataListElement"],"origin":["HTMLAreaElement","HTMLAnchorElement"],"pathname":["HTMLAreaElement","HTMLAnchorElement"],"pattern":["HTMLInputElement"],"pause":["HTMLMediaElement"],"paused":["HTMLMediaElement"],"placeholder":["HTMLTextAreaElement","HTMLInputElement"],"play":["HTMLMediaElement"],"port":["HTMLAreaElement","HTMLAnchorElement"],"position":["HTMLProgressElement"],"poster":["HTMLVideoElement"],"protocol":["HTMLAreaElement","HTMLAnchorElement"],"readOnly":["HTMLTextAreaElement","HTMLInputElement"],"referrerPolicy":["SVGAElement","HTMLScriptElement","HTMLLinkElement","HTMLImageElement","HTMLIFrameElement","HTMLAreaElement","HTMLAnchorElement"],"rel":["SVGAElement","HTMLLinkElement","HTMLFormElement","HTMLAreaElement","HTMLAnchorElement"],"relList":["SVGAElement","HTMLLinkElement","HTMLFormElement","HTMLAreaElement","HTMLAnchorElement"],"remove":["HTMLSelectElement"],"reportValidity":["HTMLTextAreaElement","HTMLSelectElement","HTMLOutputElement","HTMLObjectElement","HTMLInputElement","HTMLFormElement","HTMLFieldSetElement","HTMLButtonElement"],"requestSubmit":["HTMLFormElement"],"required":["HTMLTextAreaElement","HTMLSelectElement","HTMLInputElement"],"reset":["HTMLFormElement"],"returnValue":["HTMLDialogElement"],"reversed":["HTMLOListElement"],"rowIndex":["HTMLTableRowElement"],"rowSpan":["HTMLTableCellElement"],"rows":["HTMLTextAreaElement","HTMLTableSectionElement","HTMLTableElement","HTMLFrameSetElement"],"sandbox":["HTMLIFrameElement"],"scope":["HTMLTableCellElement"],"search":["HTMLAreaElement","HTMLAnchorElement"],"sectionRowIndex":["HTMLTableRowElement"],"select":["HTMLTextAreaElement","HTMLInputElement"],"selected":["HTMLOptionElement"],"selectedIndex":["HTMLSelectElement"],"selectedOptions":["HTMLSelectElement"],"selectionDirection":["HTMLTextAreaElement","HTMLInputElement"],"selectionEnd":["HTMLTextAreaElement","HTMLInputElement"],"selectionStart":["HTMLTextAreaElement","HTMLInputElement"],"setCustomValidity":["HTMLTextAreaElement","HTMLSelectElement","HTMLOutputElement","HTMLObjectElement","HTMLInputElement","HTMLFieldSetElement","HTMLButtonElement"],"setRangeText":["HTMLTextAreaElement","HTMLInputElement"],"setSelectionRange":["HTMLTextAreaElement","HTMLInputElement"],"shape":["HTMLAreaElement","HTMLAnchorElement"],"sheet":["SVGStyleElement","HTMLStyleElement","HTMLLinkElement"],"show":["HTMLDialogElement"],"showModal":["HTMLDialogElement"],"size":["HTMLSelectElement","HTMLInputElement","HTMLHRElement","HTMLFontElement"],"sizes":["HTMLSourceElement","HTMLLinkElement","HTMLImageElement"],"span":["HTMLTableColElement"],"src":["HTMLTrackElement","HTMLSourceElement","HTMLScriptElement","HTMLMediaElement","HTMLInputElement","HTMLImageElement","HTMLIFrameElement","HTMLFrameElement","HTMLEmbedElement"],"srcdoc":["HTMLIFrameElement"],"srclang":["HTMLTrackElement"],"srcset":["HTMLSourceElement","HTMLImageElement"],"start":["HTMLOListElement","HTMLMarqueeElement"],"step":["HTMLInputElement"],"stepDown":["HTMLInputElement"],"stepUp":["HTMLInputElement"],"submit":["HTMLFormElement"],"tBodies":["HTMLTableElement"],"tFoot":["HTMLTableElement"],"tHead":["HTMLTableElement"],"target":["SVGAElement","HTMLLinkElement","HTMLFormElement","HTMLBaseElement","HTMLAreaElement","HTMLAnchorElement"],"text":["HTMLTitleElement","HTMLScriptElement","HTMLOptionElement","HTMLBodyElement","HTMLAnchorElement"],"toBlob":["HTMLCanvasElement"],"toDataURL":["HTMLCanvasElement"],"track":["HTMLTrackElement"],"type":["SVGStyleElement","SVGScriptElement","SVGAElement","HTMLUListElement","HTMLTextAreaElement","HTMLStyleElement","HTMLSourceElement","HTMLSelectElement","HTMLScriptElement","HTMLParamElement","HTMLOutputElement","HTMLObjectElement","HTMLOListElement","HTMLLinkElement","HTMLLIElement","HTMLInputElement","HTMLFieldSetElement","HTMLEmbedElement","HTMLButtonElement","HTMLAnchorElement"],"validationMessage":["HTMLTextAreaElement","HTMLSelectElement","HTMLOutputElement","HTMLObjectElement","HTMLInputElement","HTMLFieldSetElement","HTMLButtonElement"],"validity":["HTMLTextAreaElement","HTMLSelectElement","HTMLOutputElement","HTMLObjectElement","HTMLInputElement","HTMLFieldSetElement","HTMLButtonElement"],"value":["HTMLTextAreaElement","HTMLSelectElement","HTMLProgressElement","HTMLParamElement","HTMLOutputElement","HTMLOptionElement","HTMLMeterElement","HTMLLIElement","HTMLInputElement","HTMLDataElement","HTMLButtonElement"],"valueAsNumber":["HTMLInputElement"],"videoHeight":["HTMLVideoElement"],"videoWidth":["HTMLVideoElement"],"volume":["HTMLMediaElement"],"width":["SVGUseElement","SVGSVGElement","SVGRectElement","SVGPatternElement","SVGMaskElement","SVGImageElement","SVGForeignObjectElement","HTMLVideoElement","HTMLTableElement","HTMLTableColElement","HTMLTableCellElement","HTMLSourceElement","HTMLPreElement","HTMLObjectElement","HTMLMarqueeElement","HTMLInputElement","HTMLImageElement","HTMLIFrameElement","HTMLHRElement","HTMLEmbedElement","HTMLCanvasElement"],"willValidate":["HTMLTextAreaElement","HTMLSelectElement","HTMLOutputElement","HTMLObjectElement","HTMLInputElement","HTMLFieldSetElement","HTMLButtonElement"],"wrap":["HTMLTextAreaElement"]};
+// A few interfaces with behaviour of their own are declared further down the
+// file than the hierarchy above, so their `class X extends Element` replaced the
+// re-parented version and left HTMLElement out of their chain -- a textarea
+// reached Element.prototype directly and lost everything HTMLElement owns.
+// Settle the chain here, once every declaration has run.
+(function _enforceElementHierarchy() {
+  const nested = { HTMLVideoElement: 'HTMLMediaElement', HTMLAudioElement: 'HTMLMediaElement' };
+  for (const name of Object.getOwnPropertyNames(globalThis)) {
+    if (name === 'HTMLElement' || !/^HTML\w*Element$/.test(name)) continue;
+    let ctor;
+    try { ctor = globalThis[name]; } catch (_e) { continue; }
+    if (typeof ctor !== 'function' || !ctor.prototype || ctor === Element) continue;
+    const parent = globalThis[nested[name] || 'HTMLElement'];
+    if (typeof parent !== 'function' || parent === ctor) continue;
+    if (Object.getPrototypeOf(ctor.prototype) === parent.prototype) continue;
+    try {
+      Object.setPrototypeOf(ctor.prototype, parent.prototype);
+      Object.setPrototypeOf(ctor, parent);
+    } catch (_e) {}
+  }
+})();
+
+(function _partitionElementSurface() {
+  const install = (target, member, descriptor) => {
+    if (!target || target === Element.prototype) return false;
+    if (Object.prototype.hasOwnProperty.call(target, member)) return true;
+    try { Object.defineProperty(target, member, descriptor); return true; } catch (_e) { return false; }
+  };
+  for (const member of Object.getOwnPropertyNames(Element.prototype)) {
+    if (member === 'constructor' || member.charCodeAt(0) === 95) continue; // '_' is ours
+    if (_CHROME_ELEMENT_MEMBERS.has(member)) continue;
     const descriptor = Object.getOwnPropertyDescriptor(Element.prototype, member);
     if (!descriptor) continue;
-    try { Object.defineProperty(ctor.prototype, member, descriptor); } catch (_e) {}
+    let placed = false;
+    if (_CHROME_HTML_ELEMENT_MEMBERS.has(member)) {
+      placed = install(globalThis.HTMLElement.prototype, member, descriptor) || placed;
+    }
+    if (_CHROME_SVG_ELEMENT_MEMBERS.has(member)) {
+      placed = install(globalThis.SVGElement.prototype, member, descriptor) || placed;
+    }
+    if (_CHROME_SVG_GRAPHICS_MEMBERS.has(member)) {
+      placed = install(globalThis.SVGGraphicsElement.prototype, member, descriptor) || placed;
+    }
+    // Chrome puts the GlobalEventHandlers set on Document as well as on
+    // HTMLElement, so `'oninput' in document` holds without Element carrying it.
+    if (member.charCodeAt(0) === 111 && member.charCodeAt(1) === 110
+        && (_CHROME_HTML_ELEMENT_MEMBERS.has(member) || _CHROME_ELEMENT_MEMBERS.has(member))) {
+      placed = install(globalThis.Document.prototype, member, descriptor) || placed;
+    }
+    const owners = _CHROME_INTERFACE_OWNERS[member];
+    if (owners) {
+      for (const name of owners) {
+        const ctor = globalThis[name];
+        if (typeof ctor === 'function') placed = install(ctor.prototype, member, descriptor) || placed;
+      }
+    }
+    // Only give it up once it has somewhere else to live.
+    if (placed) { try { delete Element.prototype[member]; } catch (_e) {} }
   }
-}
+})();
 
 (function _tagInterfacePrototypes() {
   const factories = new Set(['Image', 'Audio', 'Option', 'webkitURL', 'webkitAudioContext']);

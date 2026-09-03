@@ -15076,7 +15076,13 @@ mod tests {
                     docInput: ('oninput' in document),
                     docChange: ('onchange' in document),
                     docClick: ('onclick' in document),
+                    elInput: ('oninput' in document.createElement('div')),
+                    svgInput: ('oninput' in document.createElementNS('http://www.w3.org/2000/svg', 'rect')),
+                    // Chrome mixes GlobalEventHandlers into HTMLElement, SVGElement,
+                    // Document and Window -- never into Element itself, so an element
+                    // reaches them through its own interface, not through Element.
                     elProtoInput: ('oninput' in Element.prototype),
+                    onHtmlProto: Object.prototype.hasOwnProperty.call(HTMLElement.prototype, 'oninput'),
                     winInput: ('oninput' in window)
                 })"#,
             )
@@ -15085,7 +15091,10 @@ mod tests {
         assert_eq!(p["docInput"], true);
         assert_eq!(p["docChange"], true);
         assert_eq!(p["docClick"], true);
-        assert_eq!(p["elProtoInput"], true);
+        assert_eq!(p["elInput"], true);
+        assert_eq!(p["svgInput"], true);
+        assert_eq!(p["elProtoInput"], false);
+        assert_eq!(p["onHtmlProto"], true);
         assert_eq!(p["winInput"], true);
     }
 
