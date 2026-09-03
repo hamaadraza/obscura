@@ -5631,6 +5631,252 @@ mod tests {
         assert_eq!(result, serde_json::json!([true, "text-justify: inter-word;"]));
     }
 
+    /// A custom property carries a token stream that is allowed to be empty,
+    /// so `--empty:;` is a real declaration and has to survive serialization;
+    /// a standard property with no value is not a declaration and never
+    /// reaches the block. The two paths differ again on setProperty, where
+    /// CSSOM makes the empty string remove whatever the property is, and only
+    /// a whitespace value declares an empty custom property.
+    ///
+    /// Every expectation here was read back from Chromium 148 directly.
+    #[test]
+    fn an_empty_custom_property_is_a_declaration_and_a_standard_one_is_not() {
+        let mut rt = setup_runtime("<html><body><div id=\"box\"></div></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const el = document.getElementById("box");
+                el.setAttribute("style", "--a: 10px; --empty:; --list: 1, 2, 3; color: red");
+                const parsed = [
+                    el.style.cssText,
+                    el.style.length,
+                    el.style.item(1),
+                    el.style.getPropertyValue("--empty"),
+                ];
+
+                // An empty standard declaration is dropped on the way in.
+                const dropped = document.createElement("div");
+                dropped.setAttribute("style", "color:; margin: 1px");
+
+                // Whitespace is not a value for a standard property either.
+                const wsStandard = document.createElement("div");
+                wsStandard.setAttribute("style", "--e:\t ; color:  ; margin: 1px");
+
+                // setProperty: the empty string removes, custom or not.
+                const custom = document.createElement("div");
+                custom.style.setProperty("--x", "a");
+                custom.style.setProperty("--x", "");
+                const customRemoved = custom.style.cssText;
+                custom.style.setProperty("--x", " ");
+                const customEmptied = custom.style.cssText;
+
+                const standard = document.createElement("div");
+                standard.style.setProperty("color", "red");
+                standard.style.setProperty("color", "");
+                const standardRemoved = standard.style.cssText;
+
+                // The store is what reflects back onto the attribute.
+                el.style.setProperty("margin", "1px");
+
+                return [
+                    parsed,
+                    dropped.style.cssText,
+                    wsStandard.style.cssText,
+                    customRemoved,
+                    customEmptied,
+                    standardRemoved,
+                    el.getAttribute("style"),
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                ["--a: 10px; --empty: ; --list: 1, 2, 3; color: red;", 4, "--empty", ""],
+                "margin: 1px;",
+                "--e: ; margin: 1px;",
+                "",
+                "--x: ;",
+                "",
+                "--a: 10px; --empty: ; --list: 1, 2, 3; color: red; margin: 1px;",
+            ])
+        );
+    }
+
+    /// Custom property names are case-sensitive and are never re-spelled.
+    /// `--myVar` and `--MyVar` are two declarations, both kept as written, and
+    /// neither answers to `--my-var` or `--myvar`. Running them through the
+    /// camelCase-to-dashed mapping that standard IDL names need collapsed the
+    /// pair and made a theme variable readable under a name the page never
+    /// wrote. Standard properties keep that mapping, since `el.style.fontSize`
+    /// and `font-size` do have to meet on one key.
+    ///
+    /// Every expectation here was read back from Chromium 148 directly.
+    #[test]
+    fn custom_property_names_keep_their_case_and_are_never_re_spelled() {
+        let mut rt = setup_runtime("<html><body><div id=\"box\"></div></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const el = document.getElementById("box");
+                el.setAttribute(
+                    "style",
+                    "--myVar: 1px; --MyVar: 2px; --plain: 3px; font-size: 4px"
+                );
+                const parsed = [
+                    el.style.cssText,
+                    el.style.length,
+                    Array.from({ length: el.style.length }, (_, i) => el.style.item(i)),
+                ];
+                const reads = [
+                    el.style.getPropertyValue("--myVar"),
+                    el.style.getPropertyValue("--MyVar"),
+                    el.style.getPropertyValue("--my-var"),
+                    el.style.getPropertyValue("--myvar"),
+                ];
+
+                // setProperty keeps the spelling too, all the way to the attribute.
+                const set = document.createElement("div");
+                set.style.setProperty("--fooBar", "1px");
+                const written = [
+                    set.style.cssText,
+                    set.getAttribute("style"),
+                    set.style.getPropertyValue("--fooBar"),
+                    set.style.getPropertyValue("--foo-bar"),
+                ];
+
+                // removeProperty is case-sensitive: the wrong case removes nothing.
+                const gone = document.createElement("div");
+                gone.setAttribute("style", "--fooBar: 1px");
+                const wrongCase = [gone.style.removeProperty("--foobar"), gone.style.cssText];
+                const rightCase = [gone.style.removeProperty("--fooBar"), gone.style.cssText];
+
+                // The IDL mapping standard properties rely on is untouched.
+                const standard = document.createElement("div");
+                standard.style.fontSize = "5px";
+                const idl = [standard.style.cssText, standard.style.getPropertyValue("font-size")];
+
+                return [parsed, reads, written, wrongCase, rightCase, idl];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [
+                    "--myVar: 1px; --MyVar: 2px; --plain: 3px; font-size: 4px;",
+                    4,
+                    ["--myVar", "--MyVar", "--plain", "font-size"],
+                ],
+                ["1px", "2px", "", ""],
+                ["--fooBar: 1px;", "--fooBar: 1px;", "1px", ""],
+                ["", "--fooBar: 1px;"],
+                ["1px", ""],
+                ["font-size: 5px;", "5px"],
+            ])
+        );
+    }
+
+    /// CSS names and IDL names are two different name spaces, and one mapper
+    /// serving both is how `COLOR: red` came to be stored as `-c-o-l-o-r`.
+    ///
+    /// A CSS name -- the style attribute, setProperty, getPropertyValue,
+    /// removeProperty -- folds to lower case for a standard property and never
+    /// carries a camelCase spelling. An IDL name -- `el.style.fontSize`, and
+    /// the dashed `el.style["font-size"]` -- is camelCase, gives a
+    /// `webkit`-prefixed name the leading dash its property has, maps
+    /// `cssFloat` to `float`, and has no custom properties in it at all.
+    ///
+    /// Every expectation here was read back from Chromium 148 directly.
+    #[test]
+    fn css_names_and_idl_names_are_separate_name_spaces() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const mk = () => document.createElement("div");
+
+                // CSS names fold case; the attribute takes them too.
+                const css = mk();
+                css.style.setProperty("COLOR", "red");
+                css.style.setProperty("FONT-SIZE", "2px");
+                css.style.setProperty("-WEBKIT-LINE-CLAMP", "2");
+                const folded = [
+                    css.style.cssText,
+                    css.style.getPropertyValue("FONT-SIZE"),
+                    css.style.getPropertyValue("font-size"),
+                    // An IDL spelling is not a CSS name and reads as unset.
+                    css.style.getPropertyValue("fontSize"),
+                ];
+                const attr = mk();
+                attr.setAttribute("style", "COLOR: red; Font-Size: 3px");
+                const removed = [css.style.removeProperty("COLOR"), css.style.getPropertyValue("color")];
+
+                // IDL names: camelCase, dashed, webkit-prefixed, cssFloat.
+                const camel = mk(); camel.style.fontSize = "9px";
+                const dashed = mk(); dashed.style["font-size"] = "9px";
+                const webkit = mk(); webkit.style.webkitLineClamp = "2";
+                const webkitCap = mk(); webkitCap.style.WebkitLineClamp = "2";
+                const float = mk(); float.style.cssFloat = "left";
+
+                // A custom property is not an IDL attribute: assigning one
+                // through property access declares nothing and leaves an expando.
+                const expando = mk();
+                expando.style["--x"] = "1px";
+                const asExpando = [
+                    expando.style.cssText,
+                    String(expando.style["--x"]),
+                    expando.style.getPropertyValue("--x"),
+                    Object.prototype.hasOwnProperty.call(expando.style, "--x"),
+                ];
+
+                // Nor does it enumerate or answer `in`.
+                const decl = mk();
+                decl.setAttribute("style", "font-size: 2px; --custom: 1px");
+                const membership = [
+                    String(decl.style["--custom"]),
+                    "--custom" in decl.style,
+                    "fontSize" in decl.style,
+                    "font-size" in decl.style,
+                    Object.keys(decl.style).includes("--custom"),
+                    String(Object.getOwnPropertyDescriptor(decl.style, "--custom")),
+                    // ...but it is still a declaration, reachable the one way.
+                    decl.style.getPropertyValue("--custom"),
+                    decl.style.length,
+                ];
+
+                return [
+                    folded,
+                    attr.style.cssText,
+                    removed,
+                    [camel.style.cssText, dashed.style.cssText, webkit.style.cssText,
+                     webkitCap.style.cssText, float.style.cssText],
+                    asExpando,
+                    membership,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                ["color: red; font-size: 2px; -webkit-line-clamp: 2;", "2px", "2px", ""],
+                "color: red; font-size: 3px;",
+                ["red", ""],
+                [
+                    "font-size: 9px;",
+                    "font-size: 9px;",
+                    "-webkit-line-clamp: 2;",
+                    "-webkit-line-clamp: 2;",
+                    "float: left;",
+                ],
+                ["", "1px", "", true],
+                ["undefined", false, true, true, false, "undefined", "1px", 2],
+            ])
+        );
+    }
+
     #[test]
     fn image_data_reports_its_class() {
         let mut rt = setup_runtime("<html><body></body></html>");

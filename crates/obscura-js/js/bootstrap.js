@@ -1629,8 +1629,42 @@ class MessageChannel {
 globalThis.MessageChannel = MessageChannel;
 globalThis.MessagePort = MessagePort;
 
+// A custom property carries an arbitrary token stream, and that stream is
+// allowed to be empty: `--x:;` declares --x with the value "". A standard
+// property with no value is not a declaration at all and is dropped.
+const _isCustomProperty = (name) => name.startsWith("--");
 const _cssCamelToKebab = (s) => s.replace(/[A-Z]/g, (m) => "-" + m.toLowerCase());
 const _cssKebabToCamel = (s) => s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+// Two different name spaces reach a declaration block, and conflating them
+// is how `COLOR: red` came to be stored as `-c-o-l-o-r`.
+//
+// A CSS name is what the style attribute, setProperty, getPropertyValue and
+// removeProperty take. Standard ones are ASCII case-insensitive, so they
+// fold to lower case; custom ones are case-sensitive and kept exactly as
+// written, which is why `--myVar` and `--MyVar` are two declarations and
+// neither answers to `--my-var`. Neither is ever spelled in camelCase.
+const _cssNameKey = (name) => {
+  const s = String(name);
+  return _isCustomProperty(s) ? s : s.toLowerCase();
+};
+
+// An IDL name is what property access on the declaration takes:
+// `el.style.fontSize`, and the dashed spelling `el.style["font-size"]`.
+// A `webkit`-prefixed name gains the leading dash the CSS property has
+// (`webkitLineClamp` and `WebkitLineClamp` both name `-webkit-line-clamp`),
+// and `cssFloat` names `float`. A custom property is not an IDL attribute
+// at all, so this answers null and each trap decides what that means.
+const _cssIdlKey = (name) => {
+  const s = String(name);
+  if (_isCustomProperty(s)) return null;
+  if (s === "cssFloat") return "float";
+  const dashed = _cssCamelToKebab(s.charAt(0).toLowerCase() + s.slice(1));
+  return dashed.startsWith("webkit-") ? "-" + dashed : dashed;
+};
+
+// The IDL spelling of a stored key, for enumeration.
+const _cssIdlName = (key) =>
+  _cssKebabToCamel(key.startsWith("-webkit-") ? key.slice(1) : key);
 
 // Standard CSS property names (camelCase). Real CSSStyleDeclaration exposes every
 // property as an enumerable accessor, so feature-detection code (`'gap' in
@@ -1705,7 +1739,11 @@ function _parseCssInto(props, text) {
   for (const k in props) delete props[k];
   if (text) _splitCssDeclarations(text).forEach((p) => {
     const i = p.indexOf(":");
-    if (i > 0) { const k = p.slice(0, i).trim(); const v = p.slice(i + 1).trim(); if (k && v) props[_cssCamelToKebab(k)] = v; }
+    if (i > 0) {
+      const k = p.slice(0, i).trim();
+      const v = p.slice(i + 1).trim();
+      if (k && (v || _isCustomProperty(k))) props[_cssNameKey(k)] = v;
+    }
   });
 }
 // Declaration values routinely contain semicolons in quoted `content`, data
@@ -1795,16 +1833,24 @@ class CSSStyleDeclaration {
   // getPropertyValue('font-size') and el.style.fontSize stay in sync.
   setProperty(name, value) {
     this._pull();
-    const k = _cssCamelToKebab(String(name));
+    const k = _cssNameKey(name);
     // Withheld by the version gate: the presented browser does not know the
     // property, so the declaration is dropped as Chrome drops an unknown one.
     if (_cssGatedOut.has(k)) return;
-    if (value === "" || value == null) delete this._props[k];
-    else this._props[k] = String(value);
+    if (value === "" || value == null) {
+      // Per CSSOM the empty string invokes removeProperty, custom property
+      // included; declaring an empty one through this path takes a
+      // whitespace value, which trims away but still declares.
+      delete this._props[k];
+    } else {
+      const v = String(value).trim();
+      if (v === "" && !_isCustomProperty(k)) delete this._props[k];
+      else this._props[k] = v;
+    }
     this._push();
   }
-  removeProperty(name) { this._pull(); const k = _cssCamelToKebab(String(name)); const old = this._props[k]; delete this._props[k]; this._push(); return old || ""; }
-  getPropertyValue(name) { this._pull(); return this._props[_cssCamelToKebab(String(name))] || ""; }
+  removeProperty(name) { this._pull(); const k = _cssNameKey(name); const old = this._props[k]; delete this._props[k]; this._push(); return old || ""; }
+  getPropertyValue(name) { this._pull(); return this._props[_cssNameKey(name)] || ""; }
   getPropertyPriority() { return ""; }
   get cssText() { this._pull(); return _serializeCss(this._props); }
   set cssText(v) {
@@ -1820,7 +1866,12 @@ const _styleProxy = (decl) => new Proxy(decl, {
   get(t, p) {
     if (typeof p === "symbol" || p in t) return t[p];
     if (/^\d+$/.test(p)) return t.item(+p);
-    return t.getPropertyValue(p);
+    const key = _cssIdlKey(p);
+    // Reading a custom property off the declaration gives undefined: it is
+    // reachable through getPropertyValue and nowhere else.
+    if (key === null) return undefined;
+    t._pull();
+    return t._props[key] || "";
   },
   set(t, p, v) {
     if (typeof p === "symbol") { t[p] = v; return true; }
@@ -1828,18 +1879,27 @@ const _styleProxy = (decl) => new Proxy(decl, {
     if (p === "cssText") { t.cssText = v; return true; }
     if (p in t) { Reflect.set(t, p, v); return true; }
     if (/^\d+$/.test(p)) return true;
+    const key = _cssIdlKey(p);
+    // A custom property is not an IDL attribute, so assigning one through
+    // property access leaves a plain expando and declares nothing.
     // A name the presented version does not know is not a CSS property to
-    // it: assignment leaves a plain expando, as it does on Chrome, rather
+    // it either: assignment leaves an expando, as it does on Chrome, rather
     // than a declaration that would surface in cssText.
-    if (_cssGatedOut.has(_cssCamelToKebab(p))) { Reflect.set(t, p, v); return true; }
-    t.setProperty(p, v);
+    if (key === null || _cssGatedOut.has(key)) { Reflect.set(t, p, v); return true; }
+    t.setProperty(key, v);
     return true;
   },
   has(t, p) {
     if (typeof p !== "string") return Reflect.has(t, p);
     if (p in Object.getPrototypeOf(t)) return true;
+    // An expando assigned through property access, custom names included.
+    // The declaration's own bookkeeping is non-enumerable and stays hidden.
+    const own = Reflect.getOwnPropertyDescriptor(t, p);
+    if (own && own.enumerable) return true;
+    const key = _cssIdlKey(p);
+    if (key === null) return false;
     t._pull();
-    if (_cssCamelToKebab(p) in t._props) return true;
+    if (key in t._props) return true;
     if (_CSS_PROP_SET.has(p) || _CSS_PROP_SET.has(_cssKebabToCamel(p))) return true;
     return /^\d+$/.test(p) && +p < t.length;
   },
@@ -1849,7 +1909,10 @@ const _styleProxy = (decl) => new Proxy(decl, {
     const n = t.length;
     for (let i = 0; i < n; i++) keys.push(String(i));
     const names = new Set(_CSS_PROPERTY_NAMES);
-    for (const k of Object.keys(t._props)) names.add(_cssKebabToCamel(k));
+    // Custom properties are not IDL attributes and never enumerate here.
+    for (const k of Object.keys(t._props)) {
+      if (!_isCustomProperty(k)) names.add(_cssIdlName(k));
+    }
     for (const name of names) keys.push(name);
     return keys;
   },
@@ -1857,8 +1920,12 @@ const _styleProxy = (decl) => new Proxy(decl, {
     if (typeof p !== "string") return Reflect.getOwnPropertyDescriptor(t, p);
     t._pull();
     if (/^\d+$/.test(p) && +p < t.length) return { value: t.item(+p), writable: false, enumerable: true, configurable: true };
-    if (_cssCamelToKebab(p) in t._props || _CSS_PROP_SET.has(p) || _CSS_PROP_SET.has(_cssKebabToCamel(p))) {
-      return { value: t.getPropertyValue(p), writable: true, enumerable: true, configurable: true };
+    const own = Reflect.getOwnPropertyDescriptor(t, p);
+    if (own && own.enumerable) return own;
+    const key = _cssIdlKey(p);
+    if (key === null) return undefined;
+    if (key in t._props || _CSS_PROP_SET.has(p) || _CSS_PROP_SET.has(_cssKebabToCamel(p))) {
+      return { value: t._props[key] || "", writable: true, enumerable: true, configurable: true };
     }
     return undefined;
   },
@@ -11632,7 +11699,7 @@ const _CSS_SUPPORTED_DECLARATIONS = new Set((
   "background-position background-clip -webkit-background-clip mask-image -webkit-mask-image " +
   "mask-size -webkit-mask-size mask-repeat -webkit-mask-repeat color -webkit-text-fill-color fill " +
   "stroke stroke-width border-color font-size font font-weight font-family font-style text-align " +
-  "text-transform text-decoration text-decoration-line line-height white-space overflow-wrap word-wrap word-break text-wrap text-wrap-style align-items justify-items " +
+  "text-transform text-decoration text-decoration-line line-height white-space overflow-wrap word-wrap word-break text-wrap text-wrap-style text-justify align-items justify-items " +
   "place-items align-self justify-self place-self align-content justify-content place-content " +
   "flex-flow flex-direction flex-wrap flex-grow flex-shrink flex-basis flex order position float object-fit " +
   "top right bottom left inset overflow overflow-x overflow-y scrollbar-gutter visibility opacity animation " +
@@ -11777,6 +11844,9 @@ function _cssSupportsDeclaration(name, value) {
     return ["auto", "wrap", "balance", "wrap balance", "balance wrap"].includes(lower);
   }
   if (name === "text-wrap-style") return lower === "auto" || lower === "balance";
+  if (name === "text-justify") {
+    return ["auto", "none", "inter-word", "inter-character"].includes(lower);
+  }
   if (["filter", "backdrop-filter", "-webkit-backdrop-filter", "perspective"].includes(name)) {
     return lower === "none";
   }
