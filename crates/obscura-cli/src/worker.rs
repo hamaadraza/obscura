@@ -9,7 +9,17 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[serde(tag = "cmd")]
 enum WorkerCommand {
     #[serde(rename = "navigate")]
-    Navigate { url: String },
+    Navigate {
+        url: String,
+        /// Post-load settle budget in milliseconds. `fetch` has always
+        /// applied one; without it here, `scrape` read the page at the
+        /// `load` event and missed everything an app does after it.
+        #[serde(default)]
+        settle_ms: Option<u64>,
+        /// Spend the whole budget rather than returning once quiescent.
+        #[serde(default)]
+        settle_fixed: bool,
+    },
     #[serde(rename = "evaluate")]
     Evaluate { expression: String },
     #[serde(rename = "title")]
@@ -96,12 +106,31 @@ async fn main() {
         };
 
         let resp = match cmd {
-            WorkerCommand::Navigate { url } => {
+            WorkerCommand::Navigate {
+                url,
+                settle_ms,
+                settle_fixed,
+            } => {
                 match page.navigate(&url).await {
-                    Ok(()) => WorkerResponse::success(serde_json::json!({
-                        "title": page.title,
-                        "url": page.url_string(),
-                    })),
+                    Ok(()) => {
+                        // Navigation resolves at `load`, and an app that
+                        // boots from a dynamic `import()` has not run yet at
+                        // that point -- by design, since `import()` does not
+                        // delay `load`. Reading the page here returned the
+                        // server shell for every such app (SvelteKit sites
+                        // came back empty). Settle first, as `fetch` does.
+                        if let Some(settle_ms) = settle_ms.filter(|ms| *ms > 0) {
+                            if settle_fixed {
+                                page.settle_for_duration(settle_ms).await;
+                            } else {
+                                page.settle(settle_ms).await;
+                            }
+                        }
+                        WorkerResponse::success(serde_json::json!({
+                            "title": page.title,
+                            "url": page.url_string(),
+                        }))
+                    }
                     Err(e) => WorkerResponse::error(e.to_string()),
                 }
             }
@@ -161,5 +190,56 @@ async fn main() {
         out.push('\n');
         let _ = stdout.write_all(out.as_bytes()).await;
         let _ = stdout.flush().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The settle budget rides on the navigate command, and nothing else tells
+    /// the worker to wait. If these field names drift apart from the driver's,
+    /// serde quietly fills in the defaults, `scrape` goes back to reading the
+    /// page at the `load` event, and every app that boots from a dynamic
+    /// `import()` comes back as the bare server shell -- with no error anywhere
+    /// to say so. That silence is why this is pinned.
+    #[test]
+    fn navigate_carries_the_settle_budget() {
+        let cmd: WorkerCommand = serde_json::from_str(
+            r#"{"cmd":"navigate","url":"https://example.com/","settle_ms":5000,"settle_fixed":true}"#,
+        )
+        .expect("navigate with a settle budget must parse");
+        match cmd {
+            WorkerCommand::Navigate {
+                url,
+                settle_ms,
+                settle_fixed,
+            } => {
+                assert_eq!(url, "https://example.com/");
+                assert_eq!(settle_ms, Some(5000));
+                assert!(settle_fixed);
+            }
+            other => panic!("expected a navigate command, got {other:?}"),
+        }
+    }
+
+    /// An older driver sends neither field. That has to keep working, and it
+    /// has to mean "do not settle" rather than a parse failure.
+    #[test]
+    fn navigate_without_a_settle_budget_still_parses() {
+        let cmd: WorkerCommand =
+            serde_json::from_str(r#"{"cmd":"navigate","url":"https://example.com/"}"#)
+                .expect("a navigate command without settle fields must still parse");
+        match cmd {
+            WorkerCommand::Navigate {
+                settle_ms,
+                settle_fixed,
+                ..
+            } => {
+                assert_eq!(settle_ms, None);
+                assert!(!settle_fixed);
+            }
+            other => panic!("expected a navigate command, got {other:?}"),
+        }
     }
 }

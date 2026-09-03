@@ -169,6 +169,12 @@ enum Command {
         #[arg(long, short)]
         eval: Option<String>,
 
+        /// Maximum adaptive post-load settle time in seconds. When supplied
+        /// explicitly, this is a fixed delay; the default is a 5-second cap
+        /// that returns once the page is quiescent. Matches `fetch --wait`.
+        #[arg(long)]
+        wait: Option<u64>,
+
         #[arg(long, default_value_t = std::num::NonZeroUsize::new(10).unwrap())]
         concurrency: std::num::NonZeroUsize,
 
@@ -506,6 +512,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Scrape {
             urls,
             eval,
+            wait,
             concurrency,
             format,
             timeout,
@@ -521,6 +528,8 @@ async fn main() -> anyhow::Result<()> {
                 global_proxy,
                 stealth,
                 obey_robots,
+                wait.unwrap_or(5),
+                wait.is_some(),
             )
             .await?;
         }
@@ -1564,6 +1573,8 @@ async fn run_parallel_scrape(
     proxy: Option<String>,
     stealth: bool,
     obey_robots: bool,
+    wait_secs: u64,
+    wait_is_fixed: bool,
 ) -> anyhow::Result<()> {
     let total = urls.len();
     let start = Instant::now();
@@ -1664,7 +1675,18 @@ async fn run_parallel_scrape(
 
             let worker_result: Result<serde_json::Value, String> =
                 match timeout(worker_timeout, async {
-                    let nav_cmd = serde_json::json!({"cmd": "navigate", "url": url});
+                    // The settle budget has to fit inside the worker's own
+                    // deadline, or a slow page spends its whole timeout here
+                    // and the read never happens.
+                    let settle_ms = wait_secs
+                        .saturating_mul(1000)
+                        .min(timeout_secs.saturating_mul(1000) / 2);
+                    let nav_cmd = serde_json::json!({
+                        "cmd": "navigate",
+                        "url": url,
+                        "settle_ms": settle_ms,
+                        "settle_fixed": wait_is_fixed,
+                    });
                     let mut line = serde_json::to_string(&nav_cmd).unwrap();
                     line.push('\n');
                     if stdin.write_all(line.as_bytes()).await.is_err() {
