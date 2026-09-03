@@ -322,14 +322,9 @@ impl<'a> Element for DomElement<'a> {
     }
 
     fn parent_element(&self) -> Option<Self> {
-        let node = self.tree.get_node(self.node_id)?;
-        let parent_id = node.parent?;
-        let parent = self.tree.get_node(parent_id)?;
-        if parent.is_element() {
-            Some(DomElement::new(self.tree, parent_id))
-        } else {
-            None
-        }
+        let parent_id = self.tree.with_node(self.node_id, |node| node.parent).flatten()?;
+        let is_element = self.tree.with_node(parent_id, |parent| parent.is_element())?;
+        is_element.then(|| DomElement::new(self.tree, parent_id))
     }
 
     fn parent_node_is_shadow_root(&self) -> bool {
@@ -354,40 +349,56 @@ impl<'a> Element for DomElement<'a> {
     }
 
     fn prev_sibling_element(&self) -> Option<Self> {
-        let node = self.tree.get_node(self.node_id)?;
-        let mut current = node.prev_sibling;
+        let mut current = self
+            .tree
+            .with_node(self.node_id, |node| node.prev_sibling)
+            .flatten();
         while let Some(sibling_id) = current {
-            let sibling = self.tree.get_node(sibling_id)?;
-            if sibling.is_element() {
+            let step = self
+                .tree
+                .with_node(sibling_id, |sibling| {
+                    (sibling.is_element(), sibling.prev_sibling)
+                })?;
+            if step.0 {
                 return Some(DomElement::new(self.tree, sibling_id));
             }
-            current = sibling.prev_sibling;
+            current = step.1;
         }
         None
     }
 
     fn next_sibling_element(&self) -> Option<Self> {
-        let node = self.tree.get_node(self.node_id)?;
-        let mut current = node.next_sibling;
+        let mut current = self
+            .tree
+            .with_node(self.node_id, |node| node.next_sibling)
+            .flatten();
         while let Some(sibling_id) = current {
-            let sibling = self.tree.get_node(sibling_id)?;
-            if sibling.is_element() {
+            let step = self
+                .tree
+                .with_node(sibling_id, |sibling| {
+                    (sibling.is_element(), sibling.next_sibling)
+                })?;
+            if step.0 {
                 return Some(DomElement::new(self.tree, sibling_id));
             }
-            current = sibling.next_sibling;
+            current = step.1;
         }
         None
     }
 
     fn first_element_child(&self) -> Option<Self> {
-        let node = self.tree.get_node(self.node_id)?;
-        let mut current = node.first_child;
+        let mut current = self
+            .tree
+            .with_node(self.node_id, |node| node.first_child)
+            .flatten();
         while let Some(child_id) = current {
-            let child = self.tree.get_node(child_id)?;
-            if child.is_element() {
+            let step = self
+                .tree
+                .with_node(child_id, |child| (child.is_element(), child.next_sibling))?;
+            if step.0 {
                 return Some(DomElement::new(self.tree, child_id));
             }
-            current = child.next_sibling;
+            current = step.1;
         }
         None
     }
@@ -586,13 +597,18 @@ impl<'a> Element for DomElement<'a> {
             .with_node(self.node_id, |node| {
                 let mut child = node.first_child;
                 while let Some(child_id) = child {
-                    if let Some(child_node) = self.tree.get_node(child_id) {
-                        match &child_node.data {
-                            NodeData::Element { .. } => return false,
-                            NodeData::Text { contents } if !contents.is_empty() => return false,
-                            _ => {}
+                    if let Some(step) = self.tree.with_node(child_id, |child_node| {
+                        let occupied = match &child_node.data {
+                            NodeData::Element { .. } => true,
+                            NodeData::Text { contents } => !contents.is_empty(),
+                            _ => false,
+                        };
+                        (occupied, child_node.next_sibling)
+                    }) {
+                        if step.0 {
+                            return false;
                         }
-                        child = child_node.next_sibling;
+                        child = step.1;
                     } else {
                         break;
                     }
@@ -1628,6 +1644,61 @@ mod tests {
             tree.query_selector("#bar").unwrap().is_none(),
             "#bar must NOT match id=\"Bar\" in standards mode"
         );
+    }
+
+    /// The selector engine's tree adapter walks parents, siblings and children
+    /// on every match, and those walks used to clone each node they stepped
+    /// over -- element name, and every attribute name and value. A single
+    /// `matches()` call cost 21.1us on microsoft.com; borrowing instead of
+    /// cloning brought the same 112,484 calls to 6.7us each. What has to
+    /// survive that is the stepping itself: every walk skips text and comment
+    /// nodes, and only elements count as siblings or children.
+    ///
+    /// The expected counts are Chromium 148's own answers for this fixture.
+    #[test]
+    fn selector_tree_walks_step_over_non_element_nodes() {
+        let tree = parse_html(
+            r#"<div id="root">
+            text before
+            <!-- comment -->
+            <p class="a" data-x="1">first</p>
+            spacing text
+            <!-- another -->
+            <p class="b">second</p>
+            <span class="c"></span>
+            <span class="d">   </span>
+        </div>"#,
+        );
+        let count = |selector: &str| tree.query_selector_all(selector).unwrap().len();
+
+        // parent_element
+        assert_eq!(count("#root > p"), 2, "child combinator");
+        assert_eq!(count("div p.b"), 1, "descendant combinator");
+
+        // prev_sibling_element: the text and comment between the paragraphs
+        // must not break adjacency.
+        assert_eq!(count("p.a + p.b"), 1, "adjacent sibling skips text and comments");
+        assert_eq!(count("p.a ~ span"), 2, "general sibling skips text and comments");
+
+        // first/last element child: the leading text and comment do not count.
+        assert_eq!(count("#root > p:first-child"), 1, "leading text is not a first child");
+        assert_eq!(count("#root > span:last-child"), 1);
+        assert_eq!(count("#root > p:nth-child(2)"), 1, "only elements are counted");
+
+        // is_empty: whitespace text is still content, so only span.c is empty.
+        let empty = tree.query_selector_all("#root :empty").unwrap();
+        assert_eq!(empty.len(), 1, "a whitespace-only element is not :empty");
+        assert!(
+            tree.with_node(empty[0], |node| node
+                .attrs()
+                .is_some_and(|attrs| attrs.iter().any(|a| a.value == "c")))
+                .unwrap_or(false),
+            "the empty element must be span.c",
+        );
+
+        // attr_matches still reads through the borrow.
+        assert_eq!(count("#root p[data-x]"), 1);
+        assert_eq!(count(r#"#root p[data-x="1"]"#), 1);
     }
 
     #[test]
