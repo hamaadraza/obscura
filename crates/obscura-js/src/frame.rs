@@ -78,7 +78,8 @@ impl FrameRealm {
         // published objects, which is what forced `contentWindow` onto the
         // realm-less shim.
         let parent_origin = parent.page_origin();
-        let origin = if url.is_empty() || url == "about:blank" {
+        // `about:srcdoc` likewise: the inline document belongs to the parent.
+        let origin = if url.is_empty() || url == "about:blank" || url == "about:srcdoc" {
             parent_origin.clone()
         } else {
             origin_of(url)

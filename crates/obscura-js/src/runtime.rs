@@ -5629,6 +5629,159 @@ mod tests {
         );
     }
 
+    /// `iframe.contentWindow` has a WindowProxy's shape: its prototype is the
+    /// child's own Window.prototype, its chain reaches the child's EventTarget,
+    /// it stringifies as a Window, and nothing on it names an engine class.
+    #[test]
+    fn iframe_content_window_has_a_window_proxy_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const iframe = document.createElement("iframe");
+                document.body.appendChild(iframe);
+                const child = iframe.contentWindow;
+                const proto = Object.getPrototypeOf(child);
+                return [
+                    proto === child.Window.prototype,
+                    Object.prototype.toString.call(child),
+                    Object.prototype.toString.call(Object.getPrototypeOf(proto)),
+                    child instanceof child.EventTarget,
+                    child.constructor === child.Window,
+                    child.window === child && child.globalThis === child,
+                    /^_/.test(proto.constructor.name),
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, "[object Window]", "[object WindowProperties]", true, true, true, false])
+        );
+    }
+
+    /// A `srcdoc` frame carries its inline document: readable through
+    /// contentDocument and contentWindow.document, at about:srcdoc, whether the
+    /// parser created it or script set the attribute, and srcdoc wins over src.
+    #[tokio::test(flavor = "current_thread")]
+    async fn srcdoc_frames_load_their_inline_document() {
+        let mut rt = setup_runtime(
+            r#"<html><body>
+                <iframe id="parsed" srcdoc="<p id='greeting'>hello from srcdoc</p>"></iframe>
+            </body></html>"#,
+        );
+        rt.evaluate(
+            r#"
+            const dynamic = document.createElement("iframe");
+            dynamic.srcdoc = "<h1>dynamic</h1>";
+            dynamic.src = "https://example.invalid/never-fetched";
+            document.body.appendChild(dynamic);
+            globalThis.__loads = 0;
+            dynamic.addEventListener("load", () => { globalThis.__loads += 1; });
+            globalThis.__dynamic = dynamic;
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        let result = rt
+            .evaluate(
+                r#"
+                const parsed = document.getElementById("parsed");
+                const dynamic = globalThis.__dynamic;
+                return [
+                    parsed.contentDocument.getElementById("greeting").textContent,
+                    parsed.contentWindow.document.body.textContent.trim(),
+                    parsed.contentWindow.location.href,
+                    parsed.srcdoc.includes("greeting"),
+                    dynamic.contentDocument.querySelector("h1").textContent,
+                    dynamic.contentWindow.location.href,
+                    globalThis.__loads,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "hello from srcdoc", "hello from srcdoc", "about:srcdoc", true,
+                "dynamic", "about:srcdoc", 1
+            ])
+        );
+    }
+
+    /// Every interface prototype carries its name as a non-enumerable data
+    /// @@toStringTag, as in Chrome; the language's own objects are untouched,
+    /// and a factory like Image reports the interface its prototype belongs to.
+    #[test]
+    fn interface_prototypes_carry_their_to_string_tags() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const tag = (x) => Object.prototype.toString.call(x);
+                const desc = Object.getOwnPropertyDescriptor(NodeList.prototype, Symbol.toStringTag);
+                return [
+                    tag(EventTarget.prototype), tag(new EventTarget()), tag(Node.prototype),
+                    tag(document.createTextNode("t")), tag(new URL("https://a.test/")),
+                    tag(new Headers()), tag(document.querySelectorAll("body")),
+                    desc && "value" in desc && !desc.enumerable && desc.configurable,
+                    tag(new Image()) !== "[object Image]",
+                    tag([]), tag(function () {}), tag(Promise.prototype), tag({}),
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "[object EventTarget]", "[object EventTarget]", "[object Node]",
+                "[object Text]", "[object URL]", "[object Headers]", "[object NodeList]",
+                true, true,
+                "[object Array]", "[object Function]", "[object Promise]", "[object Object]"
+            ])
+        );
+    }
+
+    /// Every element reports the interface it implements, as Chrome does:
+    /// specific tags name their own interface, known generic tags and custom
+    /// element names are HTMLElement, unknown HTML names are HTMLUnknownElement,
+    /// SVG and MathML name theirs, and another namespace is a bare Element.
+    #[test]
+    fn elements_report_their_own_interface() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const tag = (el) => Object.prototype.toString.call(el);
+                const html = (name) => tag(document.createElement(name));
+                const svg = (name) => tag(document.createElementNS("http://www.w3.org/2000/svg", name));
+                return [
+                    tag(document.documentElement), tag(document.body), tag(document.head),
+                    html("div"), html("a"), html("h3"), html("td"), html("tbody"),
+                    html("blockquote"), html("ins"), html("colgroup"), html("dialog"),
+                    html("section"), html("my-widget"), html("foo"),
+                    svg("svg"), svg("path"), svg("g"), svg("nope"),
+                    tag(document.createElementNS("http://www.w3.org/1998/Math/MathML", "mi")),
+                    tag(document.createElementNS("urn:x", "thing")),
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "[object HTMLHtmlElement]", "[object HTMLBodyElement]", "[object HTMLHeadElement]",
+                "[object HTMLDivElement]", "[object HTMLAnchorElement]", "[object HTMLHeadingElement]",
+                "[object HTMLTableCellElement]", "[object HTMLTableSectionElement]",
+                "[object HTMLQuoteElement]", "[object HTMLModElement]", "[object HTMLTableColElement]",
+                "[object HTMLDialogElement]", "[object HTMLElement]", "[object HTMLElement]",
+                "[object HTMLUnknownElement]",
+                "[object SVGSVGElement]", "[object SVGPathElement]", "[object SVGGElement]",
+                "[object SVGElement]", "[object MathMLElement]", "[object Element]"
+            ])
+        );
+    }
+
     #[test]
     fn window_named_access_exposes_ids_and_eligible_names() {
         let mut rt = setup_runtime(

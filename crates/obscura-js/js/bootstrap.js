@@ -1,5 +1,10 @@
 "use strict";
 (function () {
+// The globals the engine provides before this file defines anything: the
+// language's own constructors, which already carry the @@toStringTag values
+// the specification gives them. Everything defined below is an interface
+// of ours (see _tagInterfacePrototypes at the end).
+const _engineGlobalNames = new Set(Object.getOwnPropertyNames(globalThis));
 
 // Pre-declare all internal globals as non-enumerable so they are invisible
 // to Object.keys(window) / for-in enumeration. Must run before any var
@@ -3640,8 +3645,12 @@ class Element extends Node {
       : null;
     const value = String(v);
     _dom("set_attribute", this._nid, n + "\0" + value);
-    if (n === "src" && this.localName === "iframe") {
-      if (value && value !== "about:blank") this._loadIframeSrc(value);
+    if (this.localName === "iframe" && (n === "src" || n === "srcdoc")) {
+      // The value just set, not a read-back: a script-created element keeps its
+      // attributes in a map this method updates only after its hooks ran.
+      const srcdoc = n === "srcdoc" ? value : this.getAttribute("srcdoc");
+      if (srcdoc != null) this._loadIframeSrcdoc(srcdoc);
+      else if (n === "src" && value && value !== "about:blank") this._loadIframeSrc(value);
       else this._resetIframeFrame();
     }
     if (this._nullNamespaceAttrs instanceof Map) {
@@ -4425,6 +4434,8 @@ class Element extends Node {
   set src(v) {
     this.setAttribute("src", v);
   }
+  get srcdoc() { return this.getAttribute("srcdoc") ?? ""; }
+  set srcdoc(v) { this.setAttribute("srcdoc", v); }
   _resetIframeFrame() {
     const oldId = this._frameId;
     if (oldId) {
@@ -4458,6 +4469,7 @@ class Element extends Node {
     if (this._iframeLoadingUrl) return;
     const src = this.getAttribute('src');
     if (src && src !== 'about:blank') return;
+    if (this.getAttribute('srcdoc') != null) return;
     // A frame outside the document has no browsing context yet.
     if (!this.isConnected) return;
     this._blankRealmRequested = true;
@@ -4563,11 +4575,46 @@ class Element extends Node {
       el.dispatchEvent(new Event('load'));
     });
   }
+  // `srcdoc` supplies the document inline: nothing is fetched, its URL is
+  // about:srcdoc, and it shares the parent's origin. The host still receives
+  // the document, so the frame runs in a realm of its own like a fetched one,
+  // and `load` fires as a task after the script that set it, as a real load
+  // does. A document that the facade never carried read back empty before.
+  _loadIframeSrcdoc(html) {
+    const key = 'about:srcdoc\0' + html;
+    if (this._iframeLoadingUrl === key) return;
+    this._resetIframeFrame();
+    this._iframeLoadingUrl = key;
+    const el = this;
+    let width = 300, height = 150;
+    try {
+      const box = el.getBoundingClientRect();
+      width = Math.round(box.width) || 300;
+      height = Math.round(box.height) || 150;
+    } catch (_e) {}
+    const op = Deno.core.ops.op_frame_document_ready;
+    el._frameId = typeof op === 'function' ? op('about:srcdoc', html, width, height) : 0;
+    el._iframeDoc = new _IframeDocument(html, 'about:srcdoc', el);
+    el._iframeWin = new _IframeWindow(el._iframeDoc, 'about:srcdoc');
+    if (el._frameId) {
+      el._iframeWin._frameId = el._frameId;
+      globalThis.__obscura_frameWindows[el._frameId] = el._iframeWin;
+      globalThis.__obscura_frameElements[el._frameId] = el;
+    }
+    setTimeout(() => {
+      if (el._iframeLoadingUrl === key) el.dispatchEvent(new Event('load'));
+    }, 0);
+  }
   get contentDocument() {
     if (this.localName !== 'iframe') return undefined;
+    // No browsing context without a document to live in: Chrome answers null
+    // for a detached frame, and detectors probe exactly that.
+    if (!this.isConnected) return null;
     this._requestBlankFrameRealm();
     const real = _frameObjectsFor(this);
     if (real?.document) return real.document;
+    // An inline document is the parent's own, whatever `src` says beside it.
+    if (this._iframeDoc && this.getAttribute('srcdoc') != null) return this._iframeDoc;
     if (this._iframeDoc) {
       const pageOrigin = (function(){ try { return new URL(_domParse("document_url")).origin; } catch(e) { return ''; } })();
       const iframeOrigin = (function(url){ try { return new URL(url).origin; } catch(e) { return ''; } })(this.src);
@@ -4584,6 +4631,9 @@ class Element extends Node {
   }
   get contentWindow() {
     if (this.localName !== 'iframe') return undefined;
+    // No browsing context without a document to live in: Chrome answers null
+    // for a detached frame, and detectors probe exactly that.
+    if (!this.isConnected) return null;
     this._requestBlankFrameRealm();
     if (_frameObjectsFor(this)) {
       const win = _frameWindowFor(this._frameId);
@@ -12134,6 +12184,91 @@ globalThis.CSS = {
   escape(s){ return s; }
 };
 
+// Which interface an element implements, by name. Chrome puts a data
+// @@toStringTag on each element interface's own prototype, but every HTML
+// element here shares one `Element` class, so a single tag would have to name
+// one interface for all of them: `document.documentElement` reported
+// "[object HTMLDialogElement]" because the tagging pass wrote whichever alias
+// it saw last. Deriving the name from the element instead gives every tag the
+// answer Chrome gives, at the cost of the property being an accessor rather
+// than a data property.
+const _HTML_INTERFACE_BY_TAG = {
+  a: 'HTMLAnchorElement', area: 'HTMLAreaElement', audio: 'HTMLAudioElement',
+  base: 'HTMLBaseElement', blockquote: 'HTMLQuoteElement', body: 'HTMLBodyElement',
+  br: 'HTMLBRElement', button: 'HTMLButtonElement', canvas: 'HTMLCanvasElement',
+  caption: 'HTMLTableCaptionElement', col: 'HTMLTableColElement',
+  colgroup: 'HTMLTableColElement', data: 'HTMLDataElement',
+  datalist: 'HTMLDataListElement', del: 'HTMLModElement',
+  details: 'HTMLDetailsElement', dialog: 'HTMLDialogElement',
+  dir: 'HTMLDirectoryElement', div: 'HTMLDivElement', dl: 'HTMLDListElement',
+  embed: 'HTMLEmbedElement', fieldset: 'HTMLFieldSetElement',
+  font: 'HTMLFontElement', form: 'HTMLFormElement', frame: 'HTMLFrameElement',
+  frameset: 'HTMLFrameSetElement', h1: 'HTMLHeadingElement', h2: 'HTMLHeadingElement',
+  h3: 'HTMLHeadingElement', h4: 'HTMLHeadingElement', h5: 'HTMLHeadingElement',
+  h6: 'HTMLHeadingElement', head: 'HTMLHeadElement', hr: 'HTMLHRElement',
+  html: 'HTMLHtmlElement', iframe: 'HTMLIFrameElement', img: 'HTMLImageElement',
+  input: 'HTMLInputElement', ins: 'HTMLModElement', label: 'HTMLLabelElement',
+  legend: 'HTMLLegendElement', li: 'HTMLLIElement', link: 'HTMLLinkElement',
+  listing: 'HTMLPreElement', map: 'HTMLMapElement', marquee: 'HTMLMarqueeElement',
+  menu: 'HTMLMenuElement', meta: 'HTMLMetaElement', meter: 'HTMLMeterElement',
+  object: 'HTMLObjectElement', ol: 'HTMLOListElement', optgroup: 'HTMLOptGroupElement',
+  option: 'HTMLOptionElement', output: 'HTMLOutputElement', p: 'HTMLParagraphElement',
+  param: 'HTMLParamElement', picture: 'HTMLPictureElement', plaintext: 'HTMLPreElement',
+  pre: 'HTMLPreElement', progress: 'HTMLProgressElement', q: 'HTMLQuoteElement',
+  script: 'HTMLScriptElement', select: 'HTMLSelectElement', slot: 'HTMLSlotElement',
+  source: 'HTMLSourceElement', span: 'HTMLSpanElement', style: 'HTMLStyleElement',
+  table: 'HTMLTableElement', tbody: 'HTMLTableSectionElement',
+  td: 'HTMLTableCellElement', template: 'HTMLTemplateElement',
+  textarea: 'HTMLTextAreaElement', tfoot: 'HTMLTableSectionElement',
+  th: 'HTMLTableCellElement', thead: 'HTMLTableSectionElement',
+  time: 'HTMLTimeElement', title: 'HTMLTitleElement', tr: 'HTMLTableRowElement',
+  track: 'HTMLTrackElement', ul: 'HTMLUListElement', video: 'HTMLVideoElement',
+  xmp: 'HTMLPreElement',
+};
+// Tags with no interface of their own. Anything else in the HTML namespace is
+// not a known element, which Chrome reports as HTMLUnknownElement -- except a
+// custom element name (one containing a hyphen), which is an HTMLElement.
+const _HTML_GENERIC_TAGS = new Set([
+  'abbr', 'acronym', 'address', 'article', 'aside', 'b', 'basefont', 'bdi', 'bdo',
+  'bgsound', 'big', 'center', 'cite', 'code', 'dd', 'dfn', 'dt', 'em', 'figcaption',
+  'figure', 'footer', 'header', 'hgroup', 'i', 'kbd', 'keygen', 'main', 'mark',
+  'nav', 'nobr', 'noembed', 'noframes', 'noscript', 'rb', 'rp', 'rt', 'rtc', 'ruby',
+  's', 'samp', 'search', 'section', 'small', 'strike', 'strong', 'sub', 'summary',
+  'sup', 'tt', 'u', 'var', 'wbr',
+]);
+const _SVG_INTERFACE_BY_TAG = {
+  a: 'SVGAElement', circle: 'SVGCircleElement', clipPath: 'SVGClipPathElement',
+  defs: 'SVGDefsElement', desc: 'SVGDescElement', ellipse: 'SVGEllipseElement',
+  foreignObject: 'SVGForeignObjectElement', g: 'SVGGElement', image: 'SVGImageElement',
+  line: 'SVGLineElement', linearGradient: 'SVGLinearGradientElement',
+  marker: 'SVGMarkerElement', mask: 'SVGMaskElement', path: 'SVGPathElement',
+  pattern: 'SVGPatternElement', polygon: 'SVGPolygonElement',
+  polyline: 'SVGPolylineElement', radialGradient: 'SVGRadialGradientElement',
+  rect: 'SVGRectElement', script: 'SVGScriptElement', stop: 'SVGStopElement',
+  style: 'SVGStyleElement', svg: 'SVGSVGElement', symbol: 'SVGSymbolElement',
+  text: 'SVGTextElement', textPath: 'SVGTextPathElement', title: 'SVGTitleElement',
+  tspan: 'SVGTSpanElement', use: 'SVGUseElement', view: 'SVGViewElement',
+};
+function _elementInterfaceName(element) {
+  try {
+    const namespace = element.namespaceURI;
+    const localName = element.localName;
+    if (namespace === 'http://www.w3.org/2000/svg') {
+      return _SVG_INTERFACE_BY_TAG[localName] || 'SVGElement';
+    }
+    if (namespace === 'http://www.w3.org/1998/Math/MathML') return 'MathMLElement';
+    if (namespace != null && namespace !== 'http://www.w3.org/1999/xhtml') return 'Element';
+    const tag = String(localName).toLowerCase();
+    const specific = Object.prototype.hasOwnProperty.call(_HTML_INTERFACE_BY_TAG, tag)
+      ? _HTML_INTERFACE_BY_TAG[tag] : null;
+    if (specific) return specific;
+    if (_HTML_GENERIC_TAGS.has(tag) || tag.includes('-')) return 'HTMLElement';
+    return 'HTMLUnknownElement';
+  } catch (_e) {
+    return 'Element';
+  }
+}
+
 globalThis.HTMLElement = Element;
 globalThis.HTMLDivElement = Element;
 globalThis.HTMLSpanElement = Element;
@@ -12253,6 +12388,17 @@ globalThis.DocumentFragment = DocumentFragment;
 globalThis.DocumentType = DocumentType;
 globalThis.Node = Node;
 globalThis.Element = Element;
+// Element and SVGElement each back many interfaces, so their tag is computed
+// from the element rather than fixed. A prototype for one specific interface
+// (SVGPathElement, HTMLFormElement) keeps its own data tag and shadows this.
+const _computedTagPrototypes = new Set();
+for (const base of [Element, globalThis.SVGElement]) {
+  if (!base || !base.prototype || _computedTagPrototypes.has(base.prototype)) continue;
+  const getter = { ['get [Symbol.toStringTag]']() { return _elementInterfaceName(this); } }['get [Symbol.toStringTag]'];
+  _markNativeAs(getter, 'function get [Symbol.toStringTag]() { [native code] }');
+  Object.defineProperty(base.prototype, Symbol.toStringTag, { get: getter, configurable: true });
+  _computedTagPrototypes.add(base.prototype);
+}
 globalThis.Document = Document;
 // CSSStyleDeclaration is the type of element.style and getComputedStyle(); it is
 // pre-declared non-enumerable in _preHideInternals, but unlike the other WebIDL
@@ -12993,9 +13139,37 @@ function _iframeRealmGlobal(target, name) {
   return value;
 }
 
+// The facade's prototype chain mirrors a realm's: Window.prototype, then
+// WindowProperties, then EventTarget.prototype, built from the facade's own
+// wrapped constructors. That is what makes `Object.getPrototypeOf(
+// contentWindow) === contentWindow.Window.prototype` and `contentWindow
+// instanceof contentWindow.EventTarget` hold, as they do on a WindowProxy,
+// instead of exposing an `_IframeWindow` prototype whose constructor name
+// identifies the engine.
+const _iframeWindowPrototypes = new WeakMap();
+function _iframeWindowPrototype(target) {
+  let proto = _iframeWindowPrototypes.get(target);
+  if (proto) return proto;
+  const windowCtor = _iframeRealmGlobal(target, 'Window');
+  const eventTarget = _iframeRealmGlobal(target, 'EventTarget');
+  const properties = Object.create(eventTarget.prototype);
+  Object.defineProperty(properties, Symbol.toStringTag, {
+    value: 'WindowProperties', configurable: true,
+  });
+  proto = Object.create(properties);
+  Object.defineProperty(proto, 'constructor', { value: windowCtor, writable: true, configurable: true });
+  Object.defineProperty(proto, Symbol.toStringTag, { value: 'Window', configurable: true });
+  try { windowCtor.prototype = proto; } catch (_e) {}
+  _iframeWindowPrototypes.set(target, proto);
+  return proto;
+}
+
 const _iframeWindowProxyHandler = {
+  getPrototypeOf(target) { return _iframeWindowPrototype(target); },
   get(target, key, receiver) {
     if (key === 'globalThis') return receiver;
+    if (key === Symbol.toStringTag) return 'Window';
+    if (key === 'constructor') return _iframeRealmGlobal(target, 'Window');
     if (Reflect.has(target, key)) return Reflect.get(target, key, receiver);
     if (typeof key === 'string' && _iframeRealmGlobalNameSet.has(key)) {
       return _iframeRealmGlobal(target, key);
@@ -13182,9 +13356,18 @@ function _frameWindowFor(frameId) {
     _sendRealmMessage(frameId, data, targetOrigin);
   });
   const win = new Proxy(real, {
+    // A WindowProxy presents the realm's Window.prototype as its own.
+    getPrototypeOf(target) {
+      try {
+        const ctor = Reflect.get(target, 'Window');
+        if (ctor && ctor.prototype) return ctor.prototype;
+      } catch (_e) {}
+      return Reflect.getPrototypeOf(target);
+    },
     get(target, prop) {
       if (prop === 'postMessage') return post;
       if (prop === '__obscura_wrapsRealm') return true;
+      if (prop === Symbol.toStringTag) return 'Window';
       // Not `receiver`: an accessor on a real global must run with the global
       // itself as `this`, not with this proxy.
       return Reflect.get(target, prop);
@@ -13228,32 +13411,35 @@ globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId, 
 // realm's DOM is not something this engine does, and a browser forbids it
 // across origins anyway. Widgets use postMessage regardless, which is what it
 // is for.
-class _RemoteWindow {
-  constructor(frameId) {
-    Object.defineProperty(this, '_frameId', { value: frameId, enumerable: false });
-  }
-  postMessage(data, targetOrigin, _transfer) { _sendRealmMessage(this._frameId, data, targetOrigin); }
-  get self() { return this; }
-  get window() { return this; }
-  get frames() { return this; }
-  get parent() { return this; }
-  get top() { return this; }
-  get opener() { return null; }
-  get closed() { return false; }
-  get length() { return 0; }
-  focus() {}
-  blur() {}
-  close() {}
-}
-_markNative(_RemoteWindow.prototype.postMessage);
-
 const _remoteWindows = new Map();
 function _remoteWindow(frameId) {
   let win = _remoteWindows.get(frameId);
-  if (!win) {
-    win = new _RemoteWindow(frameId);
-    _remoteWindows.set(frameId, win);
+  if (win) return win;
+  // Chrome's cross-origin WindowProxy has a null prototype and exposes only
+  // the members the HTML standard lets cross-origin script reach, each of
+  // them native. An instance of a named class gave the engine away through
+  // `Object.getPrototypeOf(frame.contentWindow).constructor.name`.
+  win = Object.create(null);
+  for (const name of ['window', 'self', 'frames', 'parent', 'top']) {
+    const getter = { ['get ' + name]() { return win; } }['get ' + name];
+    _markNativeAs(getter, 'function get ' + name + '() { [native code] }');
+    Object.defineProperty(win, name, { get: getter, enumerable: true, configurable: false });
   }
+  for (const [name, value] of [['opener', null], ['closed', false], ['length', 0]]) {
+    const getter = { ['get ' + name]() { return value; } }['get ' + name];
+    _markNativeAs(getter, 'function get ' + name + '() { [native code] }');
+    Object.defineProperty(win, name, { get: getter, enumerable: true, configurable: false });
+  }
+  const methods = {
+    postMessage(data, targetOrigin, _transfer) { _sendRealmMessage(frameId, data, targetOrigin); },
+    focus() {}, blur() {}, close() {},
+  };
+  for (const name of Object.keys(methods)) {
+    Object.defineProperty(win, name, {
+      value: _asNativeMethod(name, methods[name]), writable: false, enumerable: true, configurable: false,
+    });
+  }
+  _remoteWindows.set(frameId, win);
   return win;
 }
 
@@ -17347,8 +17533,10 @@ globalThis.__obscura_init = function() {
   // by the same path, with op_frame_document_ready recording the caller as
   // its parent.
   for (const frame of globalThis.document.querySelectorAll('iframe')) {
+    const srcdoc = frame.getAttribute('srcdoc');
     const src = frame.getAttribute('src');
-    if (src && src !== 'about:blank') frame._loadIframeSrc(src);
+    if (srcdoc != null) frame._loadIframeSrcdoc(srcdoc);
+    else if (src && src !== 'about:blank') frame._loadIframeSrc(src);
   }
 
   // Hide internals (_*, obscura, Obscura). The set of keys is static at
@@ -17893,6 +18081,35 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     var val;
     try { val = globalThis[name]; } catch (e) { continue; }
     if (typeof val === 'function') { walk(val); }
+  }
+})();
+
+
+// Chrome tags every interface prototype with the interface's name as a
+// non-enumerable data property; `Object.prototype.toString.call(x)` reads it
+// through the chain. Ours were a mix of getters and gaps, so EventTarget's
+// prototype read as "[object Object]". Every interface this file defines gets
+// its tag here. The engine's globals are left alone, as are factories whose
+// prototype belongs to another interface (Image, Audio, Option, and the
+// webkit aliases), which take that interface's name.
+(function _tagInterfacePrototypes() {
+  const factories = new Set(['Image', 'Audio', 'Option', 'webkitURL', 'webkitAudioContext']);
+  for (const name of Object.getOwnPropertyNames(globalThis)) {
+    if (_engineGlobalNames.has(name) || factories.has(name) || !/^[A-Z]/.test(name)) continue;
+    let ctor;
+    try { ctor = globalThis[name]; } catch (_e) { continue; }
+    if (typeof ctor !== 'function') continue;
+    const proto = ctor.prototype;
+    if (!proto || typeof proto !== 'object' || proto === Object.prototype) continue;
+    let ctorProp;
+    try { ctorProp = Object.getOwnPropertyDescriptor(proto, 'constructor'); } catch (_e) { continue; }
+    if (!ctorProp || ctorProp.value !== ctor) continue;
+    const own = Object.getOwnPropertyDescriptor(proto, Symbol.toStringTag);
+    if (own && !own.configurable) continue;
+    if (own && 'value' in own && own.value === name && !own.enumerable) continue;
+    // A computed tag (Element/SVGElement derive theirs from the element).
+    if (_computedTagPrototypes.has(proto)) continue;
+    try { Object.defineProperty(proto, Symbol.toStringTag, { value: name, configurable: true }); } catch (_e) {}
   }
 })();
 
