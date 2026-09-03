@@ -2872,6 +2872,20 @@ impl Page {
             .await
     }
 
+    /// Whether the navigation got far enough to have a usable document, which
+    /// decides if running out of time is a failure or merely an early stop.
+    fn has_rendered_document(&self) -> bool {
+        // Through with_dom, not self.dom: the tree is handed to the JS runtime
+        // when one is created, so the page's own field is empty by this point.
+        self.with_dom(|dom| {
+            dom.children(dom.document()).iter().any(|child| {
+                dom.with_node(*child, |node| node.is_element())
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+    }
+
     pub async fn navigate_with_wait_post(
         &mut self,
         url_str: &str,
@@ -2899,10 +2913,21 @@ impl Page {
         {
             Ok(r) => r,
             Err(_) => {
-                self.lifecycle = crate::lifecycle::LifecycleState::Failed;
-                Err(PageError::NetworkError(format!(
-                    "navigation exceeded {nav_timeout_ms}ms deadline"
-                )))
+                if self.has_rendered_document() {
+                    // The document is parsed and scripts have run for as long as
+                    // the budget allowed; stop waiting rather than discarding it.
+                    tracing::warn!(
+                        "navigation exceeded {nav_timeout_ms}ms deadline; \
+                         returning the document as it stands"
+                    );
+                    self.lifecycle = crate::lifecycle::LifecycleState::DomContentLoaded;
+                    Ok(())
+                } else {
+                    self.lifecycle = crate::lifecycle::LifecycleState::Failed;
+                    Err(PageError::NetworkError(format!(
+                        "navigation exceeded {nav_timeout_ms}ms deadline"
+                    )))
+                }
             }
         };
         if result.is_ok() {
@@ -4433,11 +4458,25 @@ impl Page {
                     &source_url,
                 ),
             )
-            .await
-            .map_err(|_| {
-                self.lifecycle = crate::lifecycle::LifecycleState::Failed;
-                PageError::NetworkError(format!("navigation exceeded {nav_timeout_ms}ms deadline"))
-            })?;
+            .await;
+            let result = match result {
+                Ok(inner) => inner,
+                Err(_) if self.has_rendered_document() => {
+                    // Same as the primary navigation path: a parsed document is
+                    // worth more than an error, so stop waiting and keep it.
+                    tracing::warn!(
+                        "navigation exceeded {nav_timeout_ms}ms deadline;                          returning the document as it stands"
+                    );
+                    self.lifecycle = crate::lifecycle::LifecycleState::DomContentLoaded;
+                    Ok(())
+                }
+                Err(_) => {
+                    self.lifecycle = crate::lifecycle::LifecycleState::Failed;
+                    return Err(PageError::NetworkError(format!(
+                        "navigation exceeded {nav_timeout_ms}ms deadline"
+                    )));
+                }
+            };
             result?;
             self.push_history(self.url_string());
             Ok(true)

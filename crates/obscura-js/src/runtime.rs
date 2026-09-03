@@ -273,6 +273,9 @@ pub struct ObscuraJsRuntime {
     /// terminates the current script and temporarily raises the limit just
     /// enough for V8 to unwind instead of aborting the worker process.
     heap_limit_state: std::sync::Arc<HeapLimitState>,
+    /// Held for the isolate's life so the runaway-script interrupt can be
+    /// handed a context pointer that stays valid (diagnostic only).
+    runaway_context: Option<Box<deno_core::v8::Global<deno_core::v8::Context>>>,
     /// Browser module-map evaluation is idempotent. deno_core 0.350 asserts if
     /// the same ModuleId is evaluated twice, so retain the first outcome for
     /// duplicate script tags and roots already seen by Obscura.
@@ -338,7 +341,67 @@ pub struct WatchdogToken {
 /// hung page cannot hold this connection's V8 lock forever. Pair with
 /// [`WatchdogToken::stop`]; if `stop` returns true, clear the termination flag
 /// via [`ObscuraJsRuntime::cancel_termination`] before reusing the isolate.
-pub fn spawn_watchdog(handle: IsolateHandle, budget: std::time::Duration) -> WatchdogToken {
+/// Where the isolate is executing, as a short stack summary. Runs on the
+/// isolate's own thread through an interrupt, so it must not allocate a
+/// HandleScope-free value or call back into Rust state.
+extern "C" fn capture_stack_interrupt(
+    isolate: &mut deno_core::v8::Isolate,
+    data: *mut std::ffi::c_void,
+) {
+    use deno_core::v8;
+    if data.is_null() {
+        tracing::warn!("runaway trace: no context supplied");
+        return;
+    }
+    let context = unsafe { &*(data as *const v8::Global<v8::Context>) };
+    let scope = &mut v8::HandleScope::with_context(isolate, context);
+    let Some(trace) = v8::StackTrace::current_stack_trace(scope, 16) else {
+        tracing::warn!("runaway trace: V8 returned no stack");
+        return;
+    };
+    let mut frames = Vec::new();
+    for index in 0..trace.get_frame_count() {
+        let Some(frame) = trace.get_frame(scope, index) else {
+            continue;
+        };
+        let function = frame
+            .get_function_name(scope)
+            .map(|name| name.to_rust_string_lossy(scope))
+            .unwrap_or_else(|| "<anonymous>".to_string());
+        let script = frame
+            .get_script_name_or_source_url(scope)
+            .map(|name| name.to_rust_string_lossy(scope))
+            .unwrap_or_default();
+        frames.push(format!(
+            "{} ({}:{})",
+            function,
+            script,
+            frame.get_line_number()
+        ));
+    }
+    tracing::warn!(
+        "runaway script stack ({} frames): {}",
+        frames.len(),
+        frames.join(" <- ")
+    );
+}
+
+pub fn spawn_watchdog(
+    handle: IsolateHandle,
+    budget: std::time::Duration,
+    trace_context: *mut std::ffi::c_void,
+) -> WatchdogToken {
+    // Only read on the isolate thread inside the interrupt callback.
+    struct SendPtr(*mut std::ffi::c_void);
+    unsafe impl Send for SendPtr {}
+    impl SendPtr {
+        // Called through the wrapper so the closure captures the Send type
+        // rather than the bare pointer field.
+        fn get(&self) -> *mut std::ffi::c_void {
+            self.0
+        }
+    }
+    let trace_context = SendPtr(trace_context);
     let pair = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let pair_c = pair.clone();
@@ -359,6 +422,16 @@ pub fn spawn_watchdog(handle: IsolateHandle, budget: std::time::Duration) -> Wat
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 fired_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                // Ask for the stack first: the interrupt runs the callback on
+                // the isolate thread, which terminate_execution would prevent.
+                if !trace_context.get().is_null() {
+                    let accepted =
+                        handle.request_interrupt(capture_stack_interrupt, trace_context.get());
+                    tracing::warn!("runaway trace: interrupt accepted={accepted}");
+                    // V8 services an interrupt at the next loop back-edge or call;
+                    // give it room before terminating, which cancels pending work.
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                }
                 handle.terminate_execution();
                 return;
             }
@@ -513,6 +586,7 @@ impl ObscuraJsRuntime {
             module_load_activity,
             isolate_handle,
             heap_limit_state,
+            runaway_context: None,
             module_evaluations: HashMap::new(),
             loaded_module_specifiers,
             evaluated_module_specifiers: HashMap::new(),
@@ -2755,7 +2829,22 @@ impl ObscuraJsRuntime {
     /// `budget` elapses, forcing V8 to throw an uncatchable error and hand
     /// control back. Always balance with [`Self::disarm_watchdog`].
     pub fn arm_watchdog(&mut self, budget: std::time::Duration) -> WatchdogToken {
-        spawn_watchdog(self.runtime.v8_isolate().thread_safe_handle(), budget)
+        let context = if std::env::var_os("OBSCURA_TRACE_RUNAWAY").is_some() {
+            if self.runaway_context.is_none() {
+                self.runaway_context = Some(Box::new(self.runtime.main_context()));
+            }
+            self.runaway_context
+                .as_ref()
+                .map(|boxed| boxed.as_ref() as *const _ as *mut std::ffi::c_void)
+                .unwrap_or(std::ptr::null_mut())
+        } else {
+            std::ptr::null_mut()
+        };
+        spawn_watchdog(
+            self.runtime.v8_isolate().thread_safe_handle(),
+            budget,
+            context,
+        )
     }
 
     /// Stop a watchdog armed by [`Self::arm_watchdog`]. If it had already fired

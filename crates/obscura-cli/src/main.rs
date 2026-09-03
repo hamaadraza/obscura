@@ -1586,7 +1586,11 @@ async fn run_parallel_scrape(
     let eval = Arc::new(eval);
     let worker_path = Arc::new(worker_path);
     let worker_timeout = Duration::from_secs(timeout_secs);
-    let read_timeout = Duration::from_secs(timeout_secs.min(30));
+    // Bounded by the worker timeout alone. Capping this at 30s made a longer
+    // --timeout meaningless: a worker gave up mid-navigation because the cap
+    // matched the child's own navigation budget, so a slow page could never
+    // be waited for however long the caller asked.
+    let read_timeout = worker_timeout;
     let shutdown_timeout = Duration::from_secs(5);
 
     let mut handles = Vec::new();
