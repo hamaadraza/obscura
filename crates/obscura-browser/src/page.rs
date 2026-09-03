@@ -2357,6 +2357,65 @@ impl Page {
         // pool / ephemeral ports and triggering OS-level backpressure.
         // 16 is well above the per-host pool ceiling most browsers use
         // and matches what real Chrome does for a given origin.
+        // Start fetching the page's module graphs now, in the background.
+        // Specifiers resolve here, on the page's thread, so the task itself
+        // needs nothing from the JS runtime. See prefetch_module_graphs.
+        // Escape hatch for diagnosing a page that behaves differently with
+        // the preload pass than without it.
+        let prefetch = (std::env::var_os("OBSCURA_NO_MODULE_PREFETCH").is_none())
+            .then(|| self.js.as_ref().map(|js| js.module_prefetch_handle()))
+            .flatten();
+        let mut prefetched_modules = None;
+        // URLs the background task is still fetching. A module in here is
+        // worth waiting for; one that is not simply loads over the network.
+        let mut prefetch_pending: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        if let Some(prefetch) = prefetch.clone() {
+            let mut roots: Vec<(String, String)> = Vec::new();
+            let mut queued: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let enqueue = &mut |specifier: &str, referrer: &str| {
+                let Some(url) = prefetch.resolve(specifier, referrer) else {
+                    return;
+                };
+                if (url.starts_with("http://") || url.starts_with("https://"))
+                    && queued.insert(url.clone())
+                {
+                    roots.push((url, referrer.to_string()));
+                }
+            };
+            for script in all_scripts
+                .iter()
+                .filter(|script| matches!(script.kind, ScriptKind::Module))
+            {
+                match &script.src {
+                    Some(src) => enqueue(src, &script.base_url),
+                    // An inline module's own source is already in hand; its
+                    // imports are the part that costs a round trip.
+                    None => {
+                        for specifier in
+                            obscura_js::ModulePrefetch::scan_imports(&script.inline)
+                        {
+                            enqueue(&specifier, &script.base_url);
+                        }
+                    }
+                }
+            }
+            if !roots.is_empty() {
+                prefetch_pending = queued;
+                let (found_tx, found_rx) = tokio::sync::mpsc::unbounded_channel();
+                tokio::spawn(prefetch_module_graphs(
+                    roots,
+                    client.clone(),
+                    page_callbacks.clone(),
+                    script_initiator.clone(),
+                    script_deadline,
+                    found_tx,
+                ));
+                prefetched_modules = Some(found_rx);
+            }
+        }
+
         use futures::StreamExt as _;
         let fetch_stream = futures::stream::iter(fetch_futures).buffer_unordered(16);
         let fetch_results = match tokio::time::timeout_at(
@@ -2614,6 +2673,14 @@ impl Page {
                                 .map(|url| url.to_string())
                                 .unwrap_or_else(|| src.clone())
                         };
+                        take_prefetched_modules(
+                            prefetch.as_ref(),
+                            prefetched_modules.as_mut(),
+                            &mut prefetch_pending,
+                            std::slice::from_ref(&full_url),
+                            prepare_budget_ms,
+                        )
+                        .await;
                         tracing::info!("Preparing ES module graph: {}", full_url);
                         let result = match &mut self.js {
                             Some(js) => js.prepare_module(&full_url, prepare_budget_ms).await,
@@ -2635,6 +2702,25 @@ impl Page {
                             }
                         }
                     } else {
+                        let wanted: Vec<String> = match prefetch.as_ref() {
+                            Some(prefetch) => obscura_js::ModulePrefetch::scan_imports(
+                                &script.inline,
+                            )
+                            .into_iter()
+                            .filter_map(|specifier| {
+                                prefetch.resolve(&specifier, &script.base_url)
+                            })
+                            .collect(),
+                            None => Vec::new(),
+                        };
+                        take_prefetched_modules(
+                            prefetch.as_ref(),
+                            prefetched_modules.as_mut(),
+                            &mut prefetch_pending,
+                            &wanted,
+                            prepare_budget_ms,
+                        )
+                        .await;
                         let result = match &mut self.js {
                             Some(js) => {
                                 js.prepare_inline_module(
@@ -4505,6 +4591,181 @@ impl Page {
     }
 }
 
+/// Move finished preloads into the module cache, waiting for the ones this
+/// graph is about to need.
+///
+/// Waiting matters as much as prefetching: a module still in flight that the
+/// loader goes and fetches for itself is downloaded twice, which is worse than
+/// never having prefetched it. Only modules named in `wanted` are waited for,
+/// and only for as long as loading the graph would itself have taken.
+async fn take_prefetched_modules(
+    prefetch: Option<&obscura_js::ModulePrefetch>,
+    found_rx: Option<&mut tokio::sync::mpsc::UnboundedReceiver<(String, String, String)>>,
+    pending: &mut std::collections::HashSet<String>,
+    wanted: &[String],
+    budget_ms: u64,
+) {
+    let (Some(prefetch), Some(found_rx)) = (prefetch, found_rx) else {
+        return;
+    };
+    while let Ok((requested, found, code)) = found_rx.try_recv() {
+        pending.remove(&requested);
+        prefetch.insert(requested, found, code);
+    }
+    let mut outstanding: Vec<&String> = wanted
+        .iter()
+        .filter(|url| pending.contains(*url))
+        .collect();
+    if outstanding.is_empty() {
+        return;
+    }
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(budget_ms),
+        async {
+            while let Some((requested, found, code)) = found_rx.recv().await {
+                pending.remove(&requested);
+                outstanding.retain(|url| **url != requested);
+                prefetch.insert(requested, found, code);
+                if outstanding.is_empty() {
+                    return;
+                }
+            }
+        },
+    )
+    .await;
+    for url in wanted {
+        pending.remove(url);
+    }
+}
+
+/// Fetch the module graphs the page is about to evaluate, in parallel and in
+/// the background, rather than one at a time during evaluation.
+///
+/// deno_core builds a graph only when its root is evaluated, and roots are
+/// evaluated one at a time, so every module in every graph cost its own round
+/// trip in series. On microsoft.com that was 88 modules across 79 graphs and
+/// 17.6s of pure waiting, most of a navigation budget spent blocked on the
+/// network.
+///
+/// This runs as a detached task feeding a channel, never as a barrier. Waiting
+/// for it before running scripts cost a page with few modules ~800ms it was
+/// not spending before, because those pages get little from it: a single graph
+/// already loads its own dependencies in parallel, and the serial cost is only
+/// paid between graphs. Sources land in the cache as they arrive; a module
+/// that has not arrived by the time its graph is evaluated simply loads over
+/// the network as it always did.
+///
+/// Specifier resolution inside the task is plain URL joining rather than the
+/// loader's import-map-aware resolve, which stays on the page's thread. A bare
+/// specifier is skipped instead of guessed, and loads the ordinary way.
+async fn prefetch_module_graphs(
+    roots: Vec<(String, String)>,
+    client: Arc<ObscuraHttpClient>,
+    callbacks: Arc<CallbackRegistry>,
+    document_url: Url,
+    deadline: tokio::time::Instant,
+    found_tx: tokio::sync::mpsc::UnboundedSender<(String, String, String)>,
+) {
+    /// Enough to cover a page's whole module surface without letting a
+    /// pathological import graph consume the navigation budget.
+    const MAX_MODULES: usize = 256;
+    /// Import depth to follow. Bundled apps are shallow; deeper graphs simply
+    /// finish loading through the normal path.
+    const MAX_DEPTH: usize = 6;
+
+    let mut seen: std::collections::HashSet<String> = roots
+        .iter()
+        .map(|(url, _)| url.clone())
+        .collect();
+    // (url, referrer): a dependency's referrer is the module that imported it,
+    // matching what the loader sends.
+    let mut frontier = roots;
+    let started = std::time::Instant::now();
+    let mut fetched = 0usize;
+
+    for _ in 0..MAX_DEPTH {
+        if frontier.is_empty() || fetched >= MAX_MODULES {
+            break;
+        }
+        let wave: Vec<(String, String)> = frontier
+            .drain(..)
+            .take(MAX_MODULES.saturating_sub(fetched))
+            .collect();
+
+        let requests: Vec<_> = wave
+            .into_iter()
+            .map(|(url, referrer)| {
+                let client = client.clone();
+                let cbs = callbacks.clone();
+                let document_url = document_url.clone();
+                async move {
+                    let parsed = Url::parse(&url).ok()?;
+                    // CORS mode and same-origin credentials for a module graph
+                    // are relative to the owning document, not to the importer.
+                    // Fetching one as a plain subresource would send cookies
+                    // cross-origin that the real module path withholds.
+                    let referrer = Url::parse(&referrer).unwrap_or_else(|_| document_url.clone());
+                    let request = ResourceRequest::module_script(&document_url, &referrer);
+                    let resp = client
+                        .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
+                        .await
+                        .ok()?;
+                    if !script_response_is_executable(resp.status) {
+                        return None;
+                    }
+                    let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
+                    let found = resp.url.to_string();
+                    Some((url, found, code))
+                }
+            })
+            .collect();
+
+        // Same ceiling as the classic-script batch. Halving it to leave room
+        // for the page's own fetches backfired: the cache filled too slowly
+        // to be there when a graph needed it, and microsoft.com took 40%
+        // longer than it does at 16.
+        use futures::StreamExt as _;
+        let stream = futures::stream::iter(requests).buffer_unordered(16);
+        let Ok(results) = tokio::time::timeout_at(deadline, stream.collect::<Vec<_>>()).await
+        else {
+            tracing::debug!("module prefetch stopped at the script deadline");
+            break;
+        };
+
+        for (requested, found, code) in results.into_iter().flatten() {
+            if let Ok(base) = Url::parse(&found) {
+                for specifier in obscura_js::ModulePrefetch::scan_imports(&code) {
+                    let Ok(url) = base.join(&specifier) else {
+                        continue;
+                    };
+                    if !matches!(url.scheme(), "http" | "https") {
+                        continue;
+                    }
+                    let url = url.to_string();
+                    if seen.insert(url.clone()) {
+                        frontier.push((url, found.clone()));
+                    }
+                }
+            }
+            seen.insert(found.clone());
+            fetched += 1;
+            if found_tx.send((requested, found, code)).is_err() {
+                // The page finished with its scripts; nothing left to feed.
+                return;
+            }
+        }
+    }
+
+    if fetched > 0 {
+        tracing::debug!(
+            phase = "module-prefetch",
+            modules = fetched,
+            elapsed_ms = started.elapsed().as_millis(),
+            "prefetched module sources in parallel",
+        );
+    }
+}
+
 fn script_response_is_executable(status: u16) -> bool {
     (200..=299).contains(&status)
 }
@@ -5812,9 +6073,84 @@ mod tests {
         page
     }
 
+    /// Module graphs must be fetched concurrently, not one at a time.
+    ///
+    /// The server here refuses to answer either module until both have been
+    /// requested, so the page can only finish if both requests are in flight
+    /// at once. Loading them in series deadlocks, which is what the old path
+    /// did: 88 modules on microsoft.com cost 17.6s of serial round trips
+    /// before any of them ran.
+    #[tokio::test(flavor = "current_thread")]
+    async fn module_graphs_are_fetched_concurrently() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            // Hold the first connection open until the second one arrives.
+            let mut pending = Vec::new();
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = [0u8; 2048];
+                let Ok(length) = stream.read(&mut request) else {
+                    return;
+                };
+                let path = String::from_utf8_lossy(&request[..length])
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                pending.push((stream, path));
+            }
+            for (mut stream, path) in pending {
+                let global = if path.contains("first") { "first" } else { "second" };
+                let body = format!("globalThis.__loaded_{global} = true;");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let base = format!("http://{address}");
+        let mut page = import_map_test_page(
+            "parallel-module-graphs",
+            &base,
+            r#"<html><head>
+                <script type="module" src="./first.js"></script>
+                <script type="module" src="./second.js"></script>
+            </head><body></body></html>"#,
+        );
+        page.execute_scripts_with_module_budget(Some(2000)).await;
+
+        let state = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                "[globalThis.__loaded_first === true, globalThis.__loaded_second === true]",
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            serde_json::json!([true, true]),
+            "both module graphs must be in flight together; serial loading \
+             cannot get past the first request here",
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn module_graph_and_evaluation_share_one_active_budget() {
         use std::io::{Read as _, Write as _};
+
+        // This covers the graph that still loads over the network during
+        // evaluation -- a dynamic import, or one the preload scan missed.
+        // nextest gives each test its own process, so this is contained.
+        std::env::set_var("OBSCURA_NO_MODULE_PREFETCH", "1");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();

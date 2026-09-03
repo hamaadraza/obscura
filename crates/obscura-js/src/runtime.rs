@@ -10,7 +10,7 @@ use obscura_dom::{DomTree, NodeId};
 pub use deno_core::v8::IsolateHandle;
 
 use crate::import_map::ImportMap;
-use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
+use crate::module_loader::{ModuleLoadActivity, ModulePrefetch, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
 use crate::ops::ensure_prepared_render;
 use crate::ops::{
@@ -273,6 +273,12 @@ pub struct ObscuraJsRuntime {
     /// terminates the current script and temporarily raises the limit just
     /// enough for V8 to unwind instead of aborting the worker process.
     heap_limit_state: std::sync::Arc<HeapLimitState>,
+    /// Resolves import specifiers the way the loader will, import map and
+    /// all, so the preload scan fetches the URLs that are actually requested.
+    module_resolver: Rc<ObscuraModuleLoader>,
+    /// Module sources the page fetched ahead of evaluation, shared with the
+    /// module loader.
+    module_prefetch: Rc<RefCell<std::collections::HashMap<String, (String, String)>>>,
     /// Held for the isolate's life so the runaway-script interrupt can be
     /// handed a context pointer that stays valid (diagnostic only).
     runaway_context: Option<Box<deno_core::v8::Global<deno_core::v8::Context>>>,
@@ -509,7 +515,9 @@ impl ObscuraJsRuntime {
         );
         let module_load_activity = module_loader.activity();
         let loaded_module_specifiers = module_loader.loaded_specifiers();
+        let module_prefetch = module_loader.prefetched();
         let module_loader = Rc::new(module_loader);
+        let resolver = module_loader.clone();
 
         // Build the isolate under the process-wide creation lock so two
         // connection threads never construct isolates concurrently (#430).
@@ -587,6 +595,8 @@ impl ObscuraJsRuntime {
             isolate_handle,
             heap_limit_state,
             runaway_context: None,
+            module_prefetch,
+            module_resolver: resolver,
             module_evaluations: HashMap::new(),
             loaded_module_specifiers,
             evaluated_module_specifiers: HashMap::new(),
@@ -2828,6 +2838,22 @@ impl ObscuraJsRuntime {
     /// fires. This spawns a watchdog thread that terminates the isolate once
     /// `budget` elapses, forcing V8 to throw an uncatchable error and hand
     /// control back. Always balance with [`Self::disarm_watchdog`].
+    /// Hand the module loader sources fetched by the page's preload pass.
+    pub fn add_prefetched_modules(&self, modules: Vec<(String, String, String)>) {
+        let Ok(mut cache) = self.module_prefetch.try_borrow_mut() else {
+            return;
+        };
+        for (requested, found, code) in modules {
+            cache.entry(requested).or_insert((found, code));
+        }
+    }
+
+    /// Handle the page uses to run its module preload pass alongside its
+    /// other fetches, rather than borrowing the runtime for it.
+    pub fn module_prefetch_handle(&self) -> ModulePrefetch {
+        ModulePrefetch::new(self.module_resolver.clone(), self.module_prefetch.clone())
+    }
+
     pub fn arm_watchdog(&mut self, budget: std::time::Duration) -> WatchdogToken {
         let context = if std::env::var_os("OBSCURA_TRACE_RUNAWAY").is_some() {
             if self.runaway_context.is_none() {
@@ -17733,6 +17759,78 @@ mod tests {
             None,
             "proxy_url() must return None when no proxy was configured"
         );
+    }
+
+    /// The preload scan has to see every shape of import a bundler emits,
+    /// otherwise a dependency drops back to a serial round trip during
+    /// evaluation. `from`, bare side-effect imports and dynamic `import()`
+    /// all count; a word that merely ends in "from" does not.
+    #[test]
+    fn module_import_scan_finds_every_import_shape() {
+        let source = r#"
+            import a from "./a.js";
+            import { b } from '../b.js';
+            export { c } from "./c.js";
+            import "./side-effect.js";
+            const lazy = () => import("./lazy.js");
+            const notAnImport = transform "./nope.js";
+        "#;
+        let mut found = crate::module_loader::ModulePrefetch::scan_imports(source);
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                "../b.js".to_string(),
+                "./a.js".to_string(),
+                "./c.js".to_string(),
+                "./lazy.js".to_string(),
+                "./side-effect.js".to_string(),
+            ],
+            "the scan must cover from/bare/dynamic imports and nothing else"
+        );
+    }
+
+    /// A module the page already fetched must load straight from memory.
+    /// deno_core walks a graph one module at a time, so any module that still
+    /// goes to the network here costs a full round trip in series -- the
+    /// 17.6s of serial module fetching this cache exists to remove.
+    #[test]
+    fn a_prefetched_module_loads_without_touching_the_network() {
+        use crate::module_loader::ObscuraModuleLoader;
+        use deno_core::ModuleLoader as _;
+
+        let loader = ObscuraModuleLoader::new("https://example.com/");
+        loader.prefetched().borrow_mut().insert(
+            "https://example.com/app.js".to_string(),
+            (
+                "https://cdn.example.com/app.js".to_string(),
+                "export const ready = true;".to_string(),
+            ),
+        );
+
+        let specifier = deno_core::ModuleSpecifier::parse("https://example.com/app.js").unwrap();
+        let response = loader.load(
+            &specifier,
+            None,
+            false,
+            deno_core::RequestedModuleType::None,
+        );
+        let source = match response {
+            deno_core::ModuleLoadResponse::Sync(result) => {
+                result.expect("a cached module must load")
+            }
+            deno_core::ModuleLoadResponse::Async(_) => {
+                panic!("a prefetched module must resolve synchronously, not over the network")
+            }
+        };
+        let code = match &source.code {
+            deno_core::ModuleSourceCode::String(code) => code.as_str().to_string(),
+            deno_core::ModuleSourceCode::Bytes(bytes) => {
+                String::from_utf8_lossy(bytes.as_bytes()).to_string()
+            }
+        };
+        assert_eq!(code, "export const ready = true;");
+        assert_eq!(source.module_type, deno_core::ModuleType::JavaScript);
     }
 
     #[test]

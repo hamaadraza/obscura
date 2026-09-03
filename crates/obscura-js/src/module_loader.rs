@@ -87,6 +87,113 @@ pub struct ObscuraModuleLoader {
     /// prepared root with the dependencies that its successful evaluation also
     /// evaluates.
     loaded_specifiers: Rc<RefCell<Vec<String>>>,
+    /// Module sources fetched ahead of evaluation, keyed by resolved URL.
+    /// deno_core loads a graph only when its root is evaluated, and roots are
+    /// evaluated one at a time, so every module in every graph used to cost a
+    /// separate round trip in series. The page fills this in parallel before
+    /// the serial phase begins; a hit here skips the network entirely.
+    prefetched: Rc<RefCell<std::collections::HashMap<String, (String, String)>>>,
+}
+
+/// The page's side of the module preload cache.
+///
+/// Holds the two things a preload pass needs -- specifier resolution that
+/// matches the loader (import map included) and a way to deposit fetched
+/// sources -- without borrowing the runtime. That lets the page fetch module
+/// graphs concurrently with everything else it fetches, instead of waiting
+/// its turn.
+#[derive(Clone)]
+pub struct ModulePrefetch {
+    resolver: Rc<ObscuraModuleLoader>,
+    cache: Rc<RefCell<std::collections::HashMap<String, (String, String)>>>,
+}
+
+impl ModulePrefetch {
+    /// Resolve an import specifier against a referrer exactly as the loader
+    /// would. `None` where the loader could not resolve it either, such as a
+    /// bare name with no import-map entry.
+    pub fn resolve(&self, specifier: &str, referrer: &str) -> Option<String> {
+        use deno_core::ModuleLoader as _;
+        self.resolver
+            .resolve(specifier, referrer, deno_core::ResolutionKind::Import)
+            .ok()
+            .map(|url| url.to_string())
+    }
+
+    /// Record a fetched module. `found` is the URL the bytes came from, which
+    /// becomes the base for the module's own relative imports.
+    pub fn insert(&self, requested: String, found: String, code: String) {
+        if let Ok(mut cache) = self.cache.try_borrow_mut() {
+            cache.entry(requested).or_insert((found, code));
+        }
+    }
+
+    /// Static import specifiers in a module's source, for the preload scan.
+    /// Approximate by design, like a browser's preload scanner: a specifier it
+    /// gets wrong only costs an unused fetch, and one it misses simply loads
+    /// later over the network. Catches `from "x"`, bare `import "x"` and
+    /// dynamic `import("x")`.
+    pub fn scan_imports(source: &str) -> Vec<String> {
+        /// Reads a quoted specifier starting at `at`, skipping whitespace and
+        /// an optional `(`. Returns the specifier and where it ended.
+        fn quoted_at(source: &str, at: usize) -> Option<(String, usize)> {
+            let rest = source.get(at..)?;
+            let mut offset = 0usize;
+            let mut seen_paren = false;
+            for ch in rest.chars() {
+                match ch {
+                    ' ' | '\t' | '\r' | '\n' => offset += ch.len_utf8(),
+                    '(' if !seen_paren => {
+                        seen_paren = true;
+                        offset += 1;
+                    }
+                    '\'' | '"' => {
+                        let quote = ch;
+                        let body = &rest[offset + 1..];
+                        let end = body.find(quote)?;
+                        let specifier = &body[..end];
+                        if specifier.is_empty() || specifier.len() > 512 {
+                            return None;
+                        }
+                        return Some((specifier.to_string(), at + offset + 1 + end + 1));
+                    }
+                    _ => return None,
+                }
+            }
+            None
+        }
+
+        let mut found = Vec::new();
+        for keyword in ["from", "import"] {
+            let mut index = 0usize;
+            while let Some(offset) = source[index..].find(keyword) {
+                let after = index + offset + keyword.len();
+                index = after;
+                // Only a whole word: `transform "x"` is not an import.
+                let before_is_word = source[..index - keyword.len()]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$' || c == '.');
+                if before_is_word {
+                    continue;
+                }
+                if let Some((specifier, end)) = quoted_at(source, after) {
+                    found.push(specifier);
+                    index = end;
+                }
+            }
+        }
+        found.sort();
+        found.dedup();
+        found
+    }
+
+    pub(crate) fn new(
+        resolver: Rc<ObscuraModuleLoader>,
+        cache: Rc<RefCell<std::collections::HashMap<String, (String, String)>>>,
+    ) -> Self {
+        Self { resolver, cache }
+    }
 }
 
 impl ObscuraModuleLoader {
@@ -116,6 +223,7 @@ impl ObscuraModuleLoader {
             import_map,
             activity: Arc::new(ModuleLoadActivity::default()),
             loaded_specifiers: Rc::new(RefCell::new(Vec::new())),
+            prefetched: Rc::new(RefCell::new(std::collections::HashMap::new())),
         }
     }
 
@@ -133,11 +241,19 @@ impl ObscuraModuleLoader {
             import_map,
             activity: Arc::new(ModuleLoadActivity::default()),
             loaded_specifiers: Rc::new(RefCell::new(Vec::new())),
+            prefetched: Rc::new(RefCell::new(std::collections::HashMap::new())),
         }
     }
 
     pub(crate) fn activity(&self) -> Arc<ModuleLoadActivity> {
         self.activity.clone()
+    }
+
+    /// Shared handle to the preload cache, so the page can fill it.
+    pub(crate) fn prefetched(
+        &self,
+    ) -> Rc<RefCell<std::collections::HashMap<String, (String, String)>>> {
+        self.prefetched.clone()
     }
 
     pub(crate) fn loaded_specifiers(&self) -> Rc<RefCell<Vec<String>>> {
@@ -191,6 +307,30 @@ impl ModuleLoader for ObscuraModuleLoader {
         _requested_module_type: RequestedModuleType,
     ) -> ModuleLoadResponse {
         let url = module_specifier.to_string();
+        // Already fetched by the page's preload pass: answer synchronously so
+        // the graph builds at memory speed instead of a round trip per module.
+        if let Some((found, code)) = self
+            .prefetched
+            .try_borrow()
+            .ok()
+            .and_then(|cache| cache.get(&url).cloned())
+        {
+            let mut specifiers = self.loaded_specifiers.borrow_mut();
+            specifiers.push(url.clone());
+            if found != url {
+                specifiers.push(found.clone());
+            }
+            drop(specifiers);
+            let found = ModuleSpecifier::parse(&found)
+                .unwrap_or_else(|_| module_specifier.clone());
+            return ModuleLoadResponse::Sync(Ok(ModuleSource::new_with_redirect(
+                deno_core::ModuleType::JavaScript,
+                ModuleSourceCode::String(code.into()),
+                module_specifier,
+                &found,
+                None,
+            )));
+        }
         // Module-graph CORS and same-origin credentials are relative to the
         // owning document, not to the importing module. The importer remains
         // the HTTP referrer for a dependency; keeping these URLs distinct
