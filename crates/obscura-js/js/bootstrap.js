@@ -5607,7 +5607,7 @@ class Document extends Node {
       "http://www.w3.org/1999/xhtml",
       localName,
     );
-    const el = new C(nid);
+    const el = _newElement(C, nid);
     // This node was just created from values already known to JS. Seed its
     // immutable metadata instead of rediscovering it through native calls in
     // hydration's tag/local-name checks.
@@ -5640,7 +5640,7 @@ class Document extends Node {
     );
     const effectiveNamespace = namespace == null ? "" : namespace;
     const C = _elementClassForKnownName(effectiveNamespace, qualified);
-    const el = new C(nid);
+    const el = _newElement(C, nid);
     const localName = qualified.includes(":")
       ? qualified.slice(qualified.indexOf(":") + 1)
       : qualified;
@@ -6729,48 +6729,21 @@ function _elementClassFor(nid) {
   // HTML tagName values are ASCII-uppercase. Foreign SVG names retain their
   // case, so keep the common HTML path fast and only inspect the native
   // namespace for possible SVG wrappers.
-  if (tag && tag !== tag.toUpperCase()
-      && _domParse("namespace_uri", nid) === "http://www.w3.org/2000/svg") {
-    if (tag === "path" && globalThis.SVGPathElement) return globalThis.SVGPathElement;
-    if (tag === "svg" && globalThis.SVGSVGElement) return globalThis.SVGSVGElement;
-    if (globalThis.SVGElement) return globalThis.SVGElement;
-  }
-  if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
-  if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
-  if (tag === "IMG") return HTMLImageElement;
-  if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
-  if (tag === "AUDIO") return HTMLAudioElement;
-  if (tag === "VIDEO") return HTMLVideoElement;
-  if (tag === "TRACK") return HTMLTrackElement;
-  return Element;
+  return _elementInterfaceCtor(_elementInterfaceNameFor(
+    _domParse("namespace_uri", nid), tag ? tag.toLowerCase() : ''));
 }
 function _elementClassForKnownName(namespace, qualifiedName) {
   const localName = qualifiedName.includes(":")
     ? qualifiedName.slice(qualifiedName.indexOf(":") + 1)
     : qualifiedName;
-  if (namespace === "http://www.w3.org/2000/svg") {
-    if (localName === "path" && globalThis.SVGPathElement) return globalThis.SVGPathElement;
-    if (localName === "svg" && globalThis.SVGSVGElement) return globalThis.SVGSVGElement;
-    if (globalThis.SVGElement) return globalThis.SVGElement;
-  }
-  if (namespace === "http://www.w3.org/1999/xhtml") {
-    const tag = localName.toUpperCase();
-    if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
-    if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
-    if (tag === "IMG") return HTMLImageElement;
-    if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
-    if (tag === "AUDIO") return HTMLAudioElement;
-    if (tag === "VIDEO") return HTMLVideoElement;
-    if (tag === "TRACK") return HTMLTrackElement;
-  }
-  return Element;
+  return _elementInterfaceCtor(_elementInterfaceNameFor(namespace, localName));
 }
 function _wrap(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
   if (_cache.has(nid)) return _cache.get(nid);
   const t = +_dom("node_type", nid);
   let n;
-  if (t === 1) { const C = _elementClassFor(nid); n = new C(nid); }
+  if (t === 1) { const C = _elementClassFor(nid); n = _newElement(C, nid); }
   else if (t === 3) n = new Text(nid);
   else if (t === 8) n = new Comment(nid);
   else if (t === 9) n = new Document(nid);
@@ -6778,11 +6751,19 @@ function _wrap(nid) {
   _cache.set(nid, n);
   return n;
 }
+function _newElement(C, nid) {
+  // A generated interface is not constructible from script (it throws, as in
+  // Chrome); building through Element with it as new.target is how the engine
+  // itself makes one, and gives the instance that interface's prototype.
+  return _generatedElementInterfaces.has(C)
+    ? Reflect.construct(Element, [nid], C)
+    : new C(nid);
+}
 function _wrapEl(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
   if (_cache.has(nid)) return _cache.get(nid);
   const C = _elementClassFor(nid);
-  const n = new C(nid);
+  const n = _newElement(C, nid);
   _cache.set(nid, n);
   return n;
 }
@@ -12249,10 +12230,76 @@ const _SVG_INTERFACE_BY_TAG = {
   text: 'SVGTextElement', textPath: 'SVGTextPathElement', title: 'SVGTitleElement',
   tspan: 'SVGTSpanElement', use: 'SVGUseElement', view: 'SVGViewElement',
 };
-function _elementInterfaceName(element) {
-  try {
-    const namespace = element.namespaceURI;
-    const localName = element.localName;
+
+const _INTERFACE_MEMBERS = {
+  HTMLInputElement: ['value', 'defaultValue', 'checked', 'defaultChecked', 'indeterminate',
+    'files', 'valueAsNumber', 'valueAsDate', 'selectionStart', 'selectionEnd',
+    'selectionDirection', 'type', 'disabled', 'readOnly', 'required', 'placeholder',
+    'name', 'form', 'labels', 'list', 'min', 'max', 'step', 'pattern', 'multiple',
+    'accept', 'autocomplete', 'maxLength', 'minLength', 'size', 'select',
+    'setSelectionRange', 'setRangeText', 'stepUp', 'stepDown', 'checkValidity',
+    'reportValidity', 'setCustomValidity', 'validity', 'validationMessage', 'willValidate'],
+  HTMLTextAreaElement: ['value', 'defaultValue', 'rows', 'cols', 'select', 'selectionStart',
+    'selectionEnd', 'setSelectionRange', 'setRangeText', 'form', 'labels', 'placeholder',
+    'disabled', 'readOnly', 'required', 'maxLength', 'minLength', 'name', 'wrap',
+    'checkValidity', 'reportValidity', 'setCustomValidity', 'validity', 'willValidate'],
+  HTMLSelectElement: ['value', 'selectedIndex', 'options', 'selectedOptions', 'add', 'remove',
+    'form', 'labels', 'multiple', 'size', 'disabled', 'required', 'name', 'type',
+    'checkValidity', 'reportValidity', 'setCustomValidity', 'validity', 'willValidate'],
+  HTMLOptionElement: ['value', 'text', 'selected', 'defaultSelected', 'index', 'label', 'form', 'disabled'],
+  HTMLOptGroupElement: ['label', 'disabled'],
+  HTMLButtonElement: ['value', 'type', 'disabled', 'form', 'labels', 'name',
+    'checkValidity', 'reportValidity', 'setCustomValidity', 'validity', 'willValidate'],
+  HTMLAnchorElement: ['href', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search',
+    'hash', 'origin', 'target', 'rel', 'relList', 'download', 'text', 'referrerPolicy'],
+  HTMLAreaElement: ['href', 'alt', 'coords', 'shape', 'target', 'rel', 'relList'],
+  HTMLIFrameElement: ['src', 'srcdoc', 'contentWindow', 'contentDocument', 'name', 'sandbox',
+    'allow', 'referrerPolicy', 'loading', 'width', 'height'],
+  HTMLScriptElement: ['src', 'text', 'type', 'async', 'defer', 'noModule', 'crossOrigin',
+    'referrerPolicy', 'integrity'],
+  HTMLLinkElement: ['href', 'rel', 'relList', 'type', 'as', 'media', 'crossOrigin', 'disabled', 'sheet'],
+  HTMLStyleElement: ['sheet', 'disabled', 'media', 'type'],
+  HTMLMetaElement: ['name', 'content', 'httpEquiv', 'charset'],
+  HTMLBaseElement: ['href', 'target'],
+  HTMLTitleElement: ['text'],
+  HTMLLabelElement: ['control', 'htmlFor', 'form'],
+  HTMLFieldSetElement: ['elements', 'disabled', 'name', 'form', 'type'],
+  HTMLLegendElement: ['form'],
+  HTMLOutputElement: ['value', 'defaultValue', 'htmlFor', 'form', 'labels', 'name'],
+  HTMLProgressElement: ['value', 'max', 'position', 'labels'],
+  HTMLMeterElement: ['value', 'min', 'max', 'low', 'high', 'optimum', 'labels'],
+  HTMLTemplateElement: ['content'],
+  HTMLSlotElement: ['name', 'assignedNodes', 'assignedElements', 'assign'],
+  HTMLDialogElement: ['open', 'returnValue', 'show', 'showModal', 'close'],
+  HTMLDetailsElement: ['open'],
+  HTMLTableElement: ['rows', 'tBodies', 'caption', 'tHead', 'tFoot', 'createTHead',
+    'createTFoot', 'createCaption', 'insertRow', 'deleteRow'],
+  HTMLTableSectionElement: ['rows', 'insertRow', 'deleteRow'],
+  HTMLTableRowElement: ['cells', 'rowIndex', 'sectionRowIndex', 'insertCell', 'deleteCell'],
+  HTMLTableCellElement: ['cellIndex', 'colSpan', 'rowSpan', 'headers', 'abbr', 'scope'],
+  HTMLTableColElement: ['span'],
+  HTMLOListElement: ['start', 'reversed', 'type'],
+  HTMLLIElement: ['value'],
+  HTMLObjectElement: ['data', 'type', 'name', 'form', 'width', 'height', 'contentDocument', 'contentWindow'],
+  HTMLEmbedElement: ['src', 'type', 'width', 'height'],
+  HTMLSourceElement: ['src', 'srcset', 'sizes', 'type', 'media'],
+  HTMLMapElement: ['name', 'areas'],
+  HTMLDataElement: ['value'],
+  HTMLTimeElement: ['dateTime'],
+  HTMLModElement: ['cite', 'dateTime'],
+  HTMLQuoteElement: ['cite'],
+  HTMLCanvasElement: ['width', 'height', 'getContext', 'toDataURL', 'toBlob', 'captureStream'],
+  HTMLFormElement: ['action', 'method', 'target', 'enctype', 'name', 'noValidate',
+    'acceptCharset', 'submit', 'requestSubmit', 'reset', 'checkValidity', 'reportValidity'],
+};
+
+// The constructor for an interface name, once the hierarchy above exists.
+function _elementInterfaceCtor(name) {
+  const ctor = globalThis[name];
+  return typeof ctor === 'function' ? ctor : Element;
+}
+function _elementInterfaceNameFor(namespace, localName) {
+  {
     if (namespace === 'http://www.w3.org/2000/svg') {
       return _SVG_INTERFACE_BY_TAG[localName] || 'SVGElement';
     }
@@ -12264,19 +12311,96 @@ function _elementInterfaceName(element) {
     if (specific) return specific;
     if (_HTML_GENERIC_TAGS.has(tag) || tag.includes('-')) return 'HTMLElement';
     return 'HTMLUnknownElement';
+  }
+}
+function _elementInterfaceName(element) {
+  try {
+    return _elementInterfaceNameFor(element.namespaceURI, element.localName);
   } catch (_e) {
     return 'Element';
   }
 }
 
-globalThis.HTMLElement = Element;
-globalThis.HTMLDivElement = Element;
-globalThis.HTMLSpanElement = Element;
-globalThis.HTMLParagraphElement = Element;
-globalThis.HTMLAnchorElement = Element;
+// Each element interface is its own constructor with its own prototype, the way
+// Chrome has them: HTMLDivElement is not Element, its prototype sits between the
+// element and Element.prototype, and it carries its interface name as a plain
+// data @@toStringTag. Aliasing them all to `Element` meant one shared prototype
+// that could hold only one name, so `document.documentElement` reported whatever
+// interface happened to be assigned last.
+//
+// Only the prototypes are new: the implementation still lives on
+// Element.prototype (and on the few classes with behaviour of their own, which
+// are re-parented below), so every element keeps its methods through the chain
+// and `div instanceof HTMLDivElement/HTMLElement/Element/Node/EventTarget` all
+// hold. Constructing one from script throws, as it does in a browser.
+class HTMLElement extends Element {}
+globalThis.HTMLElement = HTMLElement;
+
+const _generatedElementInterfaces = new Set();
+function _defineElementInterface(name, parent) {
+  const existing = globalThis[name];
+  if (typeof existing === 'function' && existing !== Element) {
+    // A class with behaviour of its own: keep it, re-parent it onto the
+    // interface hierarchy, and give it its tag.
+    if (Object.getPrototypeOf(existing.prototype) !== parent.prototype) {
+      try {
+        Object.setPrototypeOf(existing.prototype, parent.prototype);
+        Object.setPrototypeOf(existing, parent);
+      } catch (_e) {}
+    }
+    try {
+      Object.defineProperty(existing.prototype, Symbol.toStringTag, { value: name, configurable: true });
+    } catch (_e) {}
+    return existing;
+  }
+  const ctor = function () { throw new TypeError('Illegal constructor'); };
+  Object.defineProperty(ctor, 'name', { value: name, configurable: true });
+  Object.defineProperty(ctor, 'length', { value: 0, configurable: true });
+  ctor.prototype = Object.create(parent.prototype);
+  Object.defineProperty(ctor.prototype, 'constructor', {
+    value: ctor, writable: true, configurable: true,
+  });
+  Object.defineProperty(ctor.prototype, Symbol.toStringTag, { value: name, configurable: true });
+  Object.setPrototypeOf(ctor, parent);
+  _markNative(ctor);
+  _generatedElementInterfaces.add(ctor);
+  globalThis[name] = ctor;
+  return ctor;
+}
+
+// Every HTML interface reachable from a tag name, plus the ones a page can name
+// without an element to hand. All of them derive from HTMLElement.
+for (const name of [
+  'HTMLAnchorElement', 'HTMLAreaElement', 'HTMLBRElement', 'HTMLBaseElement',
+  'HTMLBodyElement', 'HTMLButtonElement', 'HTMLDListElement', 'HTMLDataElement',
+  'HTMLDataListElement', 'HTMLDetailsElement', 'HTMLDialogElement',
+  'HTMLDirectoryElement', 'HTMLDivElement', 'HTMLEmbedElement',
+  'HTMLFieldSetElement', 'HTMLFontElement', 'HTMLFrameElement',
+  'HTMLFrameSetElement', 'HTMLHRElement', 'HTMLHeadElement', 'HTMLHeadingElement',
+  'HTMLHtmlElement', 'HTMLIFrameElement', 'HTMLInputElement', 'HTMLLIElement',
+  'HTMLLabelElement', 'HTMLLegendElement', 'HTMLLinkElement', 'HTMLMapElement',
+  'HTMLMarqueeElement', 'HTMLMenuElement', 'HTMLMetaElement', 'HTMLMeterElement',
+  'HTMLModElement', 'HTMLOListElement', 'HTMLObjectElement', 'HTMLOptGroupElement',
+  'HTMLOptionElement', 'HTMLOutputElement', 'HTMLParagraphElement',
+  'HTMLParamElement', 'HTMLPictureElement', 'HTMLPreElement',
+  'HTMLProgressElement', 'HTMLQuoteElement', 'HTMLScriptElement',
+  'HTMLSelectElement', 'HTMLSlotElement', 'HTMLSourceElement', 'HTMLSpanElement',
+  'HTMLStyleElement', 'HTMLTableCaptionElement', 'HTMLTableCellElement',
+  'HTMLTableColElement', 'HTMLTableElement', 'HTMLTableRowElement',
+  'HTMLTableSectionElement', 'HTMLTemplateElement', 'HTMLTimeElement',
+  'HTMLTitleElement', 'HTMLUListElement', 'HTMLUnknownElement',
+  'HTMLCanvasElement', 'HTMLFormElement', 'HTMLTextAreaElement',
+  'HTMLImageElement', 'HTMLMediaElement', 'HTMLTrackElement',
+]) {
+  _defineElementInterface(name, HTMLElement);
+}
+_defineElementInterface('MathMLElement', Element);
+// The media interfaces nest one deeper.
+for (const name of ['HTMLVideoElement', 'HTMLAudioElement']) {
+  _defineElementInterface(name, globalThis.HTMLMediaElement);
+}
+
 globalThis.HTMLImageElement = HTMLImageElement;
-globalThis.HTMLInputElement = Element;
-globalThis.HTMLButtonElement = Element;
 globalThis.HTMLFormElement = class HTMLFormElement extends Element {
   get elements() { return HTMLCollection._from(this.querySelectorAll("input, select, textarea, button, fieldset, output, object")); }
   get length() { return this.elements.length; }
@@ -12284,7 +12408,6 @@ globalThis.HTMLFormElement = class HTMLFormElement extends Element {
   // 'submit' event and (if not prevented) builds form data and navigates.
   reset() { for (const f of this.elements) { if ('value' in f) f.value = ''; } }
 };
-globalThis.HTMLSelectElement = Element;
 globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
   // `rows`/`cols` reflect the content attributes and drive the control's
   // intrinsic box (the renderer sizes a textarea from them). The attributes
@@ -12302,34 +12425,7 @@ globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
   }
   set cols(v) { this.setAttribute('cols', String(v)); }
 };
-globalThis.HTMLLabelElement = Element;
-globalThis.HTMLTableElement = Element;
-globalThis.HTMLIFrameElement = Element;
-globalThis.HTMLCanvasElement = Element;
 // HTMLVideoElement and HTMLAudioElement are defined above with canPlayType support.
-globalThis.HTMLScriptElement = Element;
-globalThis.HTMLStyleElement = Element;
-globalThis.HTMLLinkElement = Element;
-globalThis.HTMLMetaElement = Element;
-globalThis.HTMLHeadElement = Element;
-globalThis.HTMLBodyElement = Element;
-globalThis.HTMLHtmlElement = Element;
-globalThis.HTMLBRElement = Element;
-globalThis.HTMLHRElement = Element;
-globalThis.HTMLUListElement = Element;
-globalThis.HTMLOListElement = Element;
-globalThis.HTMLLIElement = Element;
-globalThis.HTMLPreElement = Element;
-globalThis.HTMLHeadingElement = Element;
-globalThis.HTMLTemplateElement = Element;
-globalThis.HTMLSlotElement = Element;
-globalThis.HTMLOptionElement = Element;
-globalThis.HTMLDataListElement = Element;
-globalThis.HTMLFieldSetElement = Element;
-globalThis.HTMLLegendElement = Element;
-globalThis.HTMLProgressElement = Element;
-globalThis.HTMLDetailsElement = Element;
-globalThis.HTMLDialogElement = Element;
 // SVGAnimatedString backs the className and href reflections on SVG elements.
 // baseVal and animVal both read the live attribute (no SMIL animation), and
 // baseVal is writable. Used by the SVG-aware get className()/get href() above.
@@ -12365,6 +12461,29 @@ globalThis.SVGGraphicsElement = SVGGraphicsElement;
 globalThis.SVGGeometryElement = SVGGeometryElement;
 globalThis.SVGPathElement = SVGPathElement;
 globalThis.SVGSVGElement = SVGSVGElement;
+for (const [name, parent] of [
+  ['SVGTextContentElement', SVGGraphicsElement], ['SVGGradientElement', SVGElement],
+]) _defineElementInterface(name, parent);
+_defineElementInterface('SVGTextPositioningElement', globalThis.SVGTextContentElement);
+for (const name of ['SVGRectElement', 'SVGCircleElement', 'SVGEllipseElement',
+  'SVGLineElement', 'SVGPolygonElement', 'SVGPolylineElement']) {
+  _defineElementInterface(name, SVGGeometryElement);
+}
+for (const name of ['SVGGElement', 'SVGUseElement', 'SVGImageElement', 'SVGAElement',
+  'SVGSwitchElement', 'SVGForeignObjectElement', 'SVGDefsElement']) {
+  _defineElementInterface(name, SVGGraphicsElement);
+}
+for (const name of ['SVGDescElement', 'SVGTitleElement', 'SVGStyleElement',
+  'SVGScriptElement', 'SVGStopElement', 'SVGPatternElement', 'SVGMarkerElement',
+  'SVGMaskElement', 'SVGClipPathElement', 'SVGSymbolElement', 'SVGViewElement']) {
+  _defineElementInterface(name, SVGElement);
+}
+for (const name of ['SVGLinearGradientElement', 'SVGRadialGradientElement']) {
+  _defineElementInterface(name, globalThis.SVGGradientElement);
+}
+for (const name of ['SVGTextElement', 'SVGTSpanElement', 'SVGTextPathElement']) {
+  _defineElementInterface(name, globalThis.SVGTextPositioningElement);
+}
 globalThis.CharacterData = CharacterData;
 globalThis.Text = Text;
 globalThis.Comment = Comment;
@@ -12388,17 +12507,6 @@ globalThis.DocumentFragment = DocumentFragment;
 globalThis.DocumentType = DocumentType;
 globalThis.Node = Node;
 globalThis.Element = Element;
-// Element and SVGElement each back many interfaces, so their tag is computed
-// from the element rather than fixed. A prototype for one specific interface
-// (SVGPathElement, HTMLFormElement) keeps its own data tag and shadows this.
-const _computedTagPrototypes = new Set();
-for (const base of [Element, globalThis.SVGElement]) {
-  if (!base || !base.prototype || _computedTagPrototypes.has(base.prototype)) continue;
-  const getter = { ['get [Symbol.toStringTag]']() { return _elementInterfaceName(this); } }['get [Symbol.toStringTag]'];
-  _markNativeAs(getter, 'function get [Symbol.toStringTag]() { [native code] }');
-  Object.defineProperty(base.prototype, Symbol.toStringTag, { get: getter, configurable: true });
-  _computedTagPrototypes.add(base.prototype);
-}
 globalThis.Document = Document;
 // CSSStyleDeclaration is the type of element.style and getComputedStyle(); it is
 // pre-declared non-enumerable in _preHideInternals, but unlike the other WebIDL
@@ -18092,6 +18200,17 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
 // its tag here. The engine's globals are left alone, as are factories whose
 // prototype belongs to another interface (Image, Audio, Option, and the
 // webkit aliases), which take that interface's name.
+for (const [name, names] of Object.entries(_INTERFACE_MEMBERS)) {
+  const ctor = globalThis[name];
+  if (typeof ctor !== 'function' || !ctor.prototype || ctor.prototype === Element.prototype) continue;
+  for (const member of names) {
+    if (Object.prototype.hasOwnProperty.call(ctor.prototype, member)) continue;
+    const descriptor = Object.getOwnPropertyDescriptor(Element.prototype, member);
+    if (!descriptor) continue;
+    try { Object.defineProperty(ctor.prototype, member, descriptor); } catch (_e) {}
+  }
+}
+
 (function _tagInterfacePrototypes() {
   const factories = new Set(['Image', 'Audio', 'Option', 'webkitURL', 'webkitAudioContext']);
   for (const name of Object.getOwnPropertyNames(globalThis)) {
@@ -18107,8 +18226,6 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     const own = Object.getOwnPropertyDescriptor(proto, Symbol.toStringTag);
     if (own && !own.configurable) continue;
     if (own && 'value' in own && own.value === name && !own.enumerable) continue;
-    // A computed tag (Element/SVGElement derive theirs from the element).
-    if (_computedTagPrototypes.has(proto)) continue;
     try { Object.defineProperty(proto, Symbol.toStringTag, { value: name, configurable: true }); } catch (_e) {}
   }
 })();

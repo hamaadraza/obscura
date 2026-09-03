@@ -5726,6 +5726,20 @@ mod tests {
                     tag(new Headers()), tag(document.querySelectorAll("body")),
                     desc && "value" in desc && !desc.enumerable && desc.configurable,
                     tag(new Image()) !== "[object Image]",
+                    // Element interfaces are distinct constructors with their own
+                    // prototypes, and their tag is a data property like Chrome's.
+                    HTMLDivElement !== Element && HTMLDivElement.prototype !== Element.prototype,
+                    (() => {
+                        const d = Object.getOwnPropertyDescriptor(HTMLDivElement.prototype, Symbol.toStringTag);
+                        return !!d && "value" in d && d.value === "HTMLDivElement" && !d.enumerable;
+                    })(),
+                    (() => {
+                        const div = document.createElement("div");
+                        return div instanceof HTMLDivElement && div instanceof HTMLElement
+                            && div instanceof Element && div instanceof Node
+                            && div instanceof EventTarget && !(div instanceof HTMLSpanElement);
+                    })(),
+                    (() => { try { new HTMLDivElement(); return false; } catch (e) { return e instanceof TypeError; } })(),
                     tag([]), tag(function () {}), tag(Promise.prototype), tag({}),
                 ];
                 "#,
@@ -5736,7 +5750,7 @@ mod tests {
             serde_json::json!([
                 "[object EventTarget]", "[object EventTarget]", "[object Node]",
                 "[object Text]", "[object URL]", "[object Headers]", "[object NodeList]",
-                true, true,
+                true, true, true, true, true, true,
                 "[object Array]", "[object Function]", "[object Promise]", "[object Object]"
             ])
         );
