@@ -1167,6 +1167,181 @@ fn op_shadow_attach(state: &OpState, host_nid: u32, #[string] mode: String) -> i
 /// Return native host-owned shadow identity as `root-id\0mode`. Closed roots
 /// are included here; the Web-facing `Element.shadowRoot` getter applies mode
 /// visibility in bootstrap.js.
+/// Tags that generate no boxes, so their text is not part of the rendered text.
+const INNER_TEXT_SKIP: &[&str] = &[
+    "script", "style", "noscript", "template", "head", "title", "meta", "link", "base", "param",
+    "source", "track", "datalist", "rp",
+];
+
+/// Tags whose default `display` is block-level: text either side of one is
+/// separated by a line break.
+const INNER_TEXT_BLOCK: &[&str] = &[
+    "address", "article", "aside", "blockquote", "body", "caption", "center", "colgroup", "dd",
+    "details", "dialog", "dir", "div", "dl", "dt", "fieldset", "figcaption", "figure", "footer",
+    "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hgroup", "hr", "html", "legend", "li",
+    "listing", "main", "menu", "nav", "ol", "optgroup", "option", "p", "pre", "search", "section",
+    "summary", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "ul",
+];
+
+/// `innerText` as the renderer sees it: elements that generate no boxes
+/// contribute nothing, block boundaries introduce line breaks, and whitespace
+/// collapses the way layout collapses it.
+///
+/// Computed here rather than in the JS shim because the shim had to cross the
+/// bridge once per node: on a page like github.com that is thousands of round
+/// trips, which timed out where a browser answers instantly.
+fn dom_inner_text(dom: &DomTree, root: NodeId) -> String {
+    struct Frame {
+        children: Vec<NodeId>,
+        index: usize,
+        preserve: bool,
+        closing: u8,
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut pending: u8 = 0;
+    let mut last_preserve = false;
+
+    fn trim_tail(out: &mut [String], last_preserve: bool) {
+        if let Some(last) = out.last_mut() {
+            if !last_preserve {
+                let trimmed = last.trim_end_matches([' ', '\t']);
+                if trimmed.len() != last.len() {
+                    last.truncate(trimmed.len());
+                }
+            }
+        }
+    }
+
+    let mut stack = vec![Frame {
+        children: dom.children(root),
+        index: 0,
+        preserve: false,
+        closing: 0,
+    }];
+
+    while let Some(frame) = stack.last_mut() {
+        if frame.index >= frame.children.len() {
+            let closing = frame.closing;
+            stack.pop();
+            if closing > 0 && !out.is_empty() && closing > pending {
+                pending = closing;
+            }
+            continue;
+        }
+        let child = frame.children[frame.index];
+        frame.index += 1;
+        let preserve = frame.preserve;
+
+        enum Kind {
+            Text(String),
+            Element(String, Option<String>),
+            Other,
+        }
+        let kind = dom
+            .with_node(child, |node| match &node.data {
+                NodeData::Text { contents } => Kind::Text(contents.clone()),
+                NodeData::Element { name, attrs, .. } => {
+                    let style = attrs
+                        .iter()
+                        .find(|a| a.name.local.as_ref().eq_ignore_ascii_case("style"))
+                        .map(|a| a.value.clone());
+                    Kind::Element(name.local.as_ref().to_ascii_lowercase(), style)
+                }
+                _ => Kind::Other,
+            })
+            .unwrap_or(Kind::Other);
+
+        match kind {
+            Kind::Text(contents) => {
+                let mut text = if preserve {
+                    contents
+                } else {
+                    let mut collapsed = String::with_capacity(contents.len());
+                    let mut in_space = false;
+                    for ch in contents.chars() {
+                        if matches!(ch, ' ' | '\t' | '\r' | '\n' | '\u{c}') {
+                            if !in_space {
+                                collapsed.push(' ');
+                                in_space = true;
+                            }
+                        } else {
+                            collapsed.push(ch);
+                            in_space = false;
+                        }
+                    }
+                    collapsed
+                };
+                if text.is_empty() {
+                    continue;
+                }
+                if !preserve && text.trim().is_empty() && (pending > 0 || out.is_empty()) {
+                    continue;
+                }
+                if !out.is_empty() && pending > 0 {
+                    trim_tail(&mut out, last_preserve);
+                    out.push(if pending > 1 { "\n\n".into() } else { "\n".into() });
+                    if !preserve {
+                        text = text.trim_start_matches([' ', '\t']).to_string();
+                    }
+                    if text.is_empty() {
+                        pending = 0;
+                        continue;
+                    }
+                }
+                pending = 0;
+                out.push(text);
+                last_preserve = preserve;
+            }
+            Kind::Element(tag, style) => {
+                if INNER_TEXT_SKIP.contains(&tag.as_str()) {
+                    continue;
+                }
+                // Only the inline `display` is consulted; resolving the cascade
+                // would mean styling every descendant on every read.
+                if style
+                    .as_deref()
+                    .map(|s| {
+                        s.split(';').any(|decl| {
+                            let mut parts = decl.splitn(2, ':');
+                            matches!(
+                                (parts.next(), parts.next()),
+                                (Some(p), Some(v))
+                                    if p.trim().eq_ignore_ascii_case("display")
+                                        && v.trim().eq_ignore_ascii_case("none")
+                            )
+                        })
+                    })
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                if tag == "br" {
+                    trim_tail(&mut out, last_preserve);
+                    out.push("\n".into());
+                    last_preserve = false;
+                    pending = 0;
+                    continue;
+                }
+                let block = INNER_TEXT_BLOCK.contains(&tag.as_str());
+                let breaks: u8 = if tag == "p" { 2 } else { 1 };
+                if block && !out.is_empty() && breaks > pending {
+                    pending = breaks;
+                }
+                stack.push(Frame {
+                    children: dom.children(child),
+                    index: 0,
+                    preserve: preserve || tag == "pre" || tag == "textarea" || tag == "listing",
+                    closing: if block { breaks } else { 0 },
+                });
+            }
+            Kind::Other => {}
+        }
+    }
+
+    out.concat().trim_matches(|c: char| c.is_whitespace()).to_string()
+}
+
 #[op2]
 #[string]
 fn op_shadow_root_info(state: &OpState, host_nid: u32) -> String {
@@ -1549,6 +1724,10 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         "text_content" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             serde_json::to_string(&dom.text_content(NodeId::new(nid))).unwrap_or("\"\"".into())
+        }
+        "inner_text" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            serde_json::to_string(&dom_inner_text(&dom, NodeId::new(nid))).unwrap_or("\"\"".into())
         }
         "parent_node" | "first_child" | "last_child" | "next_sibling" | "prev_sibling" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);

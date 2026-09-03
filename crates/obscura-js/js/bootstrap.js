@@ -3382,38 +3382,48 @@ function _innerTextOf(root) {
     lastPreserve = preserve;
   };
   const breakHere = (count) => { if (out.length && count > pending) pending = count; };
-  const walk = (node, preserve) => {
-    const children = node.childNodes;
-    for (let i = 0; i < children.length; i++) {
-      const child = children[i];
-      const type = child.nodeType;
-      if (type === 3) {
-        let text = child.data || '';
-        if (!preserve) {
-          text = text.replace(/[ \t\r\n\f]+/g, ' ');
-          // Whitespace that only separates blocks is absorbed by the break.
-          if (!text.trim() && (pending || !out.length)) continue;
-        }
-        emit(text, preserve);
-        continue;
-      }
-      if (type !== 1) continue;
-      const tag = child.tagName ? child.tagName.toUpperCase() : '';
-      if (_INNER_TEXT_SKIP.has(tag)) continue;
-      // Only the inline `display` is consulted. Resolving the full cascade
-      // would cost a computed-style call for every descendant on every read,
-      // and extraction code reads innerText in loops.
-      const inline = child.getAttribute ? child.getAttribute('style') : null;
-      if (inline && /(^|;)\s*display\s*:\s*none\s*(;|$)/i.test(inline)) continue;
-      if (tag === 'BR') { trimTail(); out.push('\n'); lastPreserve = false; pending = 0; continue; }
-      const block = _INNER_TEXT_BLOCK.has(tag);
-      const breaks = tag === 'P' ? 2 : 1;
-      if (block) breakHere(breaks);
-      walk(child, preserve || tag === 'PRE' || tag === 'TEXTAREA' || tag === 'LISTING');
-      if (block) breakHere(breaks);
+  // Walked with an explicit stack rather than recursion: a deeply nested
+  // document (github.com is one) overflowed the call stack, and innerText threw
+  // where a browser returns the text.
+  const stack = [{ nodes: root.childNodes, index: 0, preserve: false, closing: 0 }];
+  while (stack.length) {
+    const frame = stack[stack.length - 1];
+    if (frame.index >= frame.nodes.length) {
+      stack.pop();
+      if (frame.closing) breakHere(frame.closing);
+      continue;
     }
-  };
-  walk(root, false);
+    const child = frame.nodes[frame.index++];
+    const type = child.nodeType;
+    if (type === 3) {
+      let text = child.data || '';
+      if (!frame.preserve) {
+        text = text.replace(/[ \t\r\n\f]+/g, ' ');
+        // Whitespace that only separates blocks is absorbed by the break.
+        if (!text.trim() && (pending || !out.length)) continue;
+      }
+      emit(text, frame.preserve);
+      continue;
+    }
+    if (type !== 1) continue;
+    const tag = child.tagName ? child.tagName.toUpperCase() : '';
+    if (_INNER_TEXT_SKIP.has(tag)) continue;
+    // Only the inline `display` is consulted. Resolving the full cascade
+    // would cost a computed-style call for every descendant on every read,
+    // and extraction code reads innerText in loops.
+    const inline = child.getAttribute ? child.getAttribute('style') : null;
+    if (inline && /(^|;)\s*display\s*:\s*none\s*(;|$)/i.test(inline)) continue;
+    if (tag === 'BR') { trimTail(); out.push('\n'); lastPreserve = false; pending = 0; continue; }
+    const block = _INNER_TEXT_BLOCK.has(tag);
+    const breaks = tag === 'P' ? 2 : 1;
+    if (block) breakHere(breaks);
+    stack.push({
+      nodes: child.childNodes,
+      index: 0,
+      preserve: frame.preserve || tag === 'PRE' || tag === 'TEXTAREA' || tag === 'LISTING',
+      closing: block ? breaks : 0,
+    });
+  }
   return out.join('').replace(/^\s+|\s+$/g, '');
 }
 
@@ -3525,7 +3535,16 @@ class Element extends Node {
     }
   }
   get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
-  get innerText() { return _innerTextOf(this); }
+  get innerText() {
+    // One native walk: crossing the bridge per node made this take longer
+    // than a page load on a large document. The JS walk stays for nodes the
+    // native tree does not back.
+    if (typeof this._nid === 'number') {
+      const text = _domParse('inner_text', this._nid);
+      if (typeof text === 'string') return text;
+    }
+    return _innerTextOf(this);
+  }
   set innerText(v) {
     const text = String(v ?? '');
     if (!/[\r\n]/.test(text)) { this.textContent = text; return; }
