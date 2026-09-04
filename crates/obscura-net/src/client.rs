@@ -1555,7 +1555,11 @@ impl ObscuraHttpClient {
 
             let in_flight = InFlightGuard::new(&self.in_flight);
             let resp = req_builder.send().await.map_err(|e| {
-                ObscuraNetError::Network(format!("{}: {}", current_url, e))
+                ObscuraNetError::Network(format!(
+                    "{}: {}",
+                    current_url,
+                    describe_error(&e)
+                ))
             })?;
 
             let status = resp.status();
@@ -1658,6 +1662,29 @@ impl Default for ObscuraHttpClient {
     }
 }
 
+/// An error together with everything underneath it.
+///
+/// A transport error's own `Display` is only a summary -- reqwest's is
+/// `error sending request for url (...)` whatever went wrong -- and the reason
+/// lives in its source chain. Dropping that made a TLS reset, a refused
+/// connection, a DNS failure and a timeout all report as the same sentence,
+/// which says nothing a caller can act on. Two sites in the corpus turned out
+/// to be reset mid-handshake by SNI filtering on the way out; diagnosing that
+/// took a layered network probe only because this message would not say so.
+pub(crate) fn describe_error(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        // Chains often restate the layer above; keep the message readable.
+        if !parts.iter().any(|seen| seen == &text) {
+            parts.push(text);
+        }
+        source = cause.source();
+    }
+    parts.join(": ")
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ObscuraNetError {
     #[error("Network error: {0}")]
@@ -1674,6 +1701,68 @@ pub enum ObscuraNetError {
 
     #[error("Response body exceeded {limit} byte limit: {url}")]
     ResponseTooLarge { url: String, limit: usize },
+}
+
+#[cfg(test)]
+mod error_reporting_tests {
+    use super::describe_error;
+
+    /// A transport failure has to say what actually failed.
+    ///
+    /// reqwest renders every one of them as `error sending request for url
+    /// (...)`, so on its own a TLS reset, a refused connection, a DNS failure
+    /// and a timeout are the same sentence. Two sites in the corpus are reset
+    /// mid-handshake by SNI filtering on the way out of this machine, and the
+    /// message gave no way to tell that from an outage at the far end.
+    #[test]
+    fn a_transport_error_reports_what_actually_failed() {
+        #[derive(Debug)]
+        struct Sending(std::io::Error);
+        impl std::fmt::Display for Sending {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "error sending request for url (https://example.test/)")
+            }
+        }
+        impl std::error::Error for Sending {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let described = describe_error(&Sending(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "An existing connection was forcibly closed by the remote host",
+        )));
+        assert!(
+            described.contains("error sending request"),
+            "the summary is kept: {described}"
+        );
+        assert!(
+            described.contains("forcibly closed by the remote host"),
+            "the cause has to survive: {described}"
+        );
+    }
+
+    /// Chains commonly restate the layer above them, and repeating it just
+    /// pushes the useful part further along the line.
+    #[test]
+    fn a_repeated_cause_is_only_reported_once() {
+        #[derive(Debug)]
+        struct Echo(std::io::Error);
+        impl std::fmt::Display for Echo {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "connection reset")
+            }
+        }
+        impl std::error::Error for Echo {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let described = describe_error(&Echo(std::io::Error::other("connection reset")));
+        assert_eq!(described, "connection reset");
+    }
 }
 
 #[cfg(test)]

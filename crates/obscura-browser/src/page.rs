@@ -3318,7 +3318,7 @@ impl Page {
         }
         .map_err(|e| {
             self.lifecycle = LifecycleState::Failed;
-            PageError::NetworkError(e.to_string())
+            page_network_error(e)
         })?;
 
         // Store binary main resources (images, PDFs, octet-stream) base64 so
@@ -6080,6 +6080,32 @@ mod tests {
     /// at once. Loading them in series deadlocks, which is what the old path
     /// did: 88 modules on microsoft.com cost 17.6s of serial round trips
     /// before any of them ran.
+    /// The page must not announce a network error twice.
+    ///
+    /// `ObscuraNetError::Network` already renders as `Network error: ...`, and
+    /// wrapping its rendered form in `PageError::NetworkError` produced
+    /// `Network error: Network error: ...`, pushing the part a caller needs to
+    /// the far end of the line.
+    #[test]
+    fn a_network_error_is_announced_once() {
+        let error = crate::PageError::from(obscura_net::ObscuraNetError::Network(
+            "https://example.test/: connection reset".to_string(),
+        ));
+        assert_eq!(
+            error.to_string(),
+            "Network error: https://example.test/: connection reset"
+        );
+    }
+
+    /// Every other kind still says which kind it is.
+    #[test]
+    fn a_non_network_error_keeps_its_own_wording() {
+        let error = crate::PageError::from(obscura_net::ObscuraNetError::Blocked(
+            "https://example.test/".to_string(),
+        ));
+        assert!(error.to_string().contains("Request blocked"), "got {error}");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn module_graphs_are_fetched_concurrently() {
         use std::io::{Read as _, Write as _};
@@ -7721,7 +7747,19 @@ pub enum PageError {
 
 impl From<ObscuraNetError> for PageError {
     fn from(e: ObscuraNetError) -> Self {
-        PageError::NetworkError(e.to_string())
+        page_network_error(e)
+    }
+}
+
+/// Carries a network error up to the page without saying so twice.
+///
+/// `ObscuraNetError::Network` already renders as `Network error: ...`, so
+/// wrapping its `to_string()` in `PageError::NetworkError` printed the
+/// phrase twice and pushed the part that mattered further down the line.
+fn page_network_error(error: ObscuraNetError) -> PageError {
+    match error {
+        ObscuraNetError::Network(message) => PageError::NetworkError(message),
+        other => PageError::NetworkError(other.to_string()),
     }
 }
 
