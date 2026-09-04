@@ -140,6 +140,63 @@ handover notes are private working material: do not edit them, link them from
 public documentation, stage them, or commit them. Do not commit generated
 screenshots or reports.
 
+## Known performance work: incremental layout
+
+A style mutation costs a full relayout. On a 2,500-row document (~10,000
+elements) one `element.style.height = ...` followed by a rect read costs about
+325ms, and the read-after-write pattern it comes from is everywhere in
+framework code. This is measured, not estimated; do not re-derive it.
+
+**The cascade is not the problem.** It is already incremental and already
+cheap. With `OBSCURA_RENDER_TIMING=1` on that document:
+
+```
+first layout:   cascade = 501ms
+after mutation: cascade = 17.5ms   retained_reused=10000  retained_fresh=7
+```
+
+Seven elements re-cascade. The remaining ~305ms is box layout and text
+measurement, redone wholesale. Comparing against an identical document with no
+text nodes splits it:
+
+| page                       | first layout | relayout |
+| -------------------------- | ------------ | -------- |
+| with text                  | 718ms        | 325ms    |
+| same structure, no text    | 294ms        | 155ms    |
+| text's share               | 424ms (59%)  | 170ms (52%) |
+
+So there are two independent halves: text shaping (~52%) and taffy tree
+build/compute (~48%).
+
+Two designs were scoped. Both are real, both are blocked on something specific:
+
+1. **Persist shaped text across layouts.** The shaping caches today are
+   per-render-pass by construction (`inline.rs`: "Owns the font set and shaping
+   caches for one render pass"), so nothing survives between layouts. Needs a
+   longer-lived cache threaded through the engine, keyed on text plus the font
+   attributes, size and wrap width. A wrong key gives silently wrong metrics
+   and therefore silently wrong layout, so the key has to be exhaustive.
+
+2. **Skip layout when no computed style that affects layout changed.** Run the
+   17.5ms retained cascade, compare the resulting `LayoutStyle`s for the few
+   elements it refreshed, and reuse the previous layout when nothing
+   layout-affecting differs. Roughly 18x on this path.
+
+   Prefer this one: the risk direction is safe. Comparing everything *except* a
+   listed set of paint-only fields means a field you forget to list causes an
+   unnecessary relayout — slow but correct — never a stale one.
+
+   **First step:** `LayoutStyle` derives only `Debug, Clone, Default`. Adding
+   `PartialEq` fails on `BorderCascadeOp`, `GridCalcExpression`, `TransformOp`
+   and `WaapiSampleState`, and possibly types behind those. Give those
+   `PartialEq` first; the rest of the design follows from there.
+
+Note what does *not* work, so it is not retried: deciding from the mutation
+itself whether layout can change. A pending animation start-candidate can begin
+an animation on a layout-affecting property, so a "this mutation was paint-only"
+shortcut is unsound. Comparing computed styles after the cascade avoids that
+entirely, because the cascade has already accounted for animations.
+
 ## Gotchas
 
 - **DOM mutation arg order:** `insertBefore` / `replaceChild` in `bootstrap.js`
