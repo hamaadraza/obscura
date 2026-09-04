@@ -3410,8 +3410,35 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
             use tokio::io::AsyncWriteExt;
             let (mut sock, _) = listener.accept().await.unwrap();
+
+            // Read the request before answering it, as any server does.
+            // Closing a socket that still has unread bytes in its receive
+            // buffer is an abortive close on Windows: the peer is sent an RST
+            // and reports ConnectionAborted (os error 10053) rather than a
+            // clean EOF. For a body small enough that the close raced the
+            // client's own write, that lost the response outright and the
+            // request never completed.
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        request.extend_from_slice(&buf[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                        if request.len() > 64 * 1024 {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+
             let mut header = String::from("HTTP/1.1 200 OK\r\nConnection: close\r\n");
             if with_content_length {
                 header.push_str(&format!("Content-Length: {body_len}\r\n"));
