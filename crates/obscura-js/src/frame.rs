@@ -1014,6 +1014,58 @@ mod tests {
         std::env::remove_var("OBSCURA_FRAME_MESSAGE_QUEUE_ENTRIES");
     }
 
+    /// Resolving an already-resolved promise inside a frame must not take the
+    /// process down.
+    ///
+    /// V8 reports that as `kPromiseResolveAfterResolved` through the isolate's
+    /// promise-reject callback, which belongs to deno_core and reads its state
+    /// from a raw pointer in the *current* context's embedder slots. A frame
+    /// realm is a context deno_core never created, so that slot was empty and
+    /// the callback dereferenced null: an access violation, not a catchable
+    /// error. A `<iframe>` that parked a promise resolver on `window` and
+    /// called it from a `DOMContentLoaded` handler was enough to hit it, which
+    /// is what every YouTube embed does -- 7 of 106 real sites died on it.
+    ///
+    /// The assertion is not what this test is really checking: if the realm
+    /// stops carrying deno_core's context state, this aborts rather than fails.
+    #[test]
+    fn resolving_a_settled_promise_in_a_frame_does_not_abort_the_process() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://parent.example/child",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+
+        // Park the resolver, settle the promise, then settle it again the way
+        // a load handler would.
+        frame
+            .execute_script(
+                &mut parent,
+                "globalThis.p = new Promise(res => { globalThis.settle = res; });                 globalThis.settle({ first: true });",
+            )
+            .expect("the frame's promise must settle");
+        frame
+            .execute_script(&mut parent, "globalThis.settle({ second: true });")
+            .expect("settling an already-settled promise must be a no-op, not a fault");
+
+        // The realm is still usable afterwards, and kept the first result.
+        frame
+            .execute_script(
+                &mut parent,
+                "globalThis.p.then(v => { globalThis.seen = v.first === true; });",
+            )
+            .expect("the frame realm must still run script");
+
+        // An unhandled rejection takes the same callback path.
+        frame
+            .execute_script(&mut parent, "Promise.reject(new Error('unhandled'));")
+            .expect("an unhandled rejection in a frame must not fault either");
+    }
+
     /// The page realm holds the frame's window and document, so a discarded
     /// frame leaves the page naming objects from a context the host no longer
     /// holds. Reading one must be safe. A regression here is an access

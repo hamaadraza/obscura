@@ -478,6 +478,51 @@ impl WatchdogToken {
 const SYNCHRONOUS_TASK_FLOOR_MS: u64 = 5_000;
 const WATCHDOG_SCHEDULING_MARGIN_MS: u64 = 500;
 
+/// Gives a host-created realm the per-context state deno_core installs on the
+/// contexts it creates itself.
+///
+/// deno_core's callbacks are registered on the isolate, so they fire for every
+/// context in it -- including the ones we build for frames. Each of them
+/// resolves its state by reading a raw pointer out of the *current* context's
+/// embedder slots, with a `SAFETY: slot is valid and set during realm
+/// creation` that only holds for contexts deno_core created. A frame realm's
+/// slots were empty, so the first callback to fire dereferenced null.
+///
+/// That was not hypothetical: an already-resolved promise being resolved again
+/// inside a frame makes V8 report `kPromiseResolveAfterResolved`, which lands
+/// in deno_core's promise-reject callback, which read the null slot and took
+/// the process down with an access violation. A `<iframe>` whose document did
+/// nothing more exotic than park a promise resolver on `window` was enough --
+/// which is to say YouTube embeds, and roughly one page in fifteen.
+///
+/// Pointing a frame at the main realm's state is what a browser does anyway:
+/// promise rejections a frame does not handle surface on the page, and the
+/// module map is the one the page loads through. deno_core clones the `Rc` on
+/// each read and drops it again, so sharing the pointer keeps the refcount
+/// balanced; ownership stays with the main realm, which outlives every frame.
+fn adopt_runtime_context_state(
+    scope: &mut deno_core::v8::HandleScope<()>,
+    main_context: &deno_core::v8::Global<deno_core::v8::Context>,
+    realm: deno_core::v8::Local<deno_core::v8::Context>,
+) {
+    let main = deno_core::v8::Local::new(scope, main_context);
+    for slot in [
+        deno_core::CONTEXT_STATE_SLOT_INDEX,
+        deno_core::MODULE_MAP_SLOT_INDEX,
+    ] {
+        // SAFETY: the pointers are deno_core's own, read from the context it
+        // created and installed them on, and are only ever read back through
+        // deno_core's accessors. The main realm owns them for the life of the
+        // runtime, so a frame cannot outlive what it points at.
+        unsafe {
+            let state = main.get_aligned_pointer_from_embedder_data(slot);
+            if !state.is_null() {
+                realm.set_aligned_pointer_in_embedder_data(slot, state);
+            }
+        }
+    }
+}
+
 impl ObscuraJsRuntime {
     /// Freeze the document timeline for one JavaScript task. Browser timelines
     /// update at task/rendering boundaries, not on each forced style or layout
@@ -622,6 +667,7 @@ impl ObscuraJsRuntime {
     pub(crate) fn create_realm_context(
         &mut self,
     ) -> Option<deno_core::v8::Global<deno_core::v8::Context>> {
+        let main_context = self.runtime.main_context();
         let context = {
             let isolate = self.runtime.v8_isolate();
             let scope = &mut deno_core::v8::HandleScope::new(isolate);
@@ -637,6 +683,7 @@ impl ObscuraJsRuntime {
                     deno_core::v8::ContextOptions::default(),
                 )
             })?;
+            adopt_runtime_context_state(scope, &main_context, context);
             deno_core::v8::Global::new(scope, context)
         };
         Some(context)
