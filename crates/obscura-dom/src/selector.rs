@@ -702,6 +702,62 @@ fn simple_id_selector(selector: &str) -> Option<&str> {
     }
 }
 
+/// Elements a selector list could possibly match, or `None` when the question
+/// cannot be narrowed and every element has to be tried.
+///
+/// The subject of a selector -- its rightmost compound -- has to match the
+/// element itself, so a selector ending in `.card` can only ever match an
+/// element carrying that class. `subject_keys` already works this out for the
+/// stylesheet's rule buckets, including the conservative treatment of `:is()`
+/// and `:where()`; this reuses it to skip running the selector engine over
+/// elements that cannot match.
+///
+/// Returning a superset is fine and returning `None` is fine. Returning too
+/// few would drop real matches, so anything not positively narrowed -- a
+/// universal or attribute subject, a class the index cannot answer for, a
+/// quirks-mode document -- gives up and lets the caller walk everything.
+fn selector_candidates(
+    tree: &DomTree,
+    list: &SelectorList<ObscuraSelector>,
+) -> Option<Vec<std::rc::Rc<Vec<NodeId>>>> {
+    let mut candidates: Vec<std::rc::Rc<Vec<NodeId>>> = Vec::new();
+    for selector in list.slice() {
+        let keys = subject_keys(selector);
+        if keys.is_empty() {
+            return None;
+        }
+        for key in keys {
+            match key {
+                // The id index keeps one node per id, so it cannot enumerate
+                // a document that repeats one. Walking is the correct answer.
+                SelectorKey::Id(_) => return None,
+                SelectorKey::Class(class) => {
+                    candidates.push(tree.elements_with_class(&class)?);
+                }
+                SelectorKey::Local(local) => {
+                    candidates.push(tree.elements_with_tag(&local)?);
+                }
+                // A subject with no positively indexable token can be any
+                // element at all.
+                SelectorKey::Universal
+                | SelectorKey::Attribute(_)
+                | SelectorKey::Root => return None,
+            }
+        }
+    }
+    // Narrowing is not free: every element still gets a membership test, and
+    // for a compound selector that fails fast a test costs about as much as
+    // the match it replaces. Measured on a 10,000-element document, a bucket
+    // holding a quarter of the elements made the query slower, while an eighth
+    // was a clear win -- so only prune when the index actually prunes.
+    let total: usize = candidates.iter().map(|bucket| bucket.len()).sum();
+    let covered = tree.indexed_element_count()?;
+    if total.saturating_mul(8) > covered {
+        return None;
+    }
+    Some(candidates)
+}
+
 impl DomTree {
     pub fn query_selector(&self, selector: &str) -> Result<Option<NodeId>, String> {
         self.query_selector_from(self.document(), selector)
@@ -747,7 +803,15 @@ impl DomTree {
             MatchingForInvalidation::No,
         );
 
+        let candidates = selector_candidates(self, &selector_list);
         for desc_id in self.descendants(root) {
+            if candidates.as_ref().is_some_and(|buckets| {
+                !buckets
+                    .iter()
+                    .any(|bucket| bucket.binary_search(&desc_id).is_ok())
+            }) {
+                continue;
+            }
             let is_element = self.with_node(desc_id, |n| n.is_element()).unwrap_or(false);
             if is_element {
                 let element = DomElement::new(self, desc_id);
@@ -790,7 +854,15 @@ impl DomTree {
         );
         let mut results = Vec::new();
 
+        let candidates = selector_candidates(self, &selector_list);
         for desc_id in self.descendants(root) {
+            if candidates.as_ref().is_some_and(|buckets| {
+                !buckets
+                    .iter()
+                    .any(|bucket| bucket.binary_search(&desc_id).is_ok())
+            }) {
+                continue;
+            }
             let is_element = self.with_node(desc_id, |n| n.is_element()).unwrap_or(false);
             if is_element {
                 let element = DomElement::new(self, desc_id);
@@ -1699,6 +1771,59 @@ mod tests {
         // attr_matches still reads through the borrow.
         assert_eq!(count("#root p[data-x]"), 1);
         assert_eq!(count(r#"#root p[data-x="1"]"#), 1);
+    }
+
+    /// The selector index must never cost a match.
+    ///
+    /// Queries are answered by narrowing to elements whose class or tag could
+    /// possibly be the selector's subject, and matching only those. The index
+    /// behind that is rebuilt whenever the tree changes rather than updated in
+    /// step with each mutation, because the failure mode of a stale entry is a
+    /// query quietly returning too few elements -- a wrong answer, not a slow
+    /// one, and one nothing downstream can detect.
+    ///
+    /// So this walks the tree through a sequence of mutations and checks the
+    /// answers after every one.
+    #[test]
+    fn the_selector_index_survives_mutation() {
+        let tree = parse_html(
+            r#"<div id="app">
+                 <p class="card one">a</p>
+                 <p class="card two">b</p>
+                 <span class="card">c</span>
+               </div>"#,
+        );
+        let count = |selector: &str| tree.query_selector_all(selector).unwrap().len();
+
+        assert_eq!(count(".card"), 3);
+        assert_eq!(count("p.card"), 2);
+        assert_eq!(count("span"), 1);
+        assert_eq!(count(".missing"), 0);
+
+        // A new element has to appear in the answers.
+        let app = tree.get_element_by_id("app").expect("div#app");
+        let added = shadow_element(&tree, "p", &[("class", "card three")]);
+        tree.append_child(app, added);
+        assert_eq!(count(".card"), 4, "an appended element must be found");
+        assert_eq!(count("p.card"), 3);
+
+        // Changing a class has to move the element between answers.
+        tree.with_node_mut(added, |node| {
+            node.set_attribute("class", "other".to_string())
+        });
+        assert_eq!(count(".card"), 3, "a reclassified element must drop out");
+        assert_eq!(count(".other"), 1, "and appear under its new class");
+
+        // Removing it has to take it out of both.
+        tree.remove(added);
+        assert_eq!(count(".card"), 3);
+        assert_eq!(count(".other"), 0, "a removed element matches nothing");
+
+        // A selector the index cannot narrow still has to be answered by the
+        // full walk rather than an empty candidate set.
+        assert_eq!(count("[class]"), 3, "attribute subjects fall back");
+        assert_eq!(count("*"), tree.query_selector_all("*").unwrap().len());
+        assert!(count("*") >= 5, "the universal selector is never narrowed");
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub(crate) u32);
 
 impl NodeId {
@@ -246,6 +246,31 @@ impl Node {
 
 pub struct DomTree {
     inner: RefCell<DomTreeInner>,
+    /// Bumped by every mutation, so a cache can tell whether the tree it was
+    /// built from still exists. Taking a mutable borrow of `inner` is the one
+    /// way to change anything here, which makes it the only place this has to
+    /// be maintained -- an incrementally updated cache would instead have to
+    /// be right at every call site, and a single missed one is a query that
+    /// silently returns too few elements.
+    mutation_generation: std::cell::Cell<u64>,
+    /// Elements grouped by class and by tag, for picking selector candidates
+    /// without walking the document. Rebuilt whenever the generation moves.
+    selector_index: RefCell<Option<SelectorIndex>>,
+}
+
+/// Element ids grouped by the parts of a selector that can be looked up
+/// directly. Only ever used to *narrow* the set a selector is matched
+/// against: every candidate is still run through the real matcher, so an
+/// entry that should not be here costs a little time and changes no answer.
+pub(crate) struct SelectorIndex {
+    generation: u64,
+    /// Elements the index covers, so a caller can tell whether a bucket
+    /// actually narrows the search.
+    element_count: usize,
+    // Shared and kept in arena order, so a caller can test membership by
+    // binary search without copying a bucket per query.
+    by_class: HashMap<String, std::rc::Rc<Vec<NodeId>>>,
+    by_tag: HashMap<String, std::rc::Rc<Vec<NodeId>>>,
 }
 
 pub(crate) struct DomTreeInner {
@@ -279,6 +304,8 @@ impl DomTree {
             data: NodeData::Document,
         };
         DomTree {
+            mutation_generation: std::cell::Cell::new(0),
+            selector_index: RefCell::new(None),
             inner: RefCell::new(DomTreeInner {
                 nodes: vec![Some(doc_node)],
                 free_list: Vec::new(),
@@ -292,13 +319,122 @@ impl DomTree {
         }
     }
 
+    /// A mutable borrow of the tree, counted.
+    ///
+    /// Every mutation goes through here, so anything cached about the tree's
+    /// contents can be invalidated by comparing generations rather than by
+    /// being updated in step with each individual change.
+    fn inner_mut(&self) -> std::cell::RefMut<'_, DomTreeInner> {
+        self.mutation_generation
+            .set(self.mutation_generation.get().wrapping_add(1));
+        self.inner.borrow_mut()
+    }
+
+    pub(crate) fn mutation_generation(&self) -> u64 {
+        self.mutation_generation.get()
+    }
+
+    /// Element ids carrying `class`, in document order, or `None` when the
+    /// tree cannot answer and the caller should walk it instead.
+    ///
+    /// Rebuilt from scratch whenever the tree has changed since the last
+    /// build. That is deliberately cruder than updating it in step with each
+    /// mutation: a stale entry here removes an element from a query's result,
+    /// which is a wrong answer rather than a slow one, and rebuilding is a
+    /// plain walk against matching that runs the selector engine per element.
+    /// How many elements the selector index covers.
+    pub(crate) fn indexed_element_count(&self) -> Option<usize> {
+        self.with_selector_index(|index| index.element_count)
+    }
+
+    pub(crate) fn elements_with_class(&self, class: &str) -> Option<std::rc::Rc<Vec<NodeId>>> {
+        self.with_selector_index(|index| {
+            index
+                .by_class
+                .get(class)
+                .cloned()
+                .unwrap_or_else(|| std::rc::Rc::new(Vec::new()))
+        })
+    }
+
+    /// Element ids with the given lowercase local name, in document order.
+    pub(crate) fn elements_with_tag(&self, tag: &str) -> Option<std::rc::Rc<Vec<NodeId>>> {
+        self.with_selector_index(|index| {
+            index
+                .by_tag
+                .get(tag)
+                .cloned()
+                .unwrap_or_else(|| std::rc::Rc::new(Vec::new()))
+        })
+    }
+
+    fn with_selector_index<R>(&self, read: impl FnOnce(&SelectorIndex) -> R) -> Option<R> {
+        // Quirks mode matches classes ASCII-case-insensitively, which this
+        // index does not model; fall back to the full walk there.
+        if self.is_quirks() {
+            return None;
+        }
+        let generation = self.mutation_generation.get();
+        {
+            let cached = self.selector_index.borrow();
+            if let Some(index) = cached.as_ref() {
+                if index.generation == generation {
+                    return Some(read(index));
+                }
+            }
+        }
+        let index = self.build_selector_index(generation);
+        let result = read(&index);
+        *self.selector_index.borrow_mut() = Some(index);
+        Some(result)
+    }
+
+    fn build_selector_index(&self, generation: u64) -> SelectorIndex {
+        let mut by_class: HashMap<String, Vec<NodeId>> = HashMap::new();
+        let mut by_tag: HashMap<String, Vec<NodeId>> = HashMap::new();
+        // Built as plain vectors, then shared; the arena is walked in order so
+        // each bucket comes out sorted, which is what membership relies on.
+        let inner = self.inner.borrow();
+        for (slot, node) in inner.nodes.iter().enumerate() {
+            let Some(node) = node.as_ref() else { continue };
+            let NodeData::Element { name, attrs, .. } = &node.data else {
+                continue;
+            };
+            let id = NodeId::new(slot as u32);
+            by_tag
+                .entry(name.local.as_ref().to_ascii_lowercase())
+                .or_default()
+                .push(id);
+            if let Some(class) = attrs
+                .iter()
+                .find(|attr| attr.name.local.as_ref() == "class")
+            {
+                for token in class.value.split_ascii_whitespace() {
+                    by_class.entry(token.to_string()).or_default().push(id);
+                }
+            }
+        }
+        SelectorIndex {
+            generation,
+            element_count: by_tag.values().map(Vec::len).sum(),
+            by_class: by_class
+                .into_iter()
+                .map(|(key, ids)| (key, std::rc::Rc::new(ids)))
+                .collect(),
+            by_tag: by_tag
+                .into_iter()
+                .map(|(key, ids)| (key, std::rc::Rc::new(ids)))
+                .collect(),
+        }
+    }
+
     pub fn document(&self) -> NodeId {
         self.inner.borrow().document
     }
 
     /// Record whether the document was parsed in (full) quirks mode.
     pub fn set_quirks(&self, quirks: bool) {
-        self.inner.borrow_mut().quirks = quirks;
+        self.inner_mut().quirks = quirks;
     }
 
     /// Whether the document is in (full) quirks mode, in which CSS class and id
@@ -308,7 +444,7 @@ impl DomTree {
     }
 
     pub(crate) fn set_allow_declarative_shadow_roots(&self, allow: bool) {
-        self.inner.borrow_mut().allow_declarative_shadow_roots = allow;
+        self.inner_mut().allow_declarative_shadow_roots = allow;
     }
 
     pub(crate) fn allows_declarative_shadow_roots(&self) -> bool {
@@ -362,7 +498,7 @@ impl DomTree {
         root: NodeId,
         mode: ShadowRootMode,
     ) -> Result<(), AttachShadowError> {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner_mut();
         let host_is_element = inner
             .nodes
             .get(host.index())
@@ -566,7 +702,7 @@ impl DomTree {
     }
 
     pub fn new_node(&self, data: NodeData) -> NodeId {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner_mut();
         let id = if let Some(slot) = inner.free_list.pop() {
             NodeId(slot)
         } else {
@@ -613,7 +749,7 @@ impl DomTree {
     where
         F: FnOnce(&mut Node) -> R,
     {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner_mut();
         inner.nodes.get_mut(id.index())?.as_mut().map(f)
     }
 
@@ -673,7 +809,7 @@ impl DomTree {
         };
         self.detach_for_reparent(child_id, child_connected && !parent_connected);
 
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner_mut();
 
         let old_last = inner.nodes.get(parent_id.index())
             .and_then(|n| n.as_ref())
@@ -761,7 +897,7 @@ impl DomTree {
                 .and_then(|n| n.prev_sibling)
         };
 
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner_mut();
 
         if let Some(Some(node)) = inner.nodes.get_mut(new_sibling_id.index()) {
             node.parent = Some(parent_id);
@@ -790,7 +926,7 @@ impl DomTree {
     }
 
     fn detach_for_reparent(&self, node_id: NodeId, disconnect: bool) {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner_mut();
 
         // The document and registered ShadowRoots have no ordinary parent and
         // cannot be detached through light-tree mutation APIs.
@@ -866,7 +1002,7 @@ impl DomTree {
 
         self.detach(node_id);
 
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner_mut();
         for id_str in &ids_to_remove {
             inner.id_index.remove(id_str);
         }
@@ -878,7 +1014,7 @@ impl DomTree {
             return;
         }
         self.detach(node_id);
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner_mut();
 
         let mut ids_to_remove = Vec::new();
         for &id in &nodes_to_remove {
@@ -1277,7 +1413,7 @@ impl DomTree {
         // Borrow released above: `new_node` takes its own mutable borrow.
         // Matches what the tree sink allocates for a parsed template.
         let contents = self.new_node(NodeData::Document);
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner_mut();
         if let Some(Some(node)) = inner.nodes.get_mut(node_id.index()) {
             if let NodeData::Element { template_contents, .. } = &mut node.data {
                 *template_contents = Some(contents);
@@ -1369,7 +1505,7 @@ impl DomTree {
                     .and_then(|n| n.last_child)
             };
             if let Some(last_child_id) = last_child_id {
-                let mut inner = self.inner.borrow_mut();
+                let mut inner = self.inner_mut();
                 if let Some(Some(node)) = inner.nodes.get_mut(last_child_id.index()) {
                     if let NodeData::Text { contents } = &mut node.data {
                         contents.push_str(text);
@@ -1533,7 +1669,7 @@ impl DomTree {
             if let Some(src_contents) = src_contents {
                 let dest_contents = self.new_node(NodeData::Document);
                 {
-                    let mut inner = self.inner.borrow_mut();
+                    let mut inner = self.inner_mut();
                     if let Some(Some(node)) = inner.nodes.get_mut(new_id.index()) {
                         if let NodeData::Element { template_contents, .. } = &mut node.data {
                             *template_contents = Some(dest_contents);
@@ -1570,7 +1706,7 @@ impl DomTree {
     }
 
     pub fn update_id_index(&self, node_id: NodeId, old_id: Option<&str>, new_id: Option<&str>) {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner_mut();
         if let Some(old) = old_id {
             inner.id_index.remove(old);
         }
