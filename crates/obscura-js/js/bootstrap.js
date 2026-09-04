@@ -1635,6 +1635,49 @@ globalThis.MessagePort = MessagePort;
 const _isCustomProperty = (name) => name.startsWith("--");
 const _cssCamelToKebab = (s) => s.replace(/[A-Z]/g, (m) => "-" + m.toLowerCase());
 const _cssKebabToCamel = (s) => s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+// Prefixed properties Chrome resolves to their standard name. The prefixed
+// spelling is an alias, not a separate declaration: setting `-webkit-transform`
+// produces `transform` in cssText, `item()` reports the standard name, and
+// reading or removing it through either spelling reaches the same declaration.
+//
+// Measured against Chromium 148 rather than assumed, because the set is not
+// guessable: `-webkit-writing-mode`, `-webkit-line-clamp`, `-webkit-box-orient`
+// and the other WebKit-only properties keep their prefix, and a page that
+// styles with the prefixed spelling would otherwise carry a declaration the
+// renderer never reads.
+const _CSS_PREFIX_ALIASES = {
+  "-webkit-align-content": "align-content",
+  "-webkit-align-items": "align-items",
+  "-webkit-align-self": "align-self",
+  "-webkit-animation": "animation",
+  "-webkit-appearance": "appearance",
+  "-webkit-backface-visibility": "backface-visibility",
+  "-webkit-background-clip": "background-clip",
+  "-webkit-border-radius": "border-radius",
+  "-webkit-box-shadow": "box-shadow",
+  "-webkit-box-sizing": "box-sizing",
+  "-webkit-clip-path": "clip-path",
+  "-webkit-columns": "columns",
+  "-webkit-filter": "filter",
+  "-webkit-flex": "flex",
+  "-webkit-flex-basis": "flex-basis",
+  "-webkit-flex-direction": "flex-direction",
+  "-webkit-flex-grow": "flex-grow",
+  "-webkit-flex-shrink": "flex-shrink",
+  "-webkit-flex-wrap": "flex-wrap",
+  "-webkit-justify-content": "justify-content",
+  "-webkit-mask": "mask",
+  "-webkit-opacity": "opacity",
+  "-webkit-order": "order",
+  "-webkit-perspective": "perspective",
+  "-webkit-print-color-adjust": "print-color-adjust",
+  "-webkit-text-size-adjust": "text-size-adjust",
+  "-webkit-transform": "transform",
+  "-webkit-transform-origin": "transform-origin",
+  "-webkit-transition": "transition",
+  "-webkit-user-select": "user-select",
+};
+const _cssResolveAlias = (name) => _CSS_PREFIX_ALIASES[name] || name;
 // Two different name spaces reach a declaration block, and conflating them
 // is how `COLOR: red` came to be stored as `-c-o-l-o-r`.
 //
@@ -1645,7 +1688,7 @@ const _cssKebabToCamel = (s) => s.replace(/-([a-z])/g, (_, c) => c.toUpperCase()
 // neither answers to `--my-var`. Neither is ever spelled in camelCase.
 const _cssNameKey = (name) => {
   const s = String(name);
-  return _isCustomProperty(s) ? s : s.toLowerCase();
+  return _isCustomProperty(s) ? s : _cssResolveAlias(s.toLowerCase());
 };
 
 // An IDL name is what property access on the declaration takes:
@@ -1659,7 +1702,7 @@ const _cssIdlKey = (name) => {
   if (_isCustomProperty(s)) return null;
   if (s === "cssFloat") return "float";
   const dashed = _cssCamelToKebab(s.charAt(0).toLowerCase() + s.slice(1));
-  return dashed.startsWith("webkit-") ? "-" + dashed : dashed;
+  return _cssResolveAlias(dashed.startsWith("webkit-") ? "-" + dashed : dashed);
 };
 
 // The IDL spelling of a stored key, for enumeration.
@@ -1671,67 +1714,140 @@ const _cssIdlName = (key) =>
 // el.style`) and enumeration (`Object.keys(el.style)`) see the whole set, not
 // just the ones that happen to be assigned (issue #356).
 const _CSS_PROPERTY_NAMES = [
-  "accentColor","alignContent","alignItems","alignSelf","all","animation","animationDelay",
-  "animationDirection","animationDuration","animationFillMode","animationIterationCount",
-  "animationName","animationPlayState","animationTimingFunction","appearance","aspectRatio",
-  "backdropFilter","backfaceVisibility","background","backgroundAttachment","backgroundBlendMode",
-  "backgroundClip","backgroundColor","backgroundImage","backgroundOrigin","backgroundPosition",
-  "backgroundPositionX","backgroundPositionY","backgroundRepeat","backgroundSize","blockSize",
-  "border","borderBlock","borderBlockColor","borderBlockEnd","borderBlockEndColor","borderBlockEndStyle",
-  "borderBlockEndWidth","borderBlockStart","borderBlockStartColor","borderBlockStartStyle",
-  "borderBlockStartWidth","borderBlockStyle","borderBlockWidth","borderBottom","borderBottomColor",
-  "borderBottomLeftRadius","borderBottomRightRadius","borderBottomStyle","borderBottomWidth",
-  "borderCollapse","borderColor","borderImage","borderImageOutset","borderImageRepeat",
-  "borderImageSlice","borderImageSource","borderImageWidth","borderInline","borderInlineColor",
-  "borderInlineEnd","borderInlineEndColor","borderInlineEndStyle","borderInlineEndWidth",
-  "borderInlineStart","borderInlineStartColor","borderInlineStartStyle","borderInlineStartWidth",
-  "borderInlineStyle","borderInlineWidth","borderLeft","borderLeftColor","borderLeftStyle",
-  "borderLeftWidth","borderRadius","borderRight","borderRightColor","borderRightStyle",
-  "borderRightWidth","borderSpacing","borderStyle","borderTop","borderTopColor","borderTopLeftRadius",
-  "borderTopRightRadius","borderTopStyle","borderTopWidth","borderWidth","bottom","boxShadow",
-  "boxSizing","breakAfter","breakBefore","breakInside","captionSide","caretColor","clear","clip",
-  "clipPath","color","colorScheme","columnCount","columnFill","columnGap","columnRule","columnRuleColor",
-  "columnRuleStyle","columnRuleWidth","columnSpan","columnWidth","columns","contain","container",
-  "containerName","containerType","content","counterIncrement","counterReset","counterSet","cssFloat",
-  "cursor","direction","display","emptyCells","filter","flex","flexBasis","flexDirection","flexFlow",
-  "flexGrow","flexShrink","flexWrap","float","font","fontFamily","fontFeatureSettings","fontKerning",
-  "fontOpticalSizing","fontSize","fontSizeAdjust","fontStretch","fontStyle","fontVariant",
-  "fontVariantCaps","fontVariantLigatures","fontVariantNumeric","fontWeight","gap","grid","gridArea",
-  "gridAutoColumns","gridAutoFlow","gridAutoRows","gridColumn","gridColumnEnd","gridColumnGap",
-  "gridColumnStart","gridGap","gridRow","gridRowEnd","gridRowGap","gridRowStart","gridTemplate",
-  "gridTemplateAreas","gridTemplateColumns","gridTemplateRows","height","hyphens","imageRendering",
-  "inlineSize","inset","insetBlock","insetBlockEnd","insetBlockStart","insetInline","insetInlineEnd",
-  "insetInlineStart","isolation","justifyContent","justifyItems","justifySelf","left","letterSpacing",
-  "lineBreak","lineHeight","listStyle","listStyleImage","listStylePosition","listStyleType","margin",
+  "accentColor","additiveSymbols","alignContent","alignItems","alignSelf","alignmentBaseline",
+  "all","anchorName","anchorScope","animation","animationComposition","animationDelay",
+  "animationDirection","animationDuration","animationFillMode","animationIterationCount","animationName","animationPlayState",
+  "animationRange","animationRangeEnd","animationRangeStart","animationTimeline","animationTimingFunction","animationTrigger",
+  "appRegion","appearance","ascentOverride","aspectRatio","backdropFilter","backfaceVisibility",
+  "background","backgroundAttachment","backgroundBlendMode","backgroundClip","backgroundColor","backgroundImage",
+  "backgroundOrigin","backgroundPosition","backgroundPositionX","backgroundPositionY","backgroundRepeat","backgroundSize",
+  "basePalette","baselineShift","baselineSource","blockSize","border","borderBlock",
+  "borderBlockColor","borderBlockEnd","borderBlockEndColor","borderBlockEndStyle","borderBlockEndWidth","borderBlockStart",
+  "borderBlockStartColor","borderBlockStartStyle","borderBlockStartWidth","borderBlockStyle","borderBlockWidth","borderBottom",
+  "borderBottomColor","borderBottomLeftRadius","borderBottomRightRadius","borderBottomStyle","borderBottomWidth","borderCollapse",
+  "borderColor","borderEndEndRadius","borderEndStartRadius","borderImage","borderImageOutset","borderImageRepeat",
+  "borderImageSlice","borderImageSource","borderImageWidth","borderInline","borderInlineColor","borderInlineEnd",
+  "borderInlineEndColor","borderInlineEndStyle","borderInlineEndWidth","borderInlineStart","borderInlineStartColor","borderInlineStartStyle",
+  "borderInlineStartWidth","borderInlineStyle","borderInlineWidth","borderLeft","borderLeftColor","borderLeftStyle",
+  "borderLeftWidth","borderRadius","borderRight","borderRightColor","borderRightStyle","borderRightWidth",
+  "borderShape","borderSpacing","borderStartEndRadius","borderStartStartRadius","borderStyle","borderTop",
+  "borderTopColor","borderTopLeftRadius","borderTopRightRadius","borderTopStyle","borderTopWidth","borderWidth",
+  "bottom","boxDecorationBreak","boxShadow","boxSizing","breakAfter","breakBefore",
+  "breakInside","bufferedRendering","captionSide","caretAnimation","caretColor","caretShape",
+  "clear","clip","clipPath","clipRule","color","colorInterpolation",
+  "colorInterpolationFilters","colorRendering","colorScheme","columnCount","columnFill","columnGap",
+  "columnHeight","columnRule","columnRuleColor","columnRuleStyle","columnRuleWidth","columnSpan",
+  "columnWidth","columnWrap","columns","contain","containIntrinsicBlockSize","containIntrinsicHeight",
+  "containIntrinsicInlineSize","containIntrinsicSize","containIntrinsicWidth","container","containerName","containerType",
+  "content","contentVisibility","cornerBlockEndShape","cornerBlockStartShape","cornerBottomLeftShape","cornerBottomRightShape",
+  "cornerBottomShape","cornerEndEndShape","cornerEndStartShape","cornerInlineEndShape","cornerInlineStartShape","cornerLeftShape",
+  "cornerRightShape","cornerShape","cornerStartEndShape","cornerStartStartShape","cornerTopLeftShape","cornerTopRightShape",
+  "cornerTopShape","counterIncrement","counterReset","counterSet","cssFloat","cursor",
+  "cx","cy","d","descentOverride","direction","display",
+  "dominantBaseline","dynamicRangeLimit","emptyCells","fallback","fieldSizing","fill",
+  "fillOpacity","fillRule","filter","flex","flexBasis","flexDirection",
+  "flexFlow","flexGrow","flexShrink","flexWrap","float","floodColor",
+  "floodOpacity","font","fontDisplay","fontFamily","fontFeatureSettings","fontKerning",
+  "fontLanguageOverride","fontOpticalSizing","fontPalette","fontSize","fontSizeAdjust","fontStretch",
+  "fontStyle","fontSynthesis","fontSynthesisSmallCaps","fontSynthesisStyle","fontSynthesisWeight","fontVariant",
+  "fontVariantAlternates","fontVariantCaps","fontVariantEastAsian","fontVariantEmoji","fontVariantLigatures","fontVariantNumeric",
+  "fontVariantPosition","fontVariationSettings","fontWeight","forcedColorAdjust","gap","grid",
+  "gridArea","gridAutoColumns","gridAutoFlow","gridAutoRows","gridColumn","gridColumnEnd",
+  "gridColumnGap","gridColumnStart","gridGap","gridRow","gridRowEnd","gridRowGap",
+  "gridRowStart","gridTemplate","gridTemplateAreas","gridTemplateColumns","gridTemplateRows","height",
+  "hyphenateCharacter","hyphenateLimitChars","hyphens","imageOrientation","imageRendering","inherits",
+  "initialLetter","initialValue","inlineSize","inset","insetBlock","insetBlockEnd",
+  "insetBlockStart","insetInline","insetInlineEnd","insetInlineStart","interactivity","interestDelay",
+  "interestDelayEnd","interestDelayStart","interpolateSize","isolation","justifyContent","justifyItems",
+  "justifySelf","left","letterSpacing","lightingColor","lineBreak","lineGapOverride",
+  "lineHeight","listStyle","listStyleImage","listStylePosition","listStyleType","margin",
   "marginBlock","marginBlockEnd","marginBlockStart","marginBottom","marginInline","marginInlineEnd",
-  "marginInlineStart","marginLeft","marginRight","marginTop","mask","maxBlockSize","maxHeight",
-  "maxInlineSize","maxWidth","minBlockSize","minHeight","minInlineSize","minWidth","mixBlendMode",
-  "objectFit","objectPosition","offset","opacity","order","outline","outlineColor","outlineOffset",
-  "outlineStyle","outlineWidth","overflow","overflowAnchor","overflowWrap","overflowX","overflowY",
-  "overscrollBehavior","overscrollBehaviorBlock","overscrollBehaviorInline","overscrollBehaviorX",
-  "overscrollBehaviorY","padding","paddingBlock","paddingBlockEnd","paddingBlockStart","paddingBottom",
-  "paddingInline","paddingInlineEnd","paddingInlineStart","paddingLeft","paddingRight","paddingTop",
-  "pageBreakAfter","pageBreakBefore","pageBreakInside","perspective","perspectiveOrigin","placeContent",
-  "placeItems","placeSelf","pointerEvents","position","quotes","resize","right","rotate","rowGap",
-  "scale","scrollBehavior","scrollMargin","scrollPadding","scrollSnapAlign","scrollSnapStop",
-  "scrollSnapType","tabSize","tableLayout","textAlign","textAlignLast","textCombineUpright",
-  "textDecoration","textDecorationColor","textDecorationLine","textDecorationSkipInk",
-  "textDecorationStyle","textDecorationThickness","textEmphasis","textIndent","textJustify",
-  "textOrientation","textOverflow","textRendering","textShadow","textTransform","textUnderlineOffset",
-  "textUnderlinePosition","top","touchAction","transform","transformBox","transformOrigin",
-  "transformStyle","transition","transitionDelay","transitionDuration","transitionProperty",
-  "transitionTimingFunction","translate","unicodeBidi","userSelect","verticalAlign","visibility",
-  "whiteSpace","width","willChange","wordBreak","wordSpacing","wordWrap","writingMode","zIndex","zoom",
-  // Names Blink exposes on the CSSOM, including at-rule descriptors, which
-  // its property registry carries alongside ordinary properties. Kept in step
-  // with supports_declaration in obscura-render so both surfaces agree.
-  "additiveSymbols","appRegion","ascentOverride","basePalette","baselineSource","borderEndEndRadius","borderEndStartRadius","borderStartEndRadius","borderStartStartRadius","containIntrinsicBlockSize","containIntrinsicHeight","containIntrinsicInlineSize","containIntrinsicSize","containIntrinsicWidth","descentOverride","fallback","fontPalette","fontSynthesis","fontSynthesisSmallCaps","fontSynthesisStyle","fontSynthesisWeight","fontVariantAlternates","forcedColorAdjust","hyphenateCharacter","hyphenateLimitChars","imageOrientation","inherits","initialLetter","initialValue","lineGapOverride","mathDepth","mathShift","mathStyle","negative","objectViewBox","overflowClipMargin","overrideColors","pad","pageOrientation","prefix","range","rubyPosition","sizeAdjust","speakAs","suffix","symbols","syntax","system","textEmphasisColor","textEmphasisPosition","textEmphasisStyle","viewTransitionName","whiteSpaceCollapse",
+  "marginInlineStart","marginLeft","marginRight","marginTop","marker","markerEnd",
+  "markerMid","markerStart","mask","maskClip","maskComposite","maskImage",
+  "maskMode","maskOrigin","maskPosition","maskRepeat","maskSize","maskType",
+  "mathDepth","mathShift","mathStyle","maxBlockSize","maxHeight","maxInlineSize",
+  "maxWidth","minBlockSize","minHeight","minInlineSize","minWidth","mixBlendMode",
+  "navigation","negative","objectFit","objectPosition","objectViewBox","offset",
+  "offsetAnchor","offsetDistance","offsetPath","offsetPosition","offsetRotate","opacity",
+  "order","orphans","outline","outlineColor","outlineOffset","outlineStyle",
+  "outlineWidth","overflow","overflowAnchor","overflowBlock","overflowClipMargin","overflowInline",
+  "overflowWrap","overflowX","overflowY","overlay","overrideColors","overscrollBehavior",
+  "overscrollBehaviorBlock","overscrollBehaviorInline","overscrollBehaviorX","overscrollBehaviorY","pad","padding",
+  "paddingBlock","paddingBlockEnd","paddingBlockStart","paddingBottom","paddingInline","paddingInlineEnd",
+  "paddingInlineStart","paddingLeft","paddingRight","paddingTop","page","pageBreakAfter",
+  "pageBreakBefore","pageBreakInside","pageOrientation","paintOrder","perspective","perspectiveOrigin",
+  "placeContent","placeItems","placeSelf","pointerEvents","position","positionAnchor",
+  "positionArea","positionTry","positionTryFallbacks","positionTryOrder","positionVisibility","prefix",
+  "printColorAdjust","quotes","r","range","readingFlow","readingOrder",
+  "resize","result","right","rotate","rowGap","rubyAlign",
+  "rubyPosition","rx","ry","scale","scrollBehavior","scrollInitialTarget",
+  "scrollMargin","scrollMarginBlock","scrollMarginBlockEnd","scrollMarginBlockStart","scrollMarginBottom","scrollMarginInline",
+  "scrollMarginInlineEnd","scrollMarginInlineStart","scrollMarginLeft","scrollMarginRight","scrollMarginTop","scrollMarkerGroup",
+  "scrollPadding","scrollPaddingBlock","scrollPaddingBlockEnd","scrollPaddingBlockStart","scrollPaddingBottom","scrollPaddingInline",
+  "scrollPaddingInlineEnd","scrollPaddingInlineStart","scrollPaddingLeft","scrollPaddingRight","scrollPaddingTop","scrollSnapAlign",
+  "scrollSnapStop","scrollSnapType","scrollTargetGroup","scrollTimeline","scrollTimelineAxis","scrollTimelineName",
+  "scrollbarColor","scrollbarGutter","scrollbarWidth","shapeImageThreshold","shapeMargin","shapeOutside",
+  "shapeRendering","size","sizeAdjust","speak","speakAs","src",
+  "stopColor","stopOpacity","stroke","strokeDasharray","strokeDashoffset","strokeLinecap",
+  "strokeLinejoin","strokeMiterlimit","strokeOpacity","strokeWidth","suffix","symbols",
+  "syntax","system","tabSize","tableLayout","textAlign","textAlignLast",
+  "textAnchor","textAutospace","textBox","textBoxEdge","textBoxTrim","textCombineUpright",
+  "textDecoration","textDecorationColor","textDecorationLine","textDecorationSkipInk","textDecorationStyle","textDecorationThickness",
+  "textEmphasis","textEmphasisColor","textEmphasisPosition","textEmphasisStyle","textIndent","textJustify",
+  "textOrientation","textOverflow","textRendering","textShadow","textSizeAdjust","textSpacingTrim",
+  "textTransform","textUnderlineOffset","textUnderlinePosition","textWrap","textWrapMode","textWrapStyle",
+  "timelineScope","timelineTrigger","timelineTriggerActivationRange","timelineTriggerActivationRangeEnd","timelineTriggerActivationRangeStart","timelineTriggerActiveRange",
+  "timelineTriggerActiveRangeEnd","timelineTriggerActiveRangeStart","timelineTriggerName","timelineTriggerSource","top","touchAction",
+  "transform","transformBox","transformOrigin","transformStyle","transition","transitionBehavior",
+  "transitionDelay","transitionDuration","transitionProperty","transitionTimingFunction","translate","triggerScope",
+  "types","unicodeBidi","unicodeRange","userSelect","vectorEffect","verticalAlign",
+  "viewTimeline","viewTimelineAxis","viewTimelineInset","viewTimelineName","viewTransitionClass","viewTransitionGroup",
+  "viewTransitionName","viewTransitionScope","visibility","webkitAlignContent","webkitAlignItems","webkitAlignSelf",
+  "webkitAnimation","webkitAnimationDelay","webkitAnimationDirection","webkitAnimationDuration","webkitAnimationFillMode","webkitAnimationIterationCount",
+  "webkitAnimationName","webkitAnimationPlayState","webkitAnimationTimingFunction","webkitAppRegion","webkitAppearance","webkitBackfaceVisibility",
+  "webkitBackgroundClip","webkitBackgroundOrigin","webkitBackgroundSize","webkitBorderAfter","webkitBorderAfterColor","webkitBorderAfterStyle",
+  "webkitBorderAfterWidth","webkitBorderBefore","webkitBorderBeforeColor","webkitBorderBeforeStyle","webkitBorderBeforeWidth","webkitBorderBottomLeftRadius",
+  "webkitBorderBottomRightRadius","webkitBorderEnd","webkitBorderEndColor","webkitBorderEndStyle","webkitBorderEndWidth","webkitBorderHorizontalSpacing",
+  "webkitBorderImage","webkitBorderRadius","webkitBorderStart","webkitBorderStartColor","webkitBorderStartStyle","webkitBorderStartWidth",
+  "webkitBorderTopLeftRadius","webkitBorderTopRightRadius","webkitBorderVerticalSpacing","webkitBoxAlign","webkitBoxDecorationBreak","webkitBoxDirection",
+  "webkitBoxFlex","webkitBoxOrdinalGroup","webkitBoxOrient","webkitBoxPack","webkitBoxReflect","webkitBoxShadow",
+  "webkitBoxSizing","webkitClipPath","webkitColumnBreakAfter","webkitColumnBreakBefore","webkitColumnBreakInside","webkitColumnCount",
+  "webkitColumnGap","webkitColumnRule","webkitColumnRuleColor","webkitColumnRuleStyle","webkitColumnRuleWidth","webkitColumnSpan",
+  "webkitColumnWidth","webkitColumns","webkitFilter","webkitFlex","webkitFlexBasis","webkitFlexDirection",
+  "webkitFlexFlow","webkitFlexGrow","webkitFlexShrink","webkitFlexWrap","webkitFontFeatureSettings","webkitFontSmoothing",
+  "webkitHyphenateCharacter","webkitJustifyContent","webkitLineBreak","webkitLineClamp","webkitLocale","webkitLogicalHeight",
+  "webkitLogicalWidth","webkitMarginAfter","webkitMarginBefore","webkitMarginEnd","webkitMarginStart","webkitMask",
+  "webkitMaskBoxImage","webkitMaskBoxImageOutset","webkitMaskBoxImageRepeat","webkitMaskBoxImageSlice","webkitMaskBoxImageSource","webkitMaskBoxImageWidth",
+  "webkitMaskClip","webkitMaskComposite","webkitMaskImage","webkitMaskOrigin","webkitMaskPosition","webkitMaskPositionX",
+  "webkitMaskPositionY","webkitMaskRepeat","webkitMaskSize","webkitMaxLogicalHeight","webkitMaxLogicalWidth","webkitMinLogicalHeight",
+  "webkitMinLogicalWidth","webkitOpacity","webkitOrder","webkitPaddingAfter","webkitPaddingBefore","webkitPaddingEnd",
+  "webkitPaddingStart","webkitPerspective","webkitPerspectiveOrigin","webkitPerspectiveOriginX","webkitPerspectiveOriginY","webkitPrintColorAdjust",
+  "webkitRtlOrdering","webkitRubyPosition","webkitShapeImageThreshold","webkitShapeMargin","webkitShapeOutside","webkitTapHighlightColor",
+  "webkitTextCombine","webkitTextDecorationsInEffect","webkitTextEmphasis","webkitTextEmphasisColor","webkitTextEmphasisPosition","webkitTextEmphasisStyle",
+  "webkitTextFillColor","webkitTextOrientation","webkitTextSecurity","webkitTextSizeAdjust","webkitTextStroke","webkitTextStrokeColor",
+  "webkitTextStrokeWidth","webkitTransform","webkitTransformOrigin","webkitTransformOriginX","webkitTransformOriginY","webkitTransformOriginZ",
+  "webkitTransformStyle","webkitTransition","webkitTransitionDelay","webkitTransitionDuration","webkitTransitionProperty","webkitTransitionTimingFunction",
+  "webkitUserDrag","webkitUserModify","webkitUserSelect","webkitWritingMode","whiteSpace","whiteSpaceCollapse",
+  "widows","width","willChange","wordBreak","wordSpacing","wordWrap",
+  "writingMode","x","y","zIndex","zoom",
 ];
 const _CSS_PROP_SET = new Set(_CSS_PROPERTY_NAMES);
 // Dashed CSS property names withheld because the browser version being
 // presented predates them (see _applyVersionFeatureGate). Consulted by
 // `CSS.supports` so a probe agrees with the version in the user agent.
 const _cssGatedOut = new Set();
+
+// Whether a declaration block will keep a property at all.
+//
+// Chrome parses a declaration and discards it if the property is not one it
+// knows: `bogus: 1px` never reaches the block, and neither does a `-moz-` or
+// `-ms-` spelling. Keeping them made `cssText` list declarations no browser
+// would report, which is both wrong to read back and a difference a page can
+// see. A custom property is always kept -- any name is valid -- and a property
+// the version gate withheld is already absent from the set, so a build
+// presenting an older Chrome drops exactly what that Chrome would.
+const _cssKnownProperty = (key) =>
+  _isCustomProperty(key) || _CSS_PROP_SET.has(_cssIdlName(key));
 
 // Parse a `style` attribute string (`"color: red; margin: 5px"`) into the given
 // dashed-key store, replacing its contents in place.
@@ -1742,7 +1858,10 @@ function _parseCssInto(props, text) {
     if (i > 0) {
       const k = p.slice(0, i).trim();
       const v = p.slice(i + 1).trim();
-      if (k && (v || _isCustomProperty(k))) props[_cssNameKey(k)] = v;
+      if (k && (v || _isCustomProperty(k))) {
+        const key = _cssNameKey(k);
+        if (_cssKnownProperty(key)) props[key] = v;
+      }
     }
   });
 }
@@ -1837,6 +1956,8 @@ class CSSStyleDeclaration {
     // Withheld by the version gate: the presented browser does not know the
     // property, so the declaration is dropped as Chrome drops an unknown one.
     if (_cssGatedOut.has(k)) return;
+    // A name no browser knows is not a declaration.
+    if (!_cssKnownProperty(k)) return;
     if (value === "" || value == null) {
       // Per CSSOM the empty string invokes removeProperty, custom property
       // included; declaring an empty one through this path takes a
@@ -17465,10 +17586,13 @@ const _VERSION_FEATURES = {
   135: ["!j:GPUSupportedLimits.maxInterStageShaderComponents","j:DataView.getFloat16","j:DataView.setFloat16","j:Math.f16round","w:Float16Array"],
   136: ["j:RegExp.escape"],
   140: ["!j:GPUAdapter.isFallbackAdapter","j:FontFace.variationSettings"],
-  144: ["j:Blob.bytes","j:Date.toTemporalInstant","j:Temporal.Duration","j:Temporal.Instant","j:Temporal.Now","j:Temporal.PlainDate","j:Temporal.PlainDateTime","j:Temporal.PlainMonthDay","j:Temporal.PlainTime","j:Temporal.PlainYearMonth","j:Temporal.ZonedDateTime","w:Temporal"],
-  145: ["c:text-justify"],
+  144: ["c:caret-shape", "j:Blob.bytes","j:Date.toTemporalInstant","j:Temporal.Duration","j:Temporal.Instant","j:Temporal.Now","j:Temporal.PlainDate","j:Temporal.PlainDateTime","j:Temporal.PlainMonthDay","j:Temporal.PlainTime","j:Temporal.PlainYearMonth","j:Temporal.ZonedDateTime","w:Temporal"],
+  145: ["c:column-wrap", "c:column-height", "c:text-justify"],
   148: ["!j:SharedStorage.get"],
   150: ["j:HTMLTemplateElement.htmlFor"],
+  146: ["c:trigger-scope", "c:timeline-trigger-source", "c:timeline-trigger-name", "c:timeline-trigger-active-range-start", "c:timeline-trigger-active-range-end", "c:timeline-trigger-active-range", "c:timeline-trigger-activation-range-start", "c:timeline-trigger-activation-range-end", "c:timeline-trigger-activation-range", "c:timeline-trigger", "c:animation-trigger"],
+  147: ["c:view-transition-scope", "c:border-shape"],
+  151: ["c:position-anchor"],
 };
 
 // Withhold one feature from this realm. Deleting rather than shadowing keeps

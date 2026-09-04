@@ -141,17 +141,19 @@ async fn main() {
                 // that call async app APIs impossible (issue #693). A 30s cap
                 // matches the CDP await timeout so a never-settling promise
                 // cannot hang the worker.
-                let result = match page
+                match page
                     .evaluate_for_cdp_with_timeout(&expression, true, true, 30_000)
                     .await
                 {
-                    Ok(info) => match info.value {
+                    Ok(info) => WorkerResponse::success(match info.value {
                         Some(v) => v,
                         None => serde_json::Value::String(info.description),
-                    },
-                    Err(_) => serde_json::Value::Null,
-                };
-                WorkerResponse::success(result)
+                    }),
+                    // An expression that throws or never parses reported a
+                    // bare `null`, which reads exactly like one that returned
+                    // null. Say which it was.
+                    Err(error) => WorkerResponse::error(error.to_string()),
+                }
             }
             WorkerCommand::Title => {
                 WorkerResponse::success(serde_json::json!(page.title))
@@ -196,6 +198,36 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An expression that fails has to say so.
+    ///
+    /// Both eval paths mapped every failure to a bare `null`, which reads
+    /// exactly like an expression that evaluated to null. A throw, a syntax
+    /// error and a genuine null were one answer, so a broken `--eval` looked
+    /// like a working one returning nothing -- and cost real debugging time
+    /// before it was noticed.
+    #[test]
+    fn a_failed_evaluation_is_distinguishable_from_a_null_result() {
+        let failed = WorkerResponse::error("Promise rejected: boom".to_string());
+        let encoded: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&failed).unwrap()).unwrap();
+        assert_eq!(encoded["ok"], serde_json::json!(false));
+        assert_eq!(encoded["error"], serde_json::json!("Promise rejected: boom"));
+        assert!(
+            encoded.get("result").is_none(),
+            "a failure carries no result: {encoded}"
+        );
+
+        let null_result = WorkerResponse::success(serde_json::Value::Null);
+        let encoded: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&null_result).unwrap()).unwrap();
+        assert_eq!(encoded["ok"], serde_json::json!(true));
+        assert_eq!(encoded["result"], serde_json::Value::Null);
+        assert!(
+            encoded.get("error").is_none(),
+            "a null result is not an error: {encoded}"
+        );
+    }
 
     /// The settle budget rides on the navigate command, and nothing else tells
     /// the worker to wait. If these field names drift apart from the driver's,

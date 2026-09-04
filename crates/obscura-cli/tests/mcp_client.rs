@@ -40,9 +40,40 @@ impl TestPageServer {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // An accepted socket inherits the listener's mode, and
+                        // the listener is non-blocking so the accept loop can
+                        // poll for shutdown. Left that way every read returns
+                        // WouldBlock at once, the request is never drained and
+                        // the read timeout below does nothing.
+                        let _ = stream.set_nonblocking(false);
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-                        let mut request = [0u8; 2048];
-                        let _ = stream.read(&mut request);
+                        // Drain the whole request before replying. A single
+                        // read can leave part of it in the receive buffer, and
+                        // closing a socket with unread bytes is an abortive
+                        // close on Windows: the client is sent an RST and the
+                        // fetch fails outright instead of seeing the response.
+                        // That lost the page often enough to make several of
+                        // these tests flaky whenever the suite ran hot.
+                        let mut request = Vec::new();
+                        let mut chunk = [0u8; 1024];
+                        loop {
+                            match stream.read(&mut chunk) {
+                                Ok(0) => break,
+                                Ok(read) => {
+                                    request.extend_from_slice(&chunk[..read]);
+                                    if request
+                                        .windows(4)
+                                        .any(|window| window == b"\r\n\r\n")
+                                    {
+                                        break;
+                                    }
+                                    if request.len() > 64 * 1024 {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                             TEST_PAGE.len(),
@@ -50,6 +81,7 @@ impl TestPageServer {
                         );
                         let _ = stream.write_all(response.as_bytes());
                         let _ = stream.flush();
+                        let _ = stream.shutdown(std::net::Shutdown::Write);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(2));

@@ -1338,7 +1338,14 @@ async fn eval_js(page: &mut Page, expression: &str, timeout_secs: u64) -> serde_
                 }
             }
         },
-        Err(_) => serde_json::Value::Null,
+        Err(error) => {
+            // An expression that throws, or never parses, used to return a
+            // bare `null` -- indistinguishable from one that evaluated to
+            // null. The value keeps its shape for anything parsing stdout;
+            // the reason goes to stderr, where it is visible.
+            eprintln!("--eval did not produce a value: {error}");
+            serde_json::Value::Null
+        }
     }
 }
 
@@ -1718,6 +1725,7 @@ async fn run_parallel_scrape(
                         .unwrap_or("")
                         .to_string();
 
+                    let mut eval_error: Option<String> = None;
                     let eval_result = if let Some(ref expr) = *eval {
                         let eval_cmd = serde_json::json!({"cmd": "evaluate", "expression": expr});
                         let mut line = serde_json::to_string(&eval_cmd).unwrap();
@@ -1735,6 +1743,12 @@ async fn run_parallel_scrape(
                                 let resp: serde_json::Value =
                                     serde_json::from_str(resp_line.trim())
                                         .unwrap_or(serde_json::json!({"ok": false}));
+                                if resp["ok"] == serde_json::Value::Bool(false) {
+                                    eval_error = resp["error"]
+                                        .as_str()
+                                        .map(str::to_string)
+                                        .or_else(|| Some("the expression did not evaluate".into()));
+                                }
                                 resp["result"].clone()
                             }
                             Ok(Ok(_)) | Ok(Err(_)) => return Err("Read failed".to_string()),
@@ -1751,13 +1765,19 @@ async fn run_parallel_scrape(
                     let _ = stdin.flush().await;
                     let _ = timeout(shutdown_timeout, child.wait()).await;
 
-                    Ok(serde_json::json!({
+                    let mut record = serde_json::json!({
                         "url": url,
                         "title": title,
                         "eval": eval_result,
                         "time_ms": task_start.elapsed().as_millis(),
                         "worker": i,
-                    }))
+                    });
+                    // Only present when the expression itself failed, so a
+                    // `null` eval can be told apart from one that threw.
+                    if let Some(error) = eval_error {
+                        record["eval_error"] = serde_json::Value::String(error);
+                    }
+                    Ok(record)
                 })
                 .await
                 {

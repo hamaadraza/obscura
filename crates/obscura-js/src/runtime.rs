@@ -5825,6 +5825,146 @@ mod tests {
         );
     }
 
+    /// The declaration surface has to be the browser's, not a subset of it.
+    ///
+    /// `CSSStyleDeclaration` exposes every CSS property Chrome knows, and a
+    /// page can count them: obscura advertised 362 where Chrome 148 has 695,
+    /// and long-shipped properties like `text-wrap` and `-webkit-line-clamp`
+    /// were simply absent. Feature detection through `in` answered no for
+    /// properties every real Chrome has had for years.
+    ///
+    /// The list is Chrome's own, so it also decides which names survive
+    /// parsing: an unknown property is not a declaration, and neither is a
+    /// `-moz-` or `-ms-` spelling.
+    #[test]
+    fn the_declaration_surface_is_chromes_property_set() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const el = document.createElement("div");
+                const own = Object.keys(el.style).filter((k) => !/^[0-9]+$/.test(k));
+
+                // Long-shipped properties that were missing entirely.
+                const present = [
+                    "textWrap" in el.style,
+                    "webkitLineClamp" in el.style,
+                    "anchorName" in el.style,
+                    "containerType" in el.style,
+                    "text-wrap" in el.style,
+                ];
+
+                // An unknown name is not a declaration, in either direction.
+                const unknown = document.createElement("div");
+                unknown.setAttribute("style", "bogus: 1px; color: red; -moz-osx-font-smoothing: auto");
+                const viaSetProperty = document.createElement("div");
+                viaSetProperty.style.setProperty("bogus", "1px");
+                viaSetProperty.style.setProperty("color", "red");
+
+                // A custom property is always a valid name.
+                const custom = document.createElement("div");
+                custom.style.setProperty("--anything-at-all", "1");
+
+                return [
+                    // The exact count is Chrome's 695 less whatever the version
+                    // gate withholds for the browser being presented, so this
+                    // is a floor: it is far above the 362 that shipped before
+                    // and cannot be met without the full set.
+                    own.length > 660,
+                    own.slice(0, 3),
+                    present,
+                    unknown.style.cssText,
+                    viaSetProperty.style.cssText,
+                    custom.style.cssText,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                true,
+                ["accentColor", "additiveSymbols", "alignContent"],
+                [true, true, true, true, true],
+                "color: red;",
+                "color: red;",
+                "--anything-at-all: 1;",
+            ]),
+            "the surface must be Chrome's property set, and only real properties survive"
+        );
+    }
+
+    /// A prefixed property Chrome aliases is a second spelling of the standard
+    /// one, not a declaration of its own: it serializes, enumerates, reads and
+    /// removes under the standard name through every access path.
+    ///
+    /// Storing the prefixed spelling instead left a declaration the renderer
+    /// never reads, so a page styling with `-webkit-transform` got no
+    /// transform at all. The set is measured, not assumed -- WebKit-only
+    /// properties like `-webkit-line-clamp` and `-webkit-writing-mode` keep
+    /// their prefix, and aliasing those would lose them just as badly.
+    ///
+    /// Every expectation here was read back from Chromium 148 directly.
+    #[test]
+    fn prefixed_properties_chrome_aliases_resolve_to_the_standard_name() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const mk = () => document.createElement("div");
+
+                // An alias is a rename: every path reaches one declaration.
+                const aliased = mk();
+                aliased.style.setProperty("-webkit-transform", "none");
+                const renamed = [
+                    aliased.style.cssText,
+                    aliased.style.getPropertyValue("-webkit-transform"),
+                    aliased.style.getPropertyValue("transform"),
+                    aliased.style.length,
+                    aliased.style.item(0),
+                    String(aliased.style.webkitTransform),
+                    String(aliased.style.transform),
+                ];
+                const removed = [
+                    aliased.style.removeProperty("-webkit-transform"),
+                    aliased.style.cssText,
+                ];
+
+                // The IDL spelling lands on the standard name too.
+                const idl = mk();
+                idl.style.webkitTransform = "none";
+
+                // A WebKit-only property keeps its prefix and does not answer
+                // to an unprefixed name that does not exist.
+                const kept = mk();
+                kept.style.setProperty("-webkit-line-clamp", "2");
+
+                // The attribute path aliases as well.
+                const attr = mk();
+                attr.setAttribute("style", "-webkit-box-shadow: none; -webkit-line-clamp: 3");
+
+                return [
+                    renamed,
+                    removed,
+                    idl.style.cssText,
+                    [kept.style.cssText, kept.style.getPropertyValue("line-clamp")],
+                    attr.style.cssText,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                ["transform: none;", "none", "none", 1, "transform", "none", "none"],
+                ["none", ""],
+                "transform: none;",
+                ["-webkit-line-clamp: 2;", ""],
+                "box-shadow: none; -webkit-line-clamp: 3;",
+            ])
+        );
+    }
+
     /// CSS names and IDL names are two different name spaces, and one mapper
     /// serving both is how `COLOR: red` came to be stored as `-c-o-l-o-r`.
     ///

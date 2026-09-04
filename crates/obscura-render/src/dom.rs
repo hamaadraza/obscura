@@ -9220,14 +9220,15 @@ pub(crate) fn rendered_children(tree: &DomTree, id: NodeId) -> Vec<NodeId> {
         return assigned_or_fallback;
     }
 
-    let Some(node) = tree.get_node(id) else {
+    let Some(is_closed_html_details) = tree.with_node(id, |node| {
+        node.as_element().is_some_and(|name| {
+            name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+                && name.local.as_ref() == "details"
+                && node.get_attribute("open").is_none()
+        })
+    }) else {
         return Vec::new();
     };
-    let is_closed_html_details = node.as_element().is_some_and(|name| {
-        name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
-            && name.local.as_ref() == "details"
-            && node.get_attribute("open").is_none()
-    });
     if !is_closed_html_details {
         return tree.children(id);
     }
@@ -9242,12 +9243,13 @@ pub(crate) fn rendered_children(tree: &DomTree, id: NodeId) -> Vec<NodeId> {
     tree.children(id)
         .into_iter()
         .find(|child| {
-            tree.get_node(*child).is_some_and(|child| {
+            tree.with_node(*child, |child| {
                 child.as_element().is_some_and(|name| {
                     name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
                         && name.local.as_ref() == "summary"
                 })
             })
+            .unwrap_or(false)
         })
         .into_iter()
         .collect()
@@ -9259,7 +9261,8 @@ pub(crate) fn rendered_children(tree: &DomTree, id: NodeId) -> Vec<NodeId> {
 /// an assigned light child is parented to its slot; and an unslotted light
 /// child has no rendered parent at all.
 pub(crate) fn rendered_parent(tree: &DomTree, id: NodeId) -> Option<NodeId> {
-    let parent = tree.get_node(id)?.parent?;
+    // Borrow: cloning a node to read one field is the whole cost of this call.
+    let parent = tree.with_node(id, |node| node.parent).flatten()?;
     if let Some(root) = tree.shadow_root_info(parent) {
         return Some(root.host);
     }
