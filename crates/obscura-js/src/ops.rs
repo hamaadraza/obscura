@@ -3491,6 +3491,50 @@ mod tests {
         assert_eq!(body.len(), 1024, "should read the whole small body");
     }
 
+    /// The geometry path reads the document's base URL on every call, and
+    /// uncached that runs the selector engine over the whole document. It made
+    /// `getBoundingClientRect()` cost O(nodes) per call: 650us each on a
+    /// 2500-row page, against 10us once memoized, with the price rising as the
+    /// page grew. Frameworks read rects in loops, so this was paid thousands of
+    /// times per page.
+    ///
+    /// Memoizing is only safe while the cache still notices the document
+    /// changing underneath it, which is what this pins down -- a `<base href>`
+    /// appearing later has to be picked up, or every relative URL the render
+    /// path resolves would silently keep using the old base.
+    #[test]
+    fn the_memoized_base_url_follows_the_document() {
+        let mut state = super::ObscuraState::new();
+        state.dom = Some(parse_html("<html><head></head><body></body></html>"));
+        state.url = "https://example.test/page/index.html".to_string();
+
+        assert_eq!(
+            super::document_base_url_memoized(&state).as_deref(),
+            Some("https://example.test/page/index.html"),
+            "with no <base>, the document URL is the base"
+        );
+        // Warm it again, so a stale answer is the easy failure below.
+        let _ = super::document_base_url_memoized(&state);
+
+        // The document is replaced the way a navigation or document.write
+        // replaces it, and the generation moves with it.
+        state.dom = Some(parse_html(
+            r#"<html><head><base href="https://cdn.example.test/assets/"></head><body></body></html>"#,
+        ));
+        state.document_generation += 1;
+
+        assert_eq!(
+            super::document_base_url_memoized(&state).as_deref(),
+            Some("https://cdn.example.test/assets/"),
+            "a <base href> the document gained after the cache was warmed has to be seen"
+        );
+        assert_eq!(
+            super::document_base_url_memoized(&state),
+            super::document_base_url(&state),
+            "the memoized answer must match the uncached one"
+        );
+    }
+
     #[test]
     fn glob_match_handles_cdp_blocked_url_patterns() {
         assert!(glob_match(
@@ -5405,7 +5449,7 @@ pub(crate) fn document_base_href_memoized(state: &ObscuraState) -> Option<String
 pub(crate) fn ensure_prepared_render(
     state: &mut ObscuraState,
 ) -> Option<&obscura_render::PreparedRender> {
-    let base_url = document_base_url(state);
+    let base_url = document_base_url_memoized(state);
     let viewport = state.viewport;
     let render_media = state.render_media;
     let animation_sample = state.animation_sample;
@@ -5504,7 +5548,10 @@ pub(crate) fn ensure_prepared_render(
 fn ensure_prepared_geometry(
     state: &mut ObscuraState,
 ) -> Option<&obscura_render::PreparedRender> {
-    let base_url = document_base_url(state);
+    // Memoized: uncached this runs the selector engine over the whole
+    // document, and it sits at the top of every geometry lookup, which
+    // made getBoundingClientRect O(nodes) per call.
+    let base_url = document_base_url_memoized(state);
     let reusable = state.pending_style_mutations.is_empty()
         && !state.animation_timeline.has_pending_start_candidates()
         && state.prepared_render.as_ref().is_some_and(|prepared| {
@@ -5680,7 +5727,7 @@ fn profiled_cached_image_metadata(
     node_id: NodeId,
 ) -> Option<(String, f32, bool, Option<(f32, f32)>)> {
     let dom = gs.dom.as_ref()?;
-    let base_url = document_base_url(gs);
+    let base_url = document_base_url_memoized(gs);
     gs.render_resources.cached_image_element_metadata(
         dom,
         node_id,
@@ -5727,7 +5774,7 @@ fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool) -> String {
 /// script runs and never enter this synchronous loader.
 #[cfg(feature = "render")]
 fn load_image_metadata_without_page_transport(gs: &mut ObscuraState, node_id: NodeId) -> String {
-    let base_url = document_base_url(&gs);
+    let base_url = document_base_url_memoized(&gs);
     let viewport = gs.viewport;
     let previous_dimensions = gs.dom.as_ref().and_then(|dom| {
         gs.render_resources
