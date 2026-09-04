@@ -2940,6 +2940,111 @@ fn supports_content_function(name: &str, arguments: &str) -> bool {
     }
 }
 
+/// Whether `background`'s shorthand value is one Chrome would accept.
+///
+/// The conservative fallback answered `false` for every value of this
+/// property, including `background: red`, which the cascade has always applied
+/// and the painter has always drawn. Feature detection therefore took fallback
+/// paths for a property obscura supports, and said so to anyone asking.
+fn supports_background_value(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // Unbalanced functions are a parse error, not a value.
+    if trimmed.matches('(').count() != trimmed.matches(')').count() {
+        return false;
+    }
+    split_top_commas(trimmed).iter().all(|layer| {
+        let layer = layer.trim();
+        !layer.is_empty()
+            && split_ws_paren(layer)
+                .iter()
+                .all(|token| supports_background_token(token))
+    })
+}
+
+fn supports_background_token(token: &str) -> bool {
+    let token = token.trim().trim_end_matches(',');
+    if token.is_empty() || token == "/" {
+        return true;
+    }
+    let lower = token.to_ascii_lowercase();
+    if lower.starts_with("url(")
+        || lower.contains("gradient(")
+        || matches!(
+            lower.as_str(),
+            "none"
+                | "transparent"
+                | "currentcolor"
+                | "repeat"
+                | "no-repeat"
+                | "repeat-x"
+                | "repeat-y"
+                | "space"
+                | "round"
+                | "scroll"
+                | "fixed"
+                | "local"
+                | "cover"
+                | "contain"
+                | "auto"
+                | "center"
+                | "left"
+                | "right"
+                | "top"
+                | "bottom"
+                | "border-box"
+                | "padding-box"
+                | "content-box"
+                | "text"
+        )
+    {
+        return true;
+    }
+    // A position or size component, or a colour in any notation.
+    !matches!(dimension_value(token), crate::Dimension::Auto)
+        || token.parse::<f32>().is_ok()
+        || parse_color_for_scheme(token, false).is_some()
+}
+
+/// `will-change` takes a comma-separated list of idents, and Chrome accepts an
+/// unknown one: `will-change: banana` is valid syntax whether or not anything
+/// acts on it. Only an empty list is rejected.
+fn supports_will_change_value(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && split_top_commas(trimmed).iter().all(|item| {
+            let item = item.trim();
+            !item.is_empty()
+                && item
+                    .chars()
+                    .all(|ch| ch.is_alphanumeric() || ch == '-' || ch == '_')
+        })
+}
+
+/// The `font` shorthand needs a size and a family, or one of the system font
+/// keywords. `font: 12px` and `font: bold` are both incomplete.
+fn supports_font_shorthand_value(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "caption" | "icon" | "menu" | "message-box" | "small-caption" | "status-bar"
+    ) {
+        return true;
+    }
+    let tokens = split_ws_paren(trimmed);
+    let size_at = tokens.iter().position(|token| {
+        let (candidate, _) = token.split_once('/').unwrap_or((token, ""));
+        is_font_size_token(candidate)
+    });
+    // Everything after the size is the family, and there has to be some.
+    size_at.is_some_and(|index| tokens.len() > index + 1)
+}
+
 fn supports_conservative_known_value(name: &str, value: &str) -> bool {
     let lower = value.trim().to_ascii_lowercase();
     let finite_number = |input: &str| {
@@ -3115,8 +3220,20 @@ fn supports_conservative_known_value(name: &str, value: &str) -> bool {
             .split_whitespace()
             .any(|token| list_style_keyword(token).is_some()),
         "animation" | "animation-name" => !value.trim().is_empty(),
-        "background" | "font" | "grid-template" | "grid" | "box-shadow" | "-webkit-box-shadow"
-        | "fill" | "stroke" | "stroke-width" | "letter-spacing" | "will-change" => false,
+        // Properties the cascade applies and the painter draws report the
+        // support they actually have. The rest stay false on purpose:
+        // claiming a property obscura cannot deliver sends frameworks down
+        // rendering paths it cannot satisfy, which is worse than a browser
+        // that simply lacks the feature.
+        "background" => supports_background_value(value),
+        "box-shadow" | "-webkit-box-shadow" => {
+            lower == "none" || parse_box_shadow(value, None, false).is_some()
+        }
+        "font" => supports_font_shorthand_value(value),
+        "will-change" => supports_will_change_value(value),
+        "grid-template" | "grid" | "fill" | "stroke" | "stroke-width" | "letter-spacing" => {
+            false
+        }
         _ => false,
     }
 }
@@ -8681,6 +8798,87 @@ fn split_ws_paren(s: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `CSS.supports` has to answer for the properties obscura actually
+    /// renders.
+    ///
+    /// The conservative fallback returned false for every value of
+    /// `background`, `box-shadow`, `font` and `will-change` -- including
+    /// `background: red` -- although the cascade applies all four and the
+    /// painter draws them. Feature detection took fallback paths for support
+    /// obscura has, and told anyone asking that it lacked them.
+    ///
+    /// Staying false is still right for a property obscura cannot deliver:
+    /// claiming one sends frameworks down rendering paths it cannot satisfy.
+    /// `transition` and `scrollbar-width` have no cascade arm, and `filter`
+    /// and friends are deliberately unadvertised, so those keep answering no.
+    ///
+    /// Every expectation here was read back from Chromium 148 directly.
+    #[test]
+    fn supports_answers_for_the_properties_the_renderer_draws() {
+        for (name, value) in [
+            ("background", "red"),
+            ("background", "#fff"),
+            ("background", "rgba(0,0,0,.5)"),
+            ("background", "transparent"),
+            ("background", "none"),
+            ("background", "url(a.png)"),
+            ("background", "linear-gradient(90deg,red,blue)"),
+            ("background", "radial-gradient(circle,red,blue)"),
+            ("background", "red url(a.png) no-repeat center / cover"),
+            ("background", "0"),
+            ("box-shadow", "none"),
+            ("box-shadow", "0 1px 2px red"),
+            ("box-shadow", "inset 0 1px 2px rgba(0,0,0,.2)"),
+            ("box-shadow", "0 0 0 1px red, 0 2px 4px blue"),
+            ("font", "12px serif"),
+            ("font", "italic bold 12px/1.5 serif"),
+            ("font", "caption"),
+            ("font", "menu"),
+            ("will-change", "auto"),
+            ("will-change", "transform"),
+            ("will-change", "transform, opacity"),
+            // Chrome accepts an unknown ident here: it is valid syntax
+            // whether or not anything acts on it.
+            ("will-change", "banana"),
+            ("will-change", "contents"),
+        ] {
+            assert!(
+                supports_declaration(name, value),
+                "Chrome supports `{name}: {value}`"
+            );
+        }
+
+        for (name, value) in [
+            ("background", "banana"),
+            ("background", "rgb("),
+            ("background", ""),
+            ("box-shadow", "banana"),
+            ("box-shadow", "1px"),
+            ("font", "banana"),
+            ("font", "12px"),
+            ("font", "bold"),
+            ("will-change", ""),
+        ] {
+            assert!(
+                !supports_declaration(name, value),
+                "Chrome rejects `{name}: {value}`"
+            );
+        }
+
+        // Deliberately unadvertised: obscura does not animate transitions or
+        // style scrollbars, and says so rather than inviting a framework to
+        // wait for a transitionend that never arrives.
+        for (name, value) in [
+            ("transition", "opacity 1s"),
+            ("scrollbar-width", "thin"),
+        ] {
+            assert!(
+                !supports_declaration(name, value),
+                "`{name}` is intentionally not advertised"
+            );
+        }
+    }
 
     #[test]
     fn direction_parses_inherited_state_and_supports_only_real_values() {
