@@ -140,6 +140,45 @@ handover notes are private working material: do not edit them, link them from
 public documentation, stage them, or commit them. Do not commit generated
 screenshots or reports.
 
+### Real sites: sweep, then compare
+
+Real sites are not reproducible, so a single pass over a corpus cannot tell you
+whether a change helped. Measured on a 106-site corpus, a quarter of the sites
+moved by more than 200 characters between two runs of the *same* build, and the
+failures were a nearly different set each time. Summary counts from one pass
+have already been misread as a regression that did not exist.
+
+Render the corpus several times and compare distributions instead:
+
+```bash
+python scripts/ci/sweep_sites.py --bin ./target/release/obscura \
+    --sites corpus.txt --runs 3 --stealth --out base.json
+# ...change something, rebuild...
+python scripts/ci/sweep_sites.py --bin ./target/release/obscura \
+    --sites corpus.txt --runs 3 --stealth --out candidate.json
+python scripts/ci/compare_sweep.py base.json candidate.json
+```
+
+`compare_sweep.py` reports a site only when it moves further than that site's
+own observed spread, so a page that swings wildly on its own has to move a
+great deal before it counts, while a stable page is held to the 200-character
+floor. `--fail-on-regression` gates CI on sites rendering less or dropping
+status.
+
+Build both aggregates the same way. A binary built without `--features render`
+has no layout: `getBoundingClientRect` returns a synthetic 100x20 cell, so
+anything driven by measurement (lazy loading, IntersectionObserver) behaves
+differently and the comparison is meaningless. Corpus lists are not tracked
+here; obscura-benchmark carries one under `realworld/sites.txt`.
+
+The comparison also assumes both builds agree on what the probe measures. They
+did not across the `innerText` fix: the older build returned `textContent`, so
+`<script>` source counted as rendered text, and comparing across it reported 58
+sites "rendering less" when every one of those numbers had got *more* correct.
+Each aggregate therefore also records an element count, and `compare_sweep.py`
+says so when many sites move on text while their structure holds steady. If you
+see that note, check one site by hand before believing the diff.
+
 ## Known performance work: incremental layout
 
 A style mutation costs a full relayout. On a 2,500-row document (~10,000
