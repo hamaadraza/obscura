@@ -120,11 +120,8 @@ async fn main() {
                         // server shell for every such app (SvelteKit sites
                         // came back empty). Settle first, as `fetch` does.
                         if let Some(settle_ms) = settle_ms.filter(|ms| *ms > 0) {
-                            if settle_fixed {
-                                page.settle_for_duration(settle_ms).await;
-                            } else {
-                                page.settle(settle_ms).await;
-                            }
+                            page.settle_following_navigations(settle_ms, settle_fixed)
+                                .await;
                         }
                         WorkerResponse::success(serde_json::json!({
                             "title": page.title,

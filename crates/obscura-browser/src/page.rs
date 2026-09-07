@@ -3170,6 +3170,53 @@ impl Page {
         }
     }
 
+    /// Settle, then follow a navigation the page queued while settling.
+    ///
+    /// The navigation chain drains `pending_navigation` only immediately after
+    /// a navigation returns, and `settle` never looked at it, so a navigation a
+    /// page asks for *after* load was queued and silently dropped. Only the CDP
+    /// and MCP front ends called `process_pending_navigation`; `fetch` and
+    /// `scrape` did not.
+    ///
+    /// Bot-mitigation challenges are the motivating case and they are common:
+    /// AWS WAF ships a challenge script, solves its proof-of-work
+    /// asynchronously after load, sets an `aws-waf-token` cookie and calls
+    /// `location.reload()`. Obscura already passed that challenge -- fetching
+    /// imdb.com twice against one cookie jar returns the real 1,646-element
+    /// page on the second try -- but a single fetch returned the 12-element
+    /// challenge shell, because the reload it had been asked for never
+    /// happened.
+    ///
+    /// One follow, not a loop: a challenge reload is a single hop, and each
+    /// follow costs a whole navigation budget plus another settle. A page that
+    /// wants to bounce further can be driven through CDP, which drains the
+    /// queue on every command.
+    pub async fn settle_following_navigations(&mut self, max_ms: u64, fixed: bool) {
+        if fixed {
+            self.settle_for_duration(max_ms).await;
+        } else {
+            self.settle(max_ms).await;
+        }
+        match self.process_pending_navigation().await {
+            Ok(true) => {
+                tracing::debug!("followed a navigation queued during settle");
+                // The replacement document has run nothing past `load` yet, so
+                // it needs the same settle the first one got.
+                if fixed {
+                    self.settle_for_duration(max_ms).await;
+                } else {
+                    self.settle(max_ms).await;
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                // The page as it stands is worth more than an error: the
+                // challenge shell is still a document.
+                tracing::warn!("navigation queued during settle failed: {error}");
+            }
+        }
+    }
+
     /// Pump the event loop and retain the full requested wall-clock delay.
     /// The CLI uses this for an explicitly supplied `--wait`; callers asking
     /// for a fixed capture delay should not be silently shortened by adaptive

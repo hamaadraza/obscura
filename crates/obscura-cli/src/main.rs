@@ -692,9 +692,9 @@ async fn run_multi_worker_serve(
 async fn settle_page(page: &mut Page, wait_secs: u64, fixed: bool) {
     let wait_ms = wait_secs.saturating_mul(1000);
     if fixed {
-        page.settle_for_duration(wait_ms).await;
+        page.settle_following_navigations(wait_ms, true).await;
     } else {
-        page.settle(wait_ms).await;
+        page.settle_following_navigations(wait_ms, false).await;
     }
 }
 
@@ -829,9 +829,14 @@ async fn run_fetch(
         } else {
             1
         };
+        // Settling may now follow one navigation the page queued (a challenge
+        // reload, say), which costs another navigation budget and another
+        // settle pass. Both are bounded, but this backstop has to allow for
+        // them or it fires on a fetch that was going to succeed.
         let hard = Duration::from_secs(
             timeout_secs
-                .saturating_add(wait_secs.saturating_mul(settle_passes))
+                .saturating_mul(2)
+                .saturating_add(wait_secs.saturating_mul(settle_passes.saturating_add(1)))
                 .saturating_add(10),
         );
         std::thread::spawn(move || {
