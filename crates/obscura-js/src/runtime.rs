@@ -9468,20 +9468,27 @@ mod tests {
         rt.set_url("http://example.test/docs/page");
         rt.set_viewport(200.0, 100.0);
 
+        const HERO_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="400" height="100">
+                        <rect width="400" height="100" fill="#ffff00"/>
+                    </svg>"##;
         let loads = std::sync::Arc::new(std::sync::Mutex::new(0usize));
         let loader_loads = std::sync::Arc::clone(&loads);
         rt.state.borrow_mut().render_resources =
             obscura_render::RenderResourceCache::with_loader(move |url: &str| {
                 assert_eq!(url, "http://example.test/assets/hero.svg");
                 *loader_loads.lock().expect("loader count") += 1;
-                Some(
-                    br##"<svg xmlns="http://www.w3.org/2000/svg" width="400" height="100">
-                        <rect width="400" height="100" fill="#ffff00"/>
-                    </svg>"##
-                        .to_vec(),
-                )
+                Some(HERO_SVG.to_vec())
             });
         rt.run_page_init();
+        // Bytes reach the renderer the way the page delivers them: fetched
+        // in parallel off the isolate thread and seeded here. Layout itself
+        // is cache-only, because a synchronous fetch from inside layout
+        // blocks V8 on native I/O that no watchdog can interrupt.
+        rt.seed_render_image_resource(
+            "http://example.test/assets/hero.svg".to_string(),
+            crate::ops::ImageRequestProfile::NoCorsInclude,
+            Some(HERO_SVG.to_vec()),
+        );
 
         let before = rt
             .evaluate(
@@ -9505,7 +9512,11 @@ mod tests {
             )
         };
         assert_eq!(cssom_height, prepared_height);
-        assert_eq!(*loads.lock().expect("prepare load count"), 1);
+        assert_eq!(
+            *loads.lock().expect("prepare load count"),
+            0,
+            "the intrinsic ratio must come from the seeded bytes, not a load"
+        );
 
         let base_url = Some("http://example.test/assets/");
         let top = rt
@@ -9535,7 +9546,7 @@ mod tests {
             );
             assert_eq!(prepared.content_size().1, cssom_height);
         }
-        assert_eq!(*loads.lock().expect("paint load count"), 1);
+        assert_eq!(*loads.lock().expect("paint load count"), 0);
 
         let after = rt
             .evaluate(
@@ -9565,7 +9576,7 @@ mod tests {
             .expect("mutated screenshot");
         assert_eq!(
             *loads.lock().expect("mutation load count"),
-            1,
+            0,
             "relayout must retain successful resource bytes"
         );
     }
@@ -9863,6 +9874,12 @@ mod tests {
                 <div style="position:fixed;left:0;top:0;width:10px;height:10px;background:lime"></div>
             </body></html>"#,
         );
+        const MARKER_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20">
+                        <rect width="20" height="20" fill="#ffff00"/>
+                    </svg>"##;
+        // A tripwire rather than a loader. Both layout and capture read this
+        // cache without loading now, so reaching the loader at all would mean
+        // something blocked the isolate on synchronous network I/O.
         let loads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let loader_loads = loads.clone();
         let mut rt = ObscuraJsRuntime::new();
@@ -9870,17 +9887,20 @@ mod tests {
         rt.set_url("http://example.test/page");
         rt.set_viewport(80.0, 60.0);
         rt.state.borrow_mut().render_resources =
-            obscura_render::RenderResourceCache::with_loader(move |url: &str| {
-                assert_eq!(url, "http://example.test/marker.svg");
+            obscura_render::RenderResourceCache::with_loader(move |_url: &str| {
                 loader_loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Some(
-                    br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20">
-                        <rect width="20" height="20" fill="#ffff00"/>
-                    </svg>"##
-                        .to_vec(),
-                )
+                Some(MARKER_SVG.to_vec())
             });
         rt.run_page_init();
+        // What the page transport does ahead of a capture: bytes are fetched in
+        // parallel off the isolate thread and seeded here, which is what makes
+        // a cache-only layout able to measure the image at all. See
+        // `Page::prepare_screenshot_resources`.
+        rt.seed_render_image_resource(
+            "http://example.test/marker.svg".to_string(),
+            crate::ops::ImageRequestProfile::NoCorsInclude,
+            Some(MARKER_SVG.to_vec()),
+        );
         assert_eq!(
             rt.evaluate("(function(){ window.scrollTo(0, 50); return window.scrollY; })()")
                 .expect("live scroll")
@@ -9914,7 +9934,16 @@ mod tests {
                 prepared.content_size().1,
             )
         };
-        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Layout used to fetch this image synchronously, on the isolate thread,
+        // and a real page does that once per uncached resource in series:
+        // apple.com issued 267 such blocking GETs and spent about 30 seconds in
+        // them, overrunning a 30,000ms script budget that no watchdog could
+        // enforce because native I/O is not interruptible.
+        assert_eq!(
+            loads.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "neither layout nor capture may load a resource synchronously"
+        );
 
         let region_png = rt
             .screenshot_prepared_region(obscura_render::CaptureRegion::new(
@@ -9962,7 +9991,11 @@ mod tests {
                 .root_offset(),
             resolved_root
         );
-        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            loads.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the region captures must reuse the seeded bytes, never load them"
+        );
     }
 
     #[cfg(feature = "render")]
@@ -9971,6 +10004,7 @@ mod tests {
         let loads = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let loader_loads = std::sync::Arc::clone(&loads);
         let font = include_bytes!("../../obscura-render/assets/liberation-serif.ttf").to_vec();
+        let seeded_font = font.clone();
         let mut rt = parser_image_runtime(
             r#"<html><body style="margin:0">
                 <span id="sample" style="display:inline-block;width:max-content;
@@ -10015,6 +10049,17 @@ mod tests {
             );
         }
 
+        // Bytes reach the renderer the way the page delivers them: fetched
+        // in parallel off the isolate thread and seeded here. Layout itself
+        // is cache-only, because a synchronous fetch from inside layout
+        // blocks V8 on native I/O that no watchdog can interrupt.
+        // Chrome is asynchronous here too: `document.fonts.add` does not block
+        // on the face's bytes, and text reshapes once they arrive.
+        rt.seed_render_resource(
+            "http://example.com/fonts/dynamic.ttf".to_string(),
+            Some(seeded_font),
+        );
+
         let after = rt
             .evaluate("document.getElementById('sample').getBoundingClientRect().width")
             .unwrap()
@@ -10024,13 +10069,13 @@ mod tests {
             before, after,
             "registered face must affect final text geometry"
         );
-        assert_eq!(
-            *loads.lock().expect("dynamic font loads"),
-            vec!["http://example.com/fonts/dynamic.ttf".to_string()]
+        assert!(
+            loads.lock().expect("dynamic font loads").is_empty(),
+            "the registered face must reshape from seeded bytes, not a load"
         );
         rt.screenshot_prepared((400.0, 100.0), Some("http://example.com/page/index.html"))
             .expect("dynamic font screenshot");
-        assert_eq!(loads.lock().expect("repeated font loads").len(), 1);
+        assert_eq!(loads.lock().expect("repeated font loads").len(), 0);
     }
 
     #[cfg(feature = "render")]
@@ -14251,6 +14296,7 @@ mod tests {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let loader_calls = calls.clone();
         let png = two_by_three_png();
+        let seeded_png = png.clone();
         let mut rt = parser_image_runtime(
             r#"<img id="cached" src="cached.png">"#,
             move |_url: &str| {
@@ -14258,14 +14304,27 @@ mod tests {
                 Some(png.clone())
             },
         );
+        // Bytes reach the renderer the way the page delivers them: fetched
+        // in parallel off the isolate thread and seeded here. Layout itself
+        // is cache-only, because a synchronous fetch from inside layout
+        // blocks V8 on native I/O that no watchdog can interrupt.
+        rt.seed_render_image_resource(
+            "http://example.com/page/cached.png".to_string(),
+            crate::ops::ImageRequestProfile::NoCorsInclude,
+            Some(seeded_png),
+        );
         {
             let mut state = rt.state.borrow_mut();
             assert!(ensure_prepared_render(&mut state).is_some());
         }
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "prepare must read the seeded cache, never load synchronously"
+        );
 
-        // Constructing the JS wrapper happens here, after prepare_dom loaded
-        // the resource. The first complete getter must see that cache hit
+        // Constructing the JS wrapper happens here, after prepare_dom saw the
+        // seeded resource. The first complete getter must see that cache hit
         // immediately; it must not briefly regress to pending/zero.
         assert_eq!(
             rt.evaluate(
@@ -14282,7 +14341,11 @@ mod tests {
             .unwrap(),
             serde_json::json!([true, 2, 3, "http://example.com/page/cached.png"])
         );
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the getter must be answered from the seeded cache alone"
+        );
     }
 
     #[cfg(feature = "render")]

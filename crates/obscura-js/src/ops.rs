@@ -5470,8 +5470,30 @@ pub(crate) fn ensure_prepared_render(
             .then(|| state.prepared_render.take())
             .flatten();
         let mutations = std::mem::take(&mut state.pending_style_mutations);
-        let prepared = {
-            let dom = state.dom.as_ref()?;
+        // Layout must never block on the network.
+        //
+        // An image whose bytes are not cached used to be fetched here
+        // synchronously, on the isolate thread, one at a time: apple.com issued
+        // 267 serial blocking GETs during its script phase and spent about 30
+        // seconds inside them. Nothing can interrupt that. It is native I/O, so
+        // the V8 watchdog's `terminate_execution` does not touch it, which is
+        // why a phase budgeted at 30,000ms was measured taking 51,022ms with
+        // its watchdog armed at 31,000ms and firing on time. The settle pass
+        // after it overran its own 5,000ms budget the same way.
+        //
+        // Chrome lays an image out at its attribute or CSS size and reflows
+        // once the bytes arrive, so cache-only is also the more faithful
+        // behaviour. The page's async transport seeds this same cache in
+        // parallel (`Page::prepare_screenshot_resources`), and the remembered
+        // content-image intrinsics re-run layout when bytes land, so an image
+        // that does arrive is still measured. Painting keeps its blocking
+        // fallback: a capture is an explicit, bounded request for final pixels,
+        // not a page-driven measurement.
+        let blocking_loads = state.render_resources.set_sync_loading_enabled(false);
+        let prepared = 'prepare: {
+            let Some(dom) = state.dom.as_ref() else {
+                break 'prepare None;
+            };
             match previous {
                 Some(previous) => obscura_render::prepare_dom_with_retained_styles_with_animation_state(
                     dom,
@@ -5496,7 +5518,7 @@ pub(crate) fn ensure_prepared_render(
                         animation_sample,
                         &mut state.animation_timeline,
                     )
-                })?,
+                }),
                 None => match render_media {
                     obscura_render::CssMediaType::Screen => obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
                         dom,
@@ -5507,7 +5529,7 @@ pub(crate) fn ensure_prepared_render(
                         &mut state.stylesheet_cache,
                         animation_sample,
                         &mut state.animation_timeline,
-                    )?,
+                    ),
                     obscura_render::CssMediaType::Print => obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_for_media_with_animation_state(
                         dom,
                         viewport,
@@ -5518,10 +5540,14 @@ pub(crate) fn ensure_prepared_render(
                         render_media,
                         animation_sample,
                         &mut state.animation_timeline,
-                    )?,
+                    ),
                 },
             }
         };
+        // Restored before the `?` below, so a failed prepare cannot leave the
+        // cache in cache-only mode for the capture that follows.
+        state.render_resources.set_sync_loading_enabled(blocking_loads);
+        let prepared = prepared?;
         if animation_sample.mode == obscura_render::AnimationSampleMode::DocumentTime {
             state.animation_timeline.clear_start_candidates();
         }
