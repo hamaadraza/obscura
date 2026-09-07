@@ -2133,6 +2133,41 @@ impl Page {
         true
     }
 
+    /// Run one lifecycle event dispatch under a bound.
+    ///
+    /// `DOMContentLoaded` and `load` are dispatched with a synchronous
+    /// `execute_script`, and every listener a page registered runs inside it.
+    /// Nothing checked the phase deadline around them, so a heavy listener ran
+    /// for as long as it liked: measured on apnews.com, the DCL dispatch alone
+    /// took 22.4 seconds and the load dispatch 17.4 seconds, against a
+    /// 30,000ms budget the rest of the phase honoured.
+    ///
+    /// The allowance is the budget that remains plus the same synchronous task
+    /// floor every other pump grants, so a listener that is merely slow still
+    /// finishes and only one that will not return is cut off. Armed at the
+    /// deadline alone this would kill ordinary hydration -- that mistake cost
+    /// stackoverflow.blog two thirds of its text earlier today.
+    fn dispatch_lifecycle_event(
+        js: &mut ObscuraJsRuntime,
+        name: &'static str,
+        source: &str,
+        deadline: tokio::time::Instant,
+    ) {
+        let remaining_ms = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .map(|left| left.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0);
+        let token = js.arm_watchdog(std::time::Duration::from_millis(
+            remaining_ms
+                + obscura_js::runtime::SYNCHRONOUS_TASK_FLOOR_MS
+                + obscura_js::runtime::WATCHDOG_SCHEDULING_MARGIN_MS,
+        ));
+        let _ = js.execute_script(name, source);
+        if js.disarm_watchdog(token) {
+            tracing::warn!("{name} listeners exceeded the script budget and were cut off");
+        }
+    }
+
     async fn execute_scripts_with_module_budget(&mut self, module_budget_override: Option<u64>) {
         let scripts_started = std::time::Instant::now();
         tracing::info!(
@@ -2943,10 +2978,12 @@ impl Page {
             // dynamic script elements do not gate it. They do remain in the
             // document's load-event delay set, including scripts inserted by
             // a DOMContentLoaded listener.
-            let _ = js.execute_script(
+            Self::dispatch_lifecycle_event(
+                js,
                 "<dom-content-loaded>",
                 "try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
                  try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}",
+                script_deadline,
             );
 
             let load_blockers_finished =
@@ -2960,11 +2997,13 @@ impl Page {
             // readyState becomes complete before the load event. A script
             // inserted by an onload handler is therefore post-load work and
             // remains pending until an explicit caller settle/wait.
-            let _ = js.execute_script(
+            Self::dispatch_lifecycle_event(
+                js,
                 "<load-event>",
                 "globalThis.__documentReadyState__ = 'complete';\n\
                  if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
                  try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}",
+                script_deadline,
             );
         }
         if let Some(token) = exec_wd {
