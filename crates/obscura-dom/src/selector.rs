@@ -804,7 +804,7 @@ impl DomTree {
         );
 
         let candidates = selector_candidates(self, &selector_list);
-        for desc_id in self.descendants(root) {
+        for desc_id in self.descendants_iter(root) {
             if candidates.as_ref().is_some_and(|buckets| {
                 !buckets
                     .iter()
@@ -855,7 +855,7 @@ impl DomTree {
         let mut results = Vec::new();
 
         let candidates = selector_candidates(self, &selector_list);
-        for desc_id in self.descendants(root) {
+        for desc_id in self.descendants_iter(root) {
             if candidates.as_ref().is_some_and(|buckets| {
                 !buckets
                     .iter()

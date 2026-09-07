@@ -1134,6 +1134,33 @@ impl DomTree {
         Some(self.children(root))
     }
 
+    /// Descendants of `node_id` in the same pre-order as [`Self::descendants`],
+    /// produced one at a time.
+    ///
+    /// The eager version builds a `Vec` of the entire subtree before its caller
+    /// sees the first element, so a search that stops early still paid for the
+    /// whole document -- plus a small allocation per node for the sibling walk.
+    /// `querySelector` is exactly that shape, and the cost is not theoretical:
+    /// techcrunch.com calls `document.querySelector('body')` about 129,000
+    /// times, and at 161us each that was 21.4 seconds of its 30-second script
+    /// budget, with the match sitting a few nodes in.
+    ///
+    /// The tree borrow is taken per step rather than held across iteration, so
+    /// the caller can read nodes while walking -- the selector matcher does.
+    pub fn descendants_iter(&self, node_id: NodeId) -> Descendants<'_> {
+        let mut stack = Vec::new();
+        {
+            let inner = self.inner.borrow();
+            push_children_reversed(&inner, &mut stack, node_id);
+        }
+        Descendants {
+            tree: self,
+            stack,
+            yielded: 0,
+            stopped: false,
+        }
+    }
+
     pub fn descendants(&self, node_id: NodeId) -> Vec<NodeId> {
         let inner = self.inner.borrow();
         let mut result = Vec::new();
@@ -1777,6 +1804,54 @@ impl Default for DomTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lazy walk must produce exactly the eager walk's sequence.
+    ///
+    /// The two are only interchangeable if they agree on order, and arena
+    /// order is not document order once a page has moved nodes about -- which
+    /// is precisely the case where a wrong order would return the wrong
+    /// element for `querySelector` rather than merely being slow.
+    #[test]
+    fn the_lazy_descendant_walk_matches_the_eager_one() {
+        let tree = DomTree::new();
+        let root = tree.document();
+        let a = element(&tree, "a");
+        let b = element(&tree, "b");
+        let c = element(&tree, "c");
+        let d = element(&tree, "d");
+        tree.append_child(root, a);
+        tree.append_child(a, b);
+        tree.append_child(a, c);
+        tree.append_child(c, d);
+
+        let eager = tree.descendants(root);
+        let lazy: Vec<NodeId> = tree.descendants_iter(root).collect();
+        assert_eq!(lazy, eager, "pre-order sequence must be identical");
+        assert!(eager.len() >= 4, "the fixture must have real depth");
+
+        // A node allocated last but inserted first: arena order and document
+        // order now disagree, so a walk that leaned on NodeId ordering would
+        // diverge here.
+        let late = element(&tree, "late");
+        tree.insert_before(b, late);
+        assert!(late > d, "the fixture needs the newest node to sort last");
+
+        let eager = tree.descendants(root);
+        let lazy: Vec<NodeId> = tree.descendants_iter(root).collect();
+        assert_eq!(lazy, eager, "still identical after a reordering insert");
+        assert_eq!(
+            lazy.iter().position(|n| *n == late),
+            Some(1),
+            "the inserted node belongs at its document position, not its arena one"
+        );
+
+        // Subtree roots and leaves, not just the document.
+        for start in [a, c, d] {
+            let eager = tree.descendants(start);
+            let lazy: Vec<NodeId> = tree.descendants_iter(start).collect();
+            assert_eq!(lazy, eager, "subtree walks must agree too");
+        }
+    }
 
     fn element(tree: &DomTree, local: &str) -> NodeId {
         tree.new_node(NodeData::Element {
@@ -2477,5 +2552,68 @@ mod tests {
             "ancestors() must stay bounded on a cyclic parent chain, got {}",
             ancestors.len()
         );
+    }
+}
+
+/// Push `parent`'s children onto `stack` so the first child is popped first.
+///
+/// The sibling chain is capped for the same reason the eager walk caps it: a
+/// cyclic `next_sibling` would otherwise spin forever.
+fn push_children_reversed(inner: &DomTreeInner, stack: &mut Vec<NodeId>, parent: NodeId) {
+    let start = stack.len();
+    let mut child = inner
+        .nodes
+        .get(parent.index())
+        .and_then(|n| n.as_ref())
+        .and_then(|n| n.first_child);
+    while let Some(child_id) = child {
+        stack.push(child_id);
+        if stack.len() - start > inner.nodes.len() {
+            eprintln!(
+                "obscura: sibling-chain cap hit at node {} - cycle",
+                parent.index()
+            );
+            break;
+        }
+        child = inner
+            .nodes
+            .get(child_id.index())
+            .and_then(|n| n.as_ref())
+            .and_then(|n| n.next_sibling);
+    }
+    stack[start..].reverse();
+}
+
+/// Lazy pre-order walk; see [`DomTree::descendants_iter`].
+pub struct Descendants<'a> {
+    tree: &'a DomTree,
+    stack: Vec<NodeId>,
+    yielded: usize,
+    stopped: bool,
+}
+
+impl Iterator for Descendants<'_> {
+    type Item = NodeId;
+
+    fn next(&mut self) -> Option<NodeId> {
+        if self.stopped {
+            return None;
+        }
+        let current = self.stack.pop()?;
+        let inner = self.tree.inner.borrow();
+        // Defence in depth, matching the eager walk: a well-formed subtree has
+        // at most nodes.len() descendants, so exceeding that means the
+        // parent/child graph is cyclic. Stop rather than iterate forever.
+        self.yielded += 1;
+        if self.yielded > inner.nodes.len() {
+            eprintln!(
+                "obscura: descendants() cap hit ({} nodes) - tree has a cycle",
+                inner.nodes.len()
+            );
+            self.stopped = true;
+            return None;
+        }
+        push_children_reversed(&inner, &mut self.stack, current);
+        Some(current)
     }
 }
