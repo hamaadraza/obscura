@@ -1196,7 +1196,16 @@ impl Page {
     /// the JS side queues the fetched document and this drains the queue between
     /// event loop turns. Reports whether anything was attached, so a caller can
     /// settle and come back for frames that these frames created.
-    async fn attach_pending_frames(&mut self) -> bool {
+    /// Give every queued frame document a realm.
+    ///
+    /// `deadline` bounds only the *waiting*: a frame still gets its realm and
+    /// its inline scripts past it, but no further external source is waited
+    /// for. Frames are never dropped, because they have already been taken off
+    /// the pending queue here and nothing would put them back.
+    async fn attach_pending_frames(
+        &mut self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> bool {
         let pending = match self.js.as_ref() {
             Some(js) => js.take_pending_frames(),
             None => return false,
@@ -1247,7 +1256,30 @@ impl Page {
                 if self.should_block_url(&url) {
                     continue;
                 }
-                match self.do_fetch(&parsed).await {
+                // Frame scripts are fetched one at a time and a page may hold
+                // any number of third-party frames, so this loop is where an
+                // unbounded settle actually spends itself: npr.org ran here for
+                // 250 seconds against a 5,000ms budget until the process was
+                // force-killed. An expired deadline makes each later frame cost
+                // one immediate no-op instead, so the pass still finishes
+                // attaching rather than abandoning frames it has already taken.
+                let fetched = match deadline {
+                    Some(deadline) => {
+                        match tokio::time::timeout_at(deadline, self.do_fetch(&parsed)).await {
+                            Ok(fetched) => fetched,
+                            Err(_) => {
+                                tracing::debug!(
+                                    "frame {}: settle deadline reached, leaving {} unfetched",
+                                    frame.url,
+                                    url,
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    None => self.do_fetch(&parsed).await,
+                };
+                match fetched {
                     Ok(response) => {
                         sources.insert(url, String::from_utf8_lossy(&response.body).into_owned());
                     }
@@ -1490,9 +1522,13 @@ impl Page {
         }
     }
 
-    async fn advance_frames(&mut self) -> bool {
+    /// One round of frame housekeeping. `deadline`, where a caller has a
+    /// budget, bounds the network waiting inside frame attachment; `None` means
+    /// the caller is bounded some other way (navigation wraps its whole future
+    /// in the navigation timeout) or has no budget at all.
+    async fn advance_frames(&mut self, deadline: Option<tokio::time::Instant>) -> bool {
         self.adopt_claimed_blank_frames();
-        let attached = self.attach_pending_frames().await;
+        let attached = self.attach_pending_frames(deadline).await;
         let delivered = self.deliver_frame_messages();
         self.release_detached_frames();
         self.replenish_blank_frame_spare();
@@ -3034,6 +3070,13 @@ impl Page {
             return;
         }
         let settle_started = std::time::Instant::now();
+        // The budget as a deadline, so the frame pass below can observe it too.
+        // Checking `remaining` only at the top of the loop bounded the pump but
+        // left frame attachment free to fetch for as long as it liked, which is
+        // how a 5,000ms settle was measured taking 48 seconds on apnews.com and
+        // running until the hard timeout killed the process on npr.org.
+        let settle_deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_millis(max_ms);
         // Pump, then give any frame document that finished fetching a realm of
         // its own. Attaching one runs its scripts, which can start timers,
         // fetches and further frames, so keep alternating until no new frame
@@ -3056,7 +3099,7 @@ impl Page {
                     let _ = js.run_event_loop_until_quiescent(remaining, 150).await;
                 }
             }
-            if !self.advance_frames().await {
+            if !self.advance_frames(Some(settle_deadline)).await {
                 break;
             }
         }
@@ -3096,7 +3139,15 @@ impl Page {
         // realms once at the end instead of being interleaved as in `settle`.
         // Their document scripts still run; only their own deferred work is
         // left for a later settle.
-        self.advance_frames().await;
+        //
+        // The budget is granted again rather than shared, because the caller
+        // asked for the whole duration to be spent pumping and there is by
+        // definition none of it left here. That caps a fixed wait at twice what
+        // was asked instead of leaving it unbounded; every ordinary page
+        // finishes this in milliseconds.
+        let frame_deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_millis(duration_ms);
+        self.advance_frames(Some(frame_deadline)).await;
     }
 
     /// Advance one wake-driven browser task for a continuously owned page.
@@ -3113,7 +3164,9 @@ impl Page {
         // realms must be built by Page between turns. Keep the autonomous CDP
         // pump on the same generic frame path as settle(), so a client that
         // stays attached can observe and run child documents as they arrive.
-        let frame_work = self.advance_frames().await;
+        // The CDP owner drives this turn by turn and holds no budget of its
+        // own, so there is no deadline to impose here.
+        let frame_work = self.advance_frames(None).await;
         Ok(reached_idle && !frame_work)
     }
 
@@ -3548,6 +3601,22 @@ impl Page {
         // until quiet: a page that adds one on every turn would never finish.
         const ROUNDS: usize = 8;
         const ROUND_MS: u64 = 50;
+        // Wall clock this pass may spend waiting on frame subresources.
+        //
+        // The rounds bound the pumping but not the attachment, which fetches
+        // each frame's external scripts one at a time. Navigation's own timeout
+        // was the only thing stopping that, so a caller asking for a patient
+        // navigation got a proportionally long frame pass: npr.org spent 101.8
+        // seconds here under `--timeout 240`, and under the 45s a sweep allows
+        // it consumed most of the navigation and the site was recorded as a
+        // failure. Building the document's frames is a bounded sub-task, so it
+        // gets a fixed budget rather than a share of the caller's patience.
+        let budget_ms = std::env::var("OBSCURA_FRAME_BUILD_BUDGET_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(5_000);
+        let deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_millis(budget_ms);
 
         let has_iframe = self
             .with_dom(|dom| dom.query_selector("iframe").ok().flatten().is_some())
@@ -3556,7 +3625,30 @@ impl Page {
             return;
         }
 
+        // The rounds pump with a Tokio timeout, which cannot preempt a poll
+        // that is busy in synchronous JavaScript: the deadline fires only once
+        // the task returns. Every other pump here arms a watchdog for exactly
+        // that reason; this one did not, and npr.org sat in it for 188 seconds
+        // after its script phase had finished within budget.
+        //
+        // Armed past the deadline by the same task floor every other pump
+        // grants: Tokio ends the pumping at the deadline, and a task still
+        // running when it does gets that allowance to finish, so only a task
+        // that never returns is terminated. Armed at the deadline alone this
+        // killed stackoverflow.blog's hydration in two runs of three, leaving
+        // 3,029 of its 18,106 characters each time; a dead script is not
+        // revived by any later settle, so the loss was permanent.
+        let watchdog = self.js.as_mut().map(|js| {
+            js.arm_watchdog(std::time::Duration::from_millis(
+                budget_ms
+                    + obscura_js::runtime::SYNCHRONOUS_TASK_FLOOR_MS
+                    + obscura_js::runtime::WATCHDOG_SCHEDULING_MARGIN_MS,
+            ))
+        });
         for _ in 0..ROUNDS {
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
             if let Some(js) = &mut self.js {
                 let _ = tokio::time::timeout(
                     tokio::time::Duration::from_millis(ROUND_MS),
@@ -3564,8 +3656,13 @@ impl Page {
                 )
                 .await;
             }
-            if !self.advance_frames().await {
+            if !self.advance_frames(Some(deadline)).await {
                 break;
+            }
+        }
+        if let Some(token) = watchdog {
+            if let Some(js) = self.js.as_mut() {
+                js.disarm_watchdog(token);
             }
         }
     }
@@ -5787,6 +5884,133 @@ mod tests {
         assert!(!script_response_is_executable(401));
         assert!(!script_response_is_executable(404));
         assert!(!script_response_is_executable(500));
+    }
+
+    /// `/` appends an iframe from a timer, so the frame arrives during settle
+    /// rather than during navigation. Its document pulls `/stall.js`, which is
+    /// never answered and never closed -- a closed socket would be a fast
+    /// failure, which is not what a slow third party does.
+    async fn spawn_stalling_frame_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let read = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                    if request.starts_with("GET /stall.js ") {
+                        // Holding the task holds the socket open.
+                        std::future::pending::<()>().await;
+                    }
+                    let body = if request.starts_with("GET /frame.html ") {
+                        "<html><body><script src=\"/stall.js\"></script></body></html>"
+                            .to_string()
+                    } else {
+                        "<html><body><script>\
+                         setTimeout(function () {\
+                           var f = document.createElement('iframe');\
+                           f.src = '/frame.html';\
+                           document.body.appendChild(f);\
+                         }, 50);\
+                         </script></body></html>"
+                            .to_string()
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    /// `settle(max_ms)` has to stop at its budget.
+    ///
+    /// The budget was checked only at the top of the pump loop, so frame
+    /// attachment -- which fetches each frame's external scripts one at a time
+    /// with no deadline -- was free to run for as long as the network took.
+    /// Measured on real pages that is not a small overrun: apnews.com spent 48
+    /// seconds in a 5,000ms settle, and npr.org ran until the hard timeout
+    /// killed the process at 255 seconds.
+    #[tokio::test]
+    async fn settle_stops_at_its_budget_when_a_frame_script_never_answers() {
+        let base = spawn_stalling_frame_server().await;
+        let mut page = frame_page("settle-frame-deadline");
+        page.navigate(&base).await.unwrap();
+
+        let started = std::time::Instant::now();
+        page.settle(500).await;
+        let elapsed = started.elapsed();
+
+        // The pump's own allowance (budget + the synchronous task floor) plus
+        // the resource warmup is a few seconds; an unbounded frame fetch waits
+        // on the HTTP client's timeout instead, which is far longer.
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "settle ran past its budget waiting on a frame script: {elapsed:?}"
+        );
+    }
+
+    /// `/` has an iframe, so navigation builds frames; `/child.html` is the
+    /// frame, and its own script never returns. Frame scripts run inside the
+    /// frame pass and nowhere else, so unlike a page-level timer this cannot
+    /// be serviced -- and bounded -- by an earlier pump.
+    async fn spawn_spinning_frame_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let read = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                    let body = if request.starts_with("GET /child.html ") {
+                        "<html><body><script>while (true) {}</script></body></html>"
+                    } else {
+                        "<html><body><iframe src=\"/child.html\"></iframe></body></html>"
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    /// Building the document's frames has to stay bounded against a task that
+    /// never yields.
+    ///
+    /// The pass pumps with a Tokio timeout, which cannot preempt a poll that is
+    /// busy in synchronous JavaScript: it fires only once the task returns.
+    /// Every other pump arms a V8 watchdog for that reason; this one did not,
+    /// and npr.org sat in it for 188 seconds after its script phase had
+    /// finished within budget. Without the watchdog the only thing that ends
+    /// this test is the navigation timeout.
+    #[tokio::test]
+    async fn frame_building_is_bounded_against_a_task_that_never_yields() {
+        let base = spawn_spinning_frame_server().await;
+        let mut page = frame_page("frame-build-watchdog");
+
+        let started = std::time::Instant::now();
+        page.navigate(&base).await.unwrap();
+        let elapsed = started.elapsed();
+
+        // The pass's budget plus the task floor and margin is about ten
+        // seconds. Without the watchdog this ran for 240 seconds: even the
+        // navigation timeout is a Tokio deadline, and nothing but a V8
+        // termination can end a poll that is busy in synchronous JavaScript.
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "frame building ran unbounded: {elapsed:?}"
+        );
     }
 
     /// `/` puts its iframe inside a closed shadow root, `/plain.html` puts the

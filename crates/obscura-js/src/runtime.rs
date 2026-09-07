@@ -475,8 +475,15 @@ impl WatchdogToken {
 // Observation deadlines are checked between browser tasks. A task which has
 // already started receives this bounded completion allowance, matching the
 // fixed-wait path while retaining an absolute backstop for infinite script.
-const SYNCHRONOUS_TASK_FLOOR_MS: u64 = 5_000;
-const WATCHDOG_SCHEDULING_MARGIN_MS: u64 = 500;
+/// How long a task already running when a pump's observation deadline
+/// expires is allowed to finish before the watchdog terminates it. Chromium
+/// does not kill the task that happens to be active when a capture delay
+/// ends; it waits for the task boundary. Public so a pump outside this crate
+/// can arm its watchdog by the same rule.
+pub const SYNCHRONOUS_TASK_FLOOR_MS: u64 = 5_000;
+/// Slack between the moment a deadline passes and the moment the watchdog
+/// thread can be expected to have acted on it.
+pub const WATCHDOG_SCHEDULING_MARGIN_MS: u64 = 500;
 
 /// Gives a host-created realm the per-context state deno_core installs on the
 /// contexts it creates itself.
