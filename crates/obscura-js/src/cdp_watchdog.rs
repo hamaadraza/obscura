@@ -109,6 +109,19 @@ pub fn arm(handle: IsolateHandle, budget: Duration) -> Armed {
     Armed { gen, fired }
 }
 
+impl Drop for Armed {
+    fn drop(&mut self) {
+        // A handle dropped without `disarm` left its slot in the shared map,
+        // so the worker still terminated the isolate at the slot's deadline
+        // -- the same late termination a leaked `WatchdogToken` caused. The
+        // removal is idempotent, so `disarm` and this can both run.
+        let s = shared();
+        let mut guard = s.state.lock().unwrap();
+        guard.0.remove(&self.gen);
+        s.cv.notify_one();
+    }
+}
+
 /// Disarm the command's watchdog. Returns true if it had already fired
 /// (terminated the isolate), in which case the caller must clear the V8
 /// termination flag before the next command runs.

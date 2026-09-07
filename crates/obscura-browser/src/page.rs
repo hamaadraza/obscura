@@ -3035,6 +3035,13 @@ impl Page {
         {
             Ok(r) => r,
             Err(_) => {
+                // The future was dropped mid-flight. A watchdog it had armed
+                // stops with its token, but one that had already fired left
+                // the isolate terminating, and nothing downstream would clear
+                // that before the caller's next evaluate.
+                if let Some(js) = self.js.as_mut() {
+                    js.cancel_termination();
+                }
                 if self.has_rendered_document() {
                     // The document is parsed and scripts have run for as long as
                     // the budget allowed; stop waiting rather than discarding it.

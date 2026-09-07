@@ -460,6 +460,11 @@ impl WatchdogToken {
     /// isolate). The caller must then clear the termination flag via
     /// [`ObscuraJsRuntime::cancel_termination`] before the next eval.
     pub fn stop(mut self) -> bool {
+        self.cancel_and_join();
+        self.fired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn cancel_and_join(&mut self) {
         {
             let (lock, cvar) = &*self.pair;
             *lock.lock().unwrap() = true;
@@ -468,7 +473,24 @@ impl WatchdogToken {
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
-        self.fired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for WatchdogToken {
+    fn drop(&mut self) {
+        // A token dropped without `stop` -- an early return between arm and
+        // disarm, or a future cancelled by a timeout while its watchdog was
+        // armed -- used to leave the thread alive to terminate the isolate at
+        // some later moment, poisoning whatever JavaScript ran next. That is
+        // not hypothetical: on a heavy page the navigation timeout drops the
+        // script phase with its watchdog armed, the thread fires during the
+        // `--eval` that follows, and the site is recorded as a failure with
+        // "execution terminated" -- seen on every build measured. Stopping the
+        // thread here confines the damage to the moment of the drop. A
+        // watchdog that has already fired still leaves the isolate
+        // terminating, which only a caller holding the isolate can clear; see
+        // the navigation timeout path in `Page`.
+        self.cancel_and_join();
     }
 }
 
@@ -7185,6 +7207,44 @@ mod tests {
                 .as_bool()
                 .unwrap_or(false),
             "the cooperative policy must still drive scheduler work"
+        );
+    }
+
+    /// A watchdog token that is dropped, not stopped, must not fire later.
+    ///
+    /// Every arm/disarm pair here is separated by code that can return early
+    /// or be cancelled by a timeout, and the thread behind the token knew
+    /// nothing about either: it kept its deadline and terminated the isolate
+    /// under whatever ran next. The `--eval` on a page whose navigation had
+    /// timed out was the usual victim.
+    #[test]
+    fn a_dropped_watchdog_token_does_not_terminate_later() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        {
+            let _leaked = rt.arm_watchdog(std::time::Duration::from_millis(100));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            rt.evaluate("1 + 1").expect("the isolate must not be terminating"),
+            serde_json::json!(2.0),
+        );
+    }
+
+    /// Same contract for the shared CDP watchdog, whose slot outlived a
+    /// dropped handle the same way.
+    #[test]
+    fn a_dropped_cdp_watchdog_handle_does_not_terminate_later() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        {
+            let _leaked = crate::cdp_watchdog::arm(
+                rt.isolate_handle(),
+                std::time::Duration::from_millis(100),
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            rt.evaluate("1 + 1").expect("the isolate must not be terminating"),
+            serde_json::json!(2.0),
         );
     }
 
