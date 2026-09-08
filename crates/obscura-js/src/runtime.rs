@@ -3811,6 +3811,32 @@ mod tests {
         );
     }
 
+    /// Replacing `window.ShadowRoot` must not break `attachShadow`.
+    ///
+    /// The class is assigned to the global rather than declared, so
+    /// `attachShadow`'s `new ShadowRoot(...)` resolved through the global
+    /// object. The webcomponents/ShadyDOM polyfill installs a key-guarded
+    /// `ShadowRoot` of its own -- youtube.com ships it -- after which every
+    /// `attachShadow` call in the engine constructed the page's class and threw
+    /// `Illegal constructor`, so no element could be given a shadow root.
+    #[test]
+    fn replacing_the_shadow_root_global_keeps_attach_shadow_working() {
+        let mut rt = setup_runtime("<html><body><div id=\"host\"></div></body></html>");
+        rt.execute_script(
+            "<shadydom-polyfill>",
+            "window.ShadowRoot = function ShadowRoot() {                throw new TypeError('Illegal constructor'); };",
+        )
+        .expect("a page may assign over the global");
+
+        assert_eq!(
+            rt.evaluate(
+                "(document.getElementById('host').attachShadow({mode:'open'}),                   !!document.getElementById('host').shadowRoot)",
+            )
+            .expect("attachShadow must not construct through the page's global"),
+            serde_json::json!(true),
+        );
+    }
+
     #[test]
     fn function_to_string_has_native_function_shape() {
         let mut rt = setup_runtime("<html><body></body></html>");

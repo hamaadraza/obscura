@@ -2632,7 +2632,7 @@ class Node extends EventTarget {
   }
   getRootNode(options) {
     const root = _wrap(+_dom("node_root", this._nid));
-    if (options?.composed && root instanceof ShadowRoot) {
+    if (options?.composed && root instanceof _ShadowRoot) {
       return root.host.getRootNode(options);
     }
     return root;
@@ -9632,7 +9632,7 @@ function _reconcileAdoptedStyleSheetAdopters(root, sheets) {
 function _adoptedStyleTarget(root) {
   if (!root) return null;
   if (root.nodeType === 9) return root.head || root.documentElement;
-  return root instanceof globalThis.ShadowRoot ? root : null;
+  return root instanceof _ShadowRoot ? root : null;
 }
 
 function _syncAdoptedStyles(root) {
@@ -9811,7 +9811,7 @@ globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {
   get clonable() { return this._clonable; }
   get serializable() { return this._serializable; }
   _assertInsertable(node, operation) {
-    const createsComposedCycle = node instanceof ShadowRoot
+    const createsComposedCycle = node instanceof _ShadowRoot
       || node === this._host
       || !!(node?.contains && node.contains(this._host));
     if (createsComposedCycle) {
@@ -9874,6 +9874,18 @@ globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {
   getHTML() { return this.innerHTML; }
 };
 // Constructible-stylesheet adoption, mirroring Document.adoptedStyleSheets.
+// Obscura's own ShadowRoot, bound so the engine never reaches for the global.
+//
+// `attachShadow` constructed `new ShadowRoot(...)` by bare name, and because
+// the class is assigned to the global rather than declared, that name resolved
+// through the global object. The webcomponents/ShadyDOM polyfill replaces
+// `window.ShadowRoot` with a key-guarded implementation of its own -- youtube
+// .com ships it -- so every `attachShadow` call in the engine then constructed
+// the page's class and threw `Illegal constructor`. No element could get a
+// shadow root, and a Polymer page upgraded its components and rendered nothing:
+// youtube.com returned 1,216 elements and not one character of text.
+const _ShadowRoot = globalThis.ShadowRoot;
+
 Object.defineProperty(globalThis.ShadowRoot.prototype, 'adoptedStyleSheets', {
   get() { return _adoptedStyleSheetsFor(this); },
   set(sheets) { _replaceAdoptedStyleSheets(this, sheets); },
@@ -14707,7 +14719,7 @@ Element.prototype.attachShadow = function attachShadow(opts) {
   if (rootNid < 0) {
     throw new DOMException('Failed to execute attachShadow on Element: this element does not support attachShadow', 'NotSupportedError');
   }
-  const shadow = new ShadowRoot(rootNid, this, opts);
+  const shadow = new _ShadowRoot(rootNid, this, opts);
   _treeMutationEpoch++;
   shadow._treeDetachedExact = false;
   shadow._treeParent = null;
@@ -14728,8 +14740,8 @@ function _shadowRootForHost(host, includeClosed) {
   if (!includeClosed && parts[1] !== 'open') return null;
   const rootNid = +parts[0];
   let root = _cache.get(rootNid);
-  if (!(root instanceof ShadowRoot)) {
-    root = new ShadowRoot(rootNid, host, { mode: parts[1] });
+  if (!(root instanceof _ShadowRoot)) {
+    root = new _ShadowRoot(rootNid, host, { mode: parts[1] });
     _cache.set(rootNid, root);
   }
   return root;
