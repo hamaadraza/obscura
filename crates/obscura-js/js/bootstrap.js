@@ -2287,6 +2287,34 @@ function __prepareInsertedScript(script) {
   }
 }
 
+/// Upgrade custom elements in a subtree that has just been connected.
+///
+/// Only `document.createElement` used to upgrade, so an element that reached
+/// the document any other way stayed a plain HTMLElement forever. Template
+/// stamping is exactly that other way -- Polymer clones a template through
+/// `importNode` and inserts the result -- so on youtube.com `ytd-app` upgraded
+/// (it came from the parsed HTML) while every component it stamped did not:
+/// `ytd-page-manager`, `dom-if` and the rest sat inert as HTMLElement, the page
+/// body was never created, and the document held 1,216 elements and no text.
+///
+/// Connection is the spec's trigger, and the caller has already checked it.
+/// Pages that define no custom elements pay one Map size check.
+function __upgradeInsertedCustomElements(root) {
+  const registry = globalThis.customElements?._registry;
+  if (!registry || !registry.size) return;
+  const consider = (el) => {
+    if (!el || el.__customUpgraded) return;
+    const cls = registry.get(el.localName);
+    if (cls) globalThis.customElements._upgradeElement(el, cls);
+  };
+  if (root.nodeType === 1) consider(root);
+  // One native query for the whole subtree: stamping inserts entire trees at
+  // once, and a per-definition query would be O(definitions x subtree) on a
+  // page like this one, which registers hundreds.
+  const ids = _domParse("query_selector_all_scoped", root._nid, "*") || [];
+  for (const nid of ids) consider(_wrapEl(+nid));
+}
+
 function __prepareInsertedSubtree(root) {
   // HTML's script preparation algorithm leaves a disconnected script
   // unstarted.  When an ancestor is later connected, insertion steps visit
@@ -2307,6 +2335,9 @@ function __prepareInsertedSubtree(root) {
     }
   }
   for (const script of scripts) __prepareInsertedScript(script);
+  // After scripts, so a definition registered by a script in this same subtree
+  // is in the registry before its elements are considered.
+  __upgradeInsertedCustomElements(root);
 }
 
 function _seedDetachedTreeState(node) {
