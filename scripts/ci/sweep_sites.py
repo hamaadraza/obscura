@@ -79,8 +79,16 @@ def run_once(binary: str, urls: list[str], concurrency: int, timeout: int,
         command.append("--stealth")
     command += ["scrape", *urls, "--eval", PAGE_PROBE,
                 "--concurrency", str(concurrency), "--timeout", str(timeout)]
+    # Decode as UTF-8 explicitly. `text=True` alone uses the platform's
+    # preferred encoding, which on Windows is cp1252: any non-ASCII byte in a
+    # page title -- mail.ru, 20minutos.es, ouest-france.fr -- raised
+    # UnicodeDecodeError inside the reader thread, left `stdout` as None, and
+    # the caller then failed on len(None). A corpus of English-language sites
+    # never hits it; a corpus of popular ones fails on roughly a quarter of
+    # its chunks.
     completed = subprocess.run(
         command, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
         timeout=timeout * len(urls) + 600,
     )
     if len(completed.stdout) > MAX_OUTPUT_BYTES:
