@@ -3760,6 +3760,57 @@ mod tests {
         rt
     }
 
+    /// Replacing `window.HTMLElement` must not break obscura's own wrapping.
+    ///
+    /// The custom-elements ES5 adapter -- shipped by anything Polymer or Lit
+    /// compiled to ES5, youtube.com included -- assigns its own function over
+    /// `window.HTMLElement`. Element wrappers used to resolve their class
+    /// through the global of that name, so after the adapter loaded every
+    /// wrapper obscura built ran the page's constructor and threw
+    /// `a is not a constructor`, which took `children`, `querySelectorAll`
+    /// and every other node-wrapping path with it.
+    #[test]
+    fn replacing_the_html_element_global_keeps_node_wrapping_working() {
+        // Unknown tag names, because those are the ones whose interface is
+        // plain HTMLElement -- which is what the adapter replaces. A <div>
+        // resolves to HTMLDivElement and would never notice.
+        let mut rt = setup_runtime(
+            "<html><body><ytd-app id=\"host\"><yt-icon>one</yt-icon>             <yt-icon>two</yt-icon></ytd-app><div id=\"plain\">d</div></body></html>",
+        );
+        rt.execute_script(
+            "<es5-adapter>",
+            "window.HTMLElement = function HTMLElement() {                throw new TypeError('a is not a constructor'); };              window.HTMLDivElement = function HTMLDivElement() {                throw new TypeError('a is not a constructor'); };",
+        )
+        .expect("a page may assign over the global");
+
+        assert_eq!(
+            rt.evaluate("document.body.children.length").expect("children"),
+            serde_json::json!(2.0),
+            "children must not construct through the page's global",
+        );
+        assert_eq!(
+            rt.evaluate("document.querySelectorAll('yt-icon').length")
+                .expect("querySelectorAll"),
+            serde_json::json!(2.0),
+        );
+        assert_eq!(
+            rt.evaluate("document.getElementById('host').tagName").expect("tagName"),
+            serde_json::json!("YTD-APP"),
+            "the wrapper must still carry the right interface",
+        );
+        // A named interface, not just the HTMLElement fallback: those resolve
+        // from the end-of-bootstrap snapshot rather than a module binding. The
+        // element must be built *after* the adapter ran, or the wrapper cache
+        // answers from page init and nothing is constructed -- which is also
+        // the real shape, since a page's markup arrives after its scripts.
+        assert_eq!(
+            rt.evaluate("document.createElement('div').tagName")
+                .expect("a div built after the adapter"),
+            serde_json::json!("DIV"),
+            "a replaced HTMLDivElement must not break div wrapping",
+        );
+    }
+
     #[test]
     fn function_to_string_has_native_function_shape() {
         let mut rt = setup_runtime("<html><body></body></html>");

@@ -12443,7 +12443,47 @@ const _SVG_INTERFACE_BY_TAG = {
 
 
 // The constructor for an interface name, once the hierarchy above exists.
+// Element wrappers must not resolve their class through the global object.
+//
+// A page may replace `window.HTMLElement`, and the custom-elements ES5 adapter
+// that ships with anything Polymer or Lit compiled to ES5 does exactly that --
+// youtube.com serves it. Afterwards every wrapper obscura built invoked the
+// page's constructor instead of its own and threw `a is not a constructor`,
+// taking `children`, `querySelectorAll` and every other node-wrapping path with
+// it: youtube.com returned a document whose collections could not be read.
+//
+// Recorded as each interface is defined, so obscura constructs the class
+// obscura defined whatever the page later assigns to the global of that name.
+// Page-visible semantics are untouched: `instanceof`, subclassing, and
+// custom-element upgrades all still go through the global, and an upgrade
+// still constructs the page's own class.
+const _elementInterfaceCtors = new Map();
+const _elementInterfaceNames = new Set([
+  'Element', 'HTMLElement', 'SVGElement', 'MathMLElement',
+]);
+
+// Take the registry's contents once, at the end of bootstrap: after every
+// interface has reached its final value and before a single page script has
+// run. Capturing at definition time instead recorded the throwing stub that
+// `_defineElementInterface` creates for names a real class replaces later.
+function _snapshotElementInterfaces() {
+  for (const table of [_HTML_INTERFACE_BY_TAG, _SVG_INTERFACE_BY_TAG]) {
+    for (const name of Object.values(table)) _elementInterfaceNames.add(name);
+  }
+  for (const name of _elementInterfaceNames) {
+    const ctor = globalThis[name];
+    if (typeof ctor === 'function') _elementInterfaceCtors.set(name, ctor);
+  }
+}
+
 function _elementInterfaceCtor(name) {
+  const known = _elementInterfaceCtors.get(name);
+  if (typeof known === 'function') return known;
+  // The base interfaces are module-scope classes rather than products of
+  // `_defineElementInterface`; reach them by binding, for the same reason.
+  if (name === 'HTMLElement') return HTMLElement;
+  if (name === 'SVGElement') return SVGElement;
+  if (name === 'Element') return Element;
   const ctor = globalThis[name];
   return typeof ctor === 'function' ? ctor : Element;
 }
@@ -12500,6 +12540,7 @@ function _defineElementInterface(name, parent) {
     try {
       Object.defineProperty(existing.prototype, Symbol.toStringTag, { value: name, configurable: true });
     } catch (_e) {}
+    _elementInterfaceNames.add(name);
     return existing;
   }
   const ctor = function () { throw new TypeError('Illegal constructor'); };
@@ -12513,6 +12554,7 @@ function _defineElementInterface(name, parent) {
   Object.setPrototypeOf(ctor, parent);
   _markNative(ctor);
   _generatedElementInterfaces.add(ctor);
+  _elementInterfaceNames.add(name);
   globalThis[name] = ctor;
   return ctor;
 }
@@ -18452,5 +18494,10 @@ const _CHROME_INTERFACE_OWNERS = {"abbr":["HTMLTableCellElement"],"accept":["HTM
     try { Object.defineProperty(proto, Symbol.toStringTag, { value: name, configurable: true }); } catch (_e) {}
   }
 })();
+
+
+// Element interfaces are all defined by this point; freeze what obscura will
+// construct from before any page script can reassign a global of that name.
+_snapshotElementInterfaces();
 
 })();
